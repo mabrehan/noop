@@ -4,7 +4,11 @@ NOOP is a standalone, fully **offline** companion app for WHOOP straps (4.0 and 
 directly with the strap over Bluetooth Low Energy — **no WHOOP account, no
 cloud** — stores everything on-device in SQLite, imports your WHOOP and Apple Health exports,
 and computes recovery, strain, HRV and sleep locally. The macOS app (in `Strand/`) is the
-reference implementation; iOS and Android apps are planned.
+reference implementation; Android (in `android/`) is a full, shipped app, and iOS is a
+build-from-source-only target (build it yourself in Xcode — see [docs/IOS.md](IOS.md); not on the
+App Store/TestFlight to stay anonymous). It shares NOOP's analysis code, so its results match
+macOS; it is newer and less battle-tested, with live BLE on a physical iPhone not yet fully
+validated.
 
 > **Not affiliated with WHOOP.** NOOP is independent interoperability software for *your own*
 > device and *your own* data. "WHOOP" is used only to identify the hardware NOOP talks to.
@@ -93,7 +97,10 @@ The home dashboard (`TodayView.swift`, titled "Control Center"). A tight, gaples
   a plain-English read-out ("Recovery is strong and sleep was consistent.") and a recovery state
   word (Depleted / Low / Steady / Primed / Peak).
 - **Key Metrics** — a uniform tile grid, each with a 14-day sparkline: Recovery, Day Strain
-  (of 21), Sleep (hours + efficiency), HRV, Resting HR, Blood Oxygen, Respiratory, Steps,
+  (of 21), Sleep (hours + efficiency), HRV, Resting HR, Blood Oxygen, Respiratory,
+  Steps (on-device only for WHOOP 5/MG; on a 4.0, NOOP shows your imported Apple Health /
+  Health Connect steps, because it can't yet read steps off the 4.0 strap over Bluetooth —
+  the 4.0 itself does count steps in the official WHOOP app — and approximate),
   Weight, Calories. WHOOP metrics come from the `my-whoop` source; Steps/Weight/Calories/
   Respiratory pull from `apple-health`. Sparse series (e.g. weight) fall back to all history so
   a tile never shows empty when data exists.
@@ -420,8 +427,8 @@ React when the strap comes off or goes on:
 
 ### Smart alarm
 Wake to a wrist buzz. This arms the strap's **own firmware alarm**, so it still fires even if the
-Mac is asleep or NOOP is closed. Set your wake time, and an optional **light-sleep window** (wake
-up to N minutes early if the Mac stays awake and connected and a light phase is detected).
+Mac is asleep or NOOP is closed. Set your wake time — the strap buzzes at exactly that time.
+NOOP does not currently do light-sleep early wake.
 
 Mac side-effects are sandbox-friendly: screen lock uses macOS's own lock entry point, and
 Shortcuts run via the `shortcuts://` URL scheme — anything you can build in Shortcuts is reachable.
@@ -436,8 +443,12 @@ deviation and respiration. When **two or more** anomalies appear — e.g. restin
 HRV down ≥20%, skin temp up ≥0.6 °C, respiration up — a banner appears on **Control Center**:
 *"Your body looks strained — … Consider taking it easy."*
 
-This is an optional watch (off by default; the toggle lives with the behaviour settings) and
-needs at least 14 days of history. It is informational only — **not** a diagnosis.
+On a banner transition from clear to raised, NOOP also posts a **system notification** (at most
+once per local day) so the warning reaches you when the window is closed. The toggle lives in
+**Automations → Illness early-warning**. The defaults differ by platform on purpose: macOS is
+**opt-in** (off by default — enabling it triggers the notification-permission prompt), while
+Android is **opt-out** (on by default — the watch has always run there). Needs at least 14 days
+of history. On-device and approximate — informational only, **not** a diagnosis.
 
 ---
 
@@ -473,7 +484,7 @@ feed, refresh battery, scan/reconnect, or disconnect.
 - **Built on** — credit to the community reverse-engineering projects NOOP stands on.
 - **Donate (optional)** — never a paywall; the whole app works without it. Copy-to-clipboard
   crypto addresses (Bitcoin, Cardano, Ethereum, XRP) for anyone who wants to chip in toward
-  future work (Windows, the Android app, new features). The app never asks again.
+  future work (Windows, deeper iOS hardware validation, new features). The app never asks again.
 - A reminder: **not affiliated with WHOOP; interoperability software for your own device and
   data; not a medical device.**
 

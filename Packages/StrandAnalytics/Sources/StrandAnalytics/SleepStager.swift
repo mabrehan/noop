@@ -76,6 +76,30 @@ public enum SleepStager {
     public static let minSleepMin: Int = 60
     /// Assumed sample interval (seconds) when not inferable.
     public static let defaultIntervalS: Double = 60.0
+
+    // MARK: - Daytime false-sleep guard (#90)
+
+    // A long, still, sedentary daytime stretch (reading, a desk, a sofa) is gravity-
+    // indistinguishable from a real nap, so the gravity spine alone misclassifies it as
+    // sleep. The fix is NOT to drop daytime sleep — real naps are legitimate sessions —
+    // but to hold a window whose CENTER falls in the local daytime band to a stricter bar:
+    // it must be long enough to be a real nap AND show a genuine cardiac dip (a sedentary
+    // stretch keeps a near-baseline HR). Overnight windows are UNCHANGED.
+
+    /// Local hour (inclusive) at which the stricter daytime bar begins.
+    public static let daytimeBandStartHour: Int = 11
+    /// Local hour (exclusive) at which the stricter daytime bar ends. A window whose center
+    /// is in [start, end) local hours is "daytime"; everything else is "overnight".
+    public static let daytimeBandEndHour: Int = 20
+    /// A daytime window must run at least this long (minutes) to count — short still
+    /// daytime stretches are the dominant false-positive and are rejected outright.
+    public static let daytimeMinSleepMin: Int = 90
+    /// A daytime window's resting HR (lowest 5-min rolling mean) must be at or below
+    /// baseline × this to confirm a real cardiac dip. Stricter than the overnight 1.05:
+    /// a true nap dips BELOW the waking-day median, sedentary stillness does not.
+    public static let daytimeRestingHRMult: Double = 0.95
+    /// Seconds in a calendar day (for local-hour-of-day arithmetic).
+    static let secondsPerDay: Int = 86_400
     /// Floor on the rolling-window size in samples.
     public static let minWindowSamples: Int = 3
     /// A run is HR-confirmed only if mean HR ≤ baseline × this.
@@ -160,13 +184,19 @@ public enum SleepStager {
         let n = grav.count
         if n < 2 { return [Bool](repeating: false, count: n) }
         let half = windowSize(grav.map { $0.ts }) / 2
+        // stillPrefix[i] = # still samples among deltas[0..<i]: O(1) window counts → an O(n) scan, not
+        // O(n×window). The old nested loop burned minutes of CPU per analysis tick (and on Android, on
+        // the main thread, froze the app into ANRs after a few nights of 1 Hz history). Identical output.
+        var stillPrefix = [Int](repeating: 0, count: n + 1)
+        for i in 0..<n {
+            stillPrefix[i + 1] = stillPrefix[i] + (deltas[i] < gravityStillThresholdG ? 1 : 0)
+        }
         var flags: [Bool] = []
         flags.reserveCapacity(n)
         for i in 0..<n {
             let lo = max(0, i - half)
             let hi = min(n, i + half + 1)
-            var stillCount = 0
-            for j in lo..<hi where deltas[j] < gravityStillThresholdG { stillCount += 1 }
+            let stillCount = stillPrefix[hi] - stillPrefix[lo]
             flags.append(Double(stillCount) / Double(hi - lo) >= stillFraction)
         }
         return flags
@@ -258,14 +288,51 @@ public enum SleepStager {
         return meanHR <= baseline * hrSleepBaselineMult
     }
 
+    /// True when the run's CENTER, shifted to LOCAL time by tzOffsetSeconds, lands in the
+    /// daytime band [daytimeBandStartHour, daytimeBandEndHour). The center (not the edges)
+    /// is used so a window straddling a band edge is classified once, by where it mostly is.
+    /// `((x % d) + d) % d` is a floored modulo so a negative local-shifted time still maps
+    /// into [0, secondsPerDay).
+    static func isDaytimeCenter(_ p: Period, tzOffsetSeconds: Int) -> Bool {
+        // Int overflow-safe: starts/ends are unix seconds; midpoint via average of the two.
+        let center = p.start + (p.end - p.start) / 2
+        let local = center + tzOffsetSeconds
+        let secOfDay = ((local % secondsPerDay) + secondsPerDay) % secondsPerDay
+        let hour = secOfDay / 3_600
+        return hour >= daytimeBandStartHour && hour < daytimeBandEndHour
+    }
+
+    /// Stricter bar for a daytime-centered window (#90). A real daytime nap clears it; a
+    /// long sedentary still stretch (the false-positive this guards) does not, because it
+    /// is either too short or never shows a genuine cardiac dip below the day median.
+    /// Overnight windows never reach here. Returns true = keep, false = reject.
+    ///
+    /// `restingHR` is the window's own lowest 5-min rolling-mean HR (the sleep-depth proxy
+    /// detectSleep already computes); `baseline` is the day's median HR. With no usable HR
+    /// evidence (nil baseline OR nil restingHR) a daytime stretch cannot be confirmed as a
+    /// real nap, so it is rejected — sedentary daytime stillness without a measured HR dip
+    /// is far more likely than an unmonitored nap, and this path can never touch the night.
+    static func passesDaytimeGuard(_ p: Period, restingHR: Int?, baseline: Double?) -> Bool {
+        let daytimeMinSleepS = daytimeMinSleepMin * 60
+        if (p.end - p.start) < daytimeMinSleepS { return false }
+        guard let baseline = baseline, let resting = restingHR else { return false }
+        return Double(resting) <= baseline * daytimeRestingHRMult
+    }
+
     // MARK: - detectSleep (public)
 
     /// Detect sleep sessions from biometric streams. Empty/absent gravity → [].
     /// Gravity-only input degrades gracefully (HR/RR/resp refinements skipped).
+    ///
+    /// `tzOffsetSeconds` is the wall-clock UTC offset (TimeZone.current.secondsFromGMT)
+    /// used ONLY to place each window's center on a LOCAL clock for the daytime
+    /// false-sleep guard (#90). It defaults to 0 so the pure function and its tests stay
+    /// UTC; the live call site (IntelligenceEngine) passes the device's real offset.
     public static func detectSleep(hr: [HRSample] = [],
                                    rr: [RRInterval] = [],
                                    resp: [RespSample] = [],
-                                   gravity: [GravitySample]) -> [SleepSession] {
+                                   gravity: [GravitySample],
+                                   tzOffsetSeconds: Int = 0) -> [SleepSession] {
         let grav = gravity.sorted { $0.ts < $1.ts }
         if grav.count < 2 { return [] }
 
@@ -286,10 +353,15 @@ public enum SleepStager {
             if p.stage != "sleep" { continue }
             if (p.end - p.start) <= minSleepS { continue }
             if !confirmSleepWithHR(p, hr: hrS, baseline: baseline) { continue }
+            // Daytime false-sleep guard (#90): a window centered in the local daytime band
+            // must clear a stricter bar (≥daytimeMinSleepMin AND a real resting-HR dip).
+            // Overnight windows skip this entirely. restingHR is computed here (reused below).
+            let resting = sessionRestingHR(start: p.start, end: p.end, hr: hrS)
+            if isDaytimeCenter(p, tzOffsetSeconds: tzOffsetSeconds),
+               !passesDaytimeGuard(p, restingHR: resting, baseline: baseline) { continue }
             let stages = stageSession(start: p.start, end: p.end, grav: grav,
                                       hr: hrS, rr: rrS, resp: respS)
             let eff = efficiency(start: p.start, end: p.end, stages: stages)
-            let resting = sessionRestingHR(start: p.start, end: p.end, hr: hrS)
             let avgHrv = sessionAvgHRV(start: p.start, end: p.end, rr: rrS)
             sessions.append(SleepSession(start: p.start, end: p.end, efficiency: eff,
                                          stages: stages, restingHR: resting, avgHRV: avgHrv))
@@ -603,6 +675,134 @@ public enum SleepStager {
         return candidates.enumerated().filter { keep[$0.offset] }.map { $0.element }.sorted()
     }
 
+    // MARK: - Respiration rate from R-R (RSA) — WHOOP5 on-wire path
+
+    /// RSA tachogram resample rate (Hz). 4 Hz is the standard HRV resample grid.
+    static let rsaResampleHz = 4.0
+
+    /// Moving-mean detrend window for the RSA tachogram (seconds).
+    static let rsaDetrendWindowS = 8.0
+
+    /// Minimum spacing between breath peaks on the tachogram (seconds) → ≤24 bpm.
+    static let rsaMinPeakDistanceS = 2.5
+
+    /// Per-window length for the per-window rate estimate (seconds).
+    static let rsaWindowS = 300.0
+
+    /// Physiologic breath-interval band (seconds): 0.1–0.4 Hz = 6–24 breaths/min.
+    static let rsaMinBreathIntervalS = 2.5   // 24 bpm
+    static let rsaMaxBreathIntervalS = 10.0  // 6 bpm
+
+    /// THE canonical plausible sleeping-respiratory-rate band (bpm). The RSA peak-pick below can
+    /// yield 6–8 bpm at its noise floor, but every consumer (illness/readiness gates) only acts on
+    /// 8–25 — so respRateFromRR clamps its output to this band (NaN outside it) and the stored
+    /// value can never disagree with what's acted on. Mirrors Android SleepStager.
+    public static let respPlausibleRangeBpm: ClosedRange<Double> = 8.0...25.0
+
+    /// APPROXIMATE respiratory rate (breaths/min) from the R-R interval stream via
+    /// respiratory sinus arrhythmia (RSA), for use when no raw resp ADC channel is
+    /// available (WHOOP5 v18 wire is RR-only; resp ADC is WHOOP4 / cloud-only).
+    ///
+    /// This is an ON-DEVICE ESTIMATE, NOT a cloud/clinical respiration measurement.
+    /// It recovers the breathing-modulation of beat-to-beat timing, which tracks but
+    /// does not equal a chest-band / capnography rate.
+    ///
+    /// Pipeline (per matched in-bed session [start, end], unix SECONDS):
+    ///   1. Restrict RR rows to ts in [start, end]; range-filter the RR values
+    ///      (HRVAnalyzer.rangeFilter) to drop dropouts/ectopics.
+    ///   2. Reconstruct beat times by cumulatively summing the kept RR intervals
+    ///      from the first in-bed beat, yielding an (irregular) tachogram.
+    ///   3. Resample the tachogram onto a uniform ~4 Hz grid by linear interpolation.
+    ///   4. Detrend: subtract a centered moving mean (rsaDetrendWindowS).
+    ///   5. Per ~5-min window: findPeaks (min distance rsaMinPeakDistanceS) on the
+    ///      detrended grid, keep peak-to-peak intervals in the 6–24 bpm band, rate =
+    ///      60 / median(intervals). Take the median across windows.
+    /// Returns NaN when too few intervals survive (honest no-data).
+    static func respRateFromRR(_ rr: [RRInterval], start: Int, end: Int) -> Double {
+        let nan = Double.nan
+        if end <= start { return nan }
+
+        // 1. In-bed RR rows in chronological order, range-filtered.
+        let inBed = rr.filter { $0.ts >= start && $0.ts <= end }
+            .sorted { $0.ts < $1.ts }
+            .map { Double($0.rrMs) }
+        let filtered = HRVAnalyzer.rangeFilter(inBed)
+        if filtered.count < 30 { return nan }  // need enough beats for any RSA estimate
+
+        // 2. Reconstruct beat times (seconds from session start) by cumulative sum.
+        var beatTimes = [Double](repeating: 0, count: filtered.count)
+        var acc = 0.0
+        for i in filtered.indices {
+            acc += filtered[i] / 1000.0
+            beatTimes[i] = acc
+        }
+        let totalSpanS = beatTimes[beatTimes.count - 1]
+        if totalSpanS < rsaWindowS / 2.0 { return nan }  // < ~2.5 min of beats
+
+        // 3. Resample onto a uniform grid by linear interpolation.
+        let dt = 1.0 / rsaResampleHz
+        let nGrid = Int(totalSpanS / dt) + 1
+        if nGrid < 8 { return nan }
+        var grid = [Double](repeating: 0, count: nGrid)
+        var seg = 0
+        for g in 0..<nGrid {
+            let t = Double(g) * dt
+            // advance segment so beatTimes[seg] <= t <= beatTimes[seg+1]
+            while seg < beatTimes.count - 2 && beatTimes[seg + 1] < t { seg += 1 }
+            let t0 = beatTimes[seg]
+            let t1 = beatTimes[seg + 1]
+            let v0 = filtered[seg]
+            let v1 = filtered[seg + 1]
+            grid[g] = t1 <= t0 ? v0 : v0 + min(max((t - t0) / (t1 - t0), 0), 1) * (v1 - v0)
+        }
+
+        // 4. Detrend: subtract a centered moving mean (removes slow LF/baseline drift).
+        let halfW = max(1, Int((rsaDetrendWindowS * rsaResampleHz / 2.0).rounded()))
+        var detrended = [Double](repeating: 0, count: nGrid)
+        for i in 0..<nGrid {
+            let lo = max(0, i - halfW)
+            let hi = min(nGrid - 1, i + halfW)
+            var sum = 0.0
+            for j in lo...hi { sum += grid[j] }
+            detrended[i] = grid[i] - sum / Double(hi - lo + 1)
+        }
+        if standardDeviation(detrended) <= 1e-9 { return nan }  // flat → no RSA
+
+        // 5. Per ~5-min window peak-pick → 60/median(breath interval); median across.
+        let minDistSamples = max(2, Int((rsaMinPeakDistanceS * rsaResampleHz).rounded()))
+        let windowSamples = max(minDistSamples * 3, Int((rsaWindowS * rsaResampleHz).rounded()))
+        var perWindowRates: [Double] = []
+        var w = 0
+        while w < nGrid {
+            let wEnd = min(nGrid, w + windowSamples)
+            if wEnd - w >= minDistSamples * 3 {
+                let winSeg = Array(detrended[w..<wEnd])
+                // findPeaks with height = 0.0 selects the positive RSA peaks (one per
+                // breath) on the zero-mean detrended tachogram.
+                let peaks = findPeaks(winSeg, distance: minDistSamples, height: 0.0)
+                if peaks.count >= 3 {
+                    var intervals: [Double] = []
+                    for i in 1..<peaks.count {
+                        let ivS = Double(peaks[i] - peaks[i - 1]) * dt
+                        if ivS >= rsaMinBreathIntervalS && ivS <= rsaMaxBreathIntervalS {
+                            intervals.append(ivS)
+                        }
+                    }
+                    if intervals.count >= 2 {
+                        let med = HRVAnalyzer.median(intervals)
+                        if med > 0.0 { perWindowRates.append(60.0 / med) }
+                    }
+                }
+            }
+            w += windowSamples
+        }
+        if perWindowRates.isEmpty { return nan }
+        // Reject estimates outside the canonical consumer band (NaN = "no usable estimate") so the
+        // persisted value never silently disagrees with the illness/readiness plausibility gate.
+        let median = HRVAnalyzer.median(perWindowRates)
+        return respPlausibleRangeBpm.contains(median) ? median : nan
+    }
+
     // MARK: - Per-epoch features
 
     struct EpochFeatures {
@@ -699,8 +899,13 @@ public enum SleepStager {
         let hrLow = hasHR && hrLo != nil && f.hr <= hrLo!
         let hrHigh = hasHR && hrHi != nil && f.hr >= hrHi!
 
-        // NOTE: HF omitted (no neurokit2). Parasympathetic tone = RMSSD only.
-        let parasympHigh = f.rmssd.isFinite && rmssdHi != nil && f.rmssd >= rmssdHi!
+        // NOTE: HF omitted (no neurokit2). Parasympathetic tone = RMSSD only. A MISSING per-epoch
+        // RMSSD (sparse R-R, common on BLE-offloaded nights and especially 5/MG) is treated as
+        // pro-deep rather than deep-blocking — mirroring how a missing respiration value is handled
+        // below — so those nights stop decoding 0 m of deep sleep despite a real depth signature
+        // (still + low HR + regular breathing). An epoch WITH a finite RMSSD must still clear the
+        // high-tone bar. (#127, #129)
+        let parasympOK = (!f.rmssd.isFinite) || (rmssdHi != nil && f.rmssd >= rmssdHi!)
 
         let hrvarHigh = f.hrVar.isFinite && hrvarHi != nil && f.hrVar >= hrvarHi!
         let cardiacActivated = hrHigh || hrvarHigh
@@ -714,8 +919,8 @@ public enum SleepStager {
 
         // WAKE: sustained motion + activated cardiac (or no HR to vet motion).
         if moving && (cardiacActivated || !hasHR) { return "wake" }
-        // DEEP: still + high parasympathetic tone + low HR + regular respiration.
-        if still && parasympHigh && hrLow && rrvRegular { return "deep" }
+        // DEEP: still + low HR + regular respiration, with high parasympathetic tone when measurable.
+        if still && parasympOK && hrLow && rrvRegular { return "deep" }
         // REM: still body + activated cardiac + irregular respiration.
         if still && cardiacActivated && rrvIrregular { return "rem" }
         // REM fallback when respiration unavailable: require BOTH cardiac signals.
@@ -753,10 +958,15 @@ public enum SleepStager {
                                    onsetIdx: Int, finalWakeIdx: Int) -> [String] {
         var out = labels
         let noREMEpochs = Int((noREMAfterOnsetMin * 60.0 / epochS).rounded())
+        // "Deep is front-loaded" re-imposes scattered late "deep" back to light — BUT only when there's
+        // deep in the first third to anchor that prior. If the whole detected deep block lands later
+        // (individual variation, or HR/HRV-only staging without respiration placing the deepest, lowest-HR
+        // window later), zeroing it out gives a wrong "0 m deep"; keeping the best estimate is better. (#127)
+        let hasEarlyDeep = zip(labels, features).contains { $0.0 == "deep" && $0.1.clock <= deepFirstFraction }
         for (i, f) in features.enumerated() {
             if i < onsetIdx || i > finalWakeIdx { continue }
             if out[i] == "rem" && (i - onsetIdx) < noREMEpochs { out[i] = "light" }
-            if out[i] == "deep" && f.clock > deepFirstFraction { out[i] = "light" }
+            if out[i] == "deep" && f.clock > deepFirstFraction && hasEarlyDeep { out[i] = "light" }
         }
         return out
     }

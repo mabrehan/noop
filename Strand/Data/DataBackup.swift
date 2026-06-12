@@ -1,5 +1,10 @@
 import Foundation
+#if canImport(AppKit)
 import AppKit
+#elseif canImport(UIKit)
+import UIKit
+#endif
+import SQLite3
 import UniformTypeIdentifiers
 import WhoopStore
 
@@ -53,6 +58,7 @@ enum DataBackup {
         // Flush the WAL so the single .sqlite carries everything. Best-effort.
         let checkpointed = await checkpoint()
 
+        #if os(macOS)
         // Ask where to save.
         let panel = NSSavePanel()
         panel.title = "Export NOOP backup"
@@ -85,6 +91,25 @@ enum DataBackup {
         } catch {
             return .failure("Export failed: \(error.localizedDescription)")
         }
+        #else
+        // iOS: DocumentPicker.export only carries a single file, so we cannot fall back to copying
+        // the -wal/-shm sidecars the way macOS does. If the checkpoint above didn't fold the WAL
+        // into the main file, the staged copy would silently omit everything written since the last
+        // automatic checkpoint. Fail loudly instead of producing a partial backup.
+        guard checkpointed else {
+            return .failure("Couldn't safely export right now — recent changes are still in the database's write-ahead log. Close any in-flight sync, then try again.")
+        }
+        let fm = FileManager.default
+        let staged = fm.temporaryDirectory.appendingPathComponent(defaultBackupName())
+        do {
+            if fm.fileExists(atPath: staged.path) { try fm.removeItem(at: staged) }
+            try fm.copyItem(at: dbURL, to: staged)
+        } catch {
+            return .failure("Export failed: \(error.localizedDescription)")
+        }
+        guard let dest = await DocumentPicker.export(staged) else { return .cancelled }
+        return .exported(dest)
+        #endif
     }
 
     // MARK: - Import
@@ -98,6 +123,7 @@ enum DataBackup {
         do { dbPath = try StorePaths.defaultDatabasePath() }
         catch { return .failure("Couldn't locate the NOOP database. \(error.localizedDescription)") }
 
+        #if os(macOS)
         let panel = NSOpenPanel()
         panel.title = "Import NOOP backup"
         panel.prompt = "Import"
@@ -110,10 +136,23 @@ enum DataBackup {
 
         let scoped = source.startAccessingSecurityScopedResource()
         defer { if scoped { source.stopAccessingSecurityScopedResource() } }
+        #else
+        // iOS: pick the backup through the system document picker (asCopy gives us a readable local
+        // copy in our temp dir, so no security-scoped bookkeeping is needed).
+        guard let source = await DocumentPicker.importFile(sqliteContentTypes()) else { return .cancelled }
+        #endif
 
         // Validate: must be a real SQLite database (magic header "SQLite format 3\0").
         guard isSQLiteFile(at: source) else {
             return .failure("That file isn't a NOOP backup — it doesn't look like a SQLite database.")
+        }
+
+        // Reject the OTHER platform's backup honestly. The magic check passes for ANY SQLite
+        // file, so an Android (Room) backup would otherwise sail through, replace the GRDB
+        // database, and strand the user after the relaunch (the GRDB migration bookkeeping is
+        // absent). Probe the schema read-only and point the user at a path that does work.
+        if backupOrigin(of: sqliteTableNames(at: source)) == .android {
+            return .failure("This looks like an Android NOOP backup, which can't be restored on macOS — the two apps store data in different database layouts. Restore it on an Android device, or import your original WHOOP or Apple Health exports here instead.")
         }
 
         let fm = FileManager.default
@@ -168,6 +207,49 @@ enum DataBackup {
         types.append(.database)
         types.append(.data)
         return types
+    }
+
+    /// Which platform produced a NOOP backup, judged by its migrator's bookkeeping table.
+    enum BackupOrigin: Equatable { case mac, android, unknown }
+
+    /// Pure classification over a backup's `sqlite_master` table names: GRDB (this app) writes
+    /// `grdb_migrations`, Room (the Android app) writes `room_master_table`. `.unknown` (neither —
+    /// an empty or pre-migration file) falls through to the normal import path, where the
+    /// open-time migrator decides. Mirrors the Android `DataBackup.backupOriginOf`.
+    static func backupOrigin(of tableNames: Set<String>) -> BackupOrigin {
+        // This platform's marker wins on the (degenerate) both-present case: restoring here is the
+        // less destructive read.
+        if tableNames.contains("grdb_migrations") { return .mac }
+        if tableNames.contains("room_master_table") { return .android }
+        // Older Room layouts didn't carry `room_master_table`; treat the Room/AndroidX duo of
+        // `android_metadata` + an internal `sqlite_sequence` as an Android backup too.
+        if tableNames.contains("android_metadata") && tableNames.contains("sqlite_sequence") {
+            return .android
+        }
+        return .unknown
+    }
+
+    /// Every table name in a SQLite file, opened READ-ONLY through the system SQLite so the probed
+    /// file is never mutated. Returns an empty set on any failure — the caller treats that as
+    /// `.unknown` and falls through to the existing behaviour.
+    private static func sqliteTableNames(at url: URL) -> Set<String> {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+            sqlite3_close(db)
+            return []
+        }
+        defer { sqlite3_close(db) }
+        var stmt: OpaquePointer?
+        let sql = "SELECT name FROM sqlite_master WHERE type = 'table'"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        var names: Set<String> = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let c = sqlite3_column_text(stmt, 0) {
+                names.insert(String(cString: c))
+            }
+        }
+        return names
     }
 
     /// Read the first 16 bytes and check for the SQLite magic header.

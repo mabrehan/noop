@@ -68,6 +68,15 @@ object ReadinessEngine {
     private const val chronicWindow = 28
     private const val minChronic = 14       // need at least this much strain history for ACWR
 
+    // Resp-rate signal is sourced from either clean cloud RR or a higher-variance on-device RSA
+    // estimate (no source flag on the field), so it uses wider z thresholds than HRV/RHR and a
+    // physiologic sanity band. A single noisy RSA night should not reach BAD (which feeds recoveryDown).
+    private const val respZWatch = 1.5      // raised vs HRV/RHR (was 1.0) to absorb RSA night-to-night noise
+    private const val respZBad = 2.0        // raised vs HRV/RHR (was 1.5) so one off-night can't trigger RUNDOWN
+    // Single canonical band, owned by the producer so the stored RSA value can't disagree with this
+    // gate (#78): SleepStager.respRateFromRR now NaNs anything outside it before persisting.
+    private val respPlausibleRange = SleepStager.respPlausibleRangeBpm // plausible sleeping RR (bpm)
+
     // MARK: Entry point
 
     /**
@@ -76,7 +85,12 @@ object ReadinessEngine {
      */
     fun evaluate(days: List<DailyMetric>, today: String? = null): Readiness {
         val sorted = days.sortedBy { it.day }
-        val latest = (today?.let { t -> sorted.firstOrNull { it.day == t } }) ?: sorted.lastOrNull()
+        // When an explicit [today] is given (the dashboard passes the device's real local day key), use
+        // the row for THAT day and nothing else: a stale historical import has no row for today, so the
+        // readiness card reads "insufficient" rather than synthesizing off the newest stored — possibly
+        // months-old — row (issue #23/#24). With no [today] (live-strap default callers) fall back to the
+        // most recent row exactly as before, so nothing wearing the strap nightly changes.
+        val latest = if (today != null) sorted.firstOrNull { it.day == today } else sorted.lastOrNull()
         if (latest == null) {
             return Readiness(
                 level = Level.INSUFFICIENT,
@@ -116,20 +130,26 @@ object ReadinessEngine {
         if (rhrSignal != null) signals.add(rhrSignal)
 
         // Respiratory-rate drift (illness early signal) ----------------------
+        // respRateBpm may be a clean cloud value OR a higher-variance on-device RSA estimate
+        // (WHOOP5 BLE-only) and carries no source flag, so gate conservatively for BOTH: keep the
+        // minBaseline + sd>0 guard, only act on physiologically plausible sleeping-RR (~8-25 bpm),
+        // and use wider resp-only z thresholds (WATCH 1.5 / BAD 2.0) so a single noisy night can't
+        // reach BAD (which would feed recoveryDown), while a sustained genuine rise still flags.
         val rr = latest.respRateBpm
-        if (rr != null) {
+        if (rr != null && rr in respPlausibleRange) {
             val base = history.takeLast(baselineWindow).mapNotNull { it.respRateBpm }
+            val m = mean(base)
             val sd = sampleSD(base)
-            if (base.size >= minBaseline && sd != null && sd > 0) {
-                val z = (rr - mean(base)!!) / sd
-                if (z >= 1.5) {
+            if (base.size >= minBaseline && m != null && m in respPlausibleRange && sd != null && sd > 0) {
+                val z = (rr - m) / sd
+                if (z >= respZBad) {
                     signals.add(
                         Signal(
                             key = "respRate", label = "Respiratory rate",
                             detail = "up vs baseline — sometimes an early sign of getting sick", flag = Flag.BAD,
                         )
                     )
-                } else if (z >= 1.0) {
+                } else if (z >= respZWatch) {
                     signals.add(
                         Signal(
                             key = "respRate", label = "Respiratory rate",

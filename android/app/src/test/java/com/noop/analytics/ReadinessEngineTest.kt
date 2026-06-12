@@ -99,6 +99,31 @@ class ReadinessEngineTest {
     }
 
     @Test
+    fun respRate_implausibleOutlierProducesNoSignal() {
+        // A physiologically implausible RSA value (outside the 8-25 bpm sanity band) must produce
+        // NO resp signal, even though it is far above baseline — this rejects degenerate RSA outputs
+        // so they can't drive readiness toward STRAINED/RUNDOWN. (respRateRiseFlags above confirms a
+        // genuine in-band elevation still flags after the threshold raise.)
+        val r = ReadinessEngine.evaluate(
+            baseline(todayHrv = 60.0, todayRhr = 52, todayStrain = 10.0, todayResp = 40.0)
+        )
+        assertTrue(r.signals.none { it.key == "respRate" })
+    }
+
+    @Test
+    fun explicitTodayWithoutMatchingRowIsInsufficient() {
+        // Stale historical import: newest row is 2024-03-29, but the device's real calendar day is later.
+        // An explicit `today` with no matching row must read INSUFFICIENT — NOT synthesize off the newest
+        // stored (stale) row (issue #23/#24).
+        val days = baseline(todayHrv = 72.0, todayRhr = 46, todayStrain = 10.0)
+        assertEquals(ReadinessEngine.Level.INSUFFICIENT, ReadinessEngine.evaluate(days, today = "2026-06-08").level)
+        // The day that IS present still computes (no regression for current data).
+        assertTrue(ReadinessEngine.evaluate(days, today = "2024-03-29").level != ReadinessEngine.Level.INSUFFICIENT)
+        // The legacy no-`today` path is unchanged — still falls back to the most recent row.
+        assertTrue(ReadinessEngine.evaluate(days).level != ReadinessEngine.Level.INSUFFICIENT)
+    }
+
+    @Test
     fun statsHelpers() {
         assertEquals(4.0, ReadinessEngine.mean(listOf(2.0, 4.0, 6.0))!!, 1e-12)
         assertEquals(2.0, ReadinessEngine.sampleSD(listOf(2.0, 4.0, 6.0))!!, 0.0001)

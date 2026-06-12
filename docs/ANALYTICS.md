@@ -8,29 +8,29 @@ All analytics live in the cross-platform `StrandAnalytics` Swift package. Every 
 
 - Package: `Packages/StrandAnalytics/Sources/StrandAnalytics/`
 - Top-level index: `StrandAnalytics.swift` (`StrandAnalytics.version == "0.1.0"`)
-- App reference implementation: `Strand/` (macOS SwiftUI)
+- App reference implementation: `Strand/` (SwiftUI, macOS + iOS). The same `StrandAnalytics` code backs both Swift app targets, and Android (Room/Kotlin) runs equivalent analytics — the number-crunching is shared, so results match across platforms.
 
 ---
 
 ## What is actually wired into the app
 
-The package contains more analytics than the app currently calls. This section is the honest map of **library-only** vs **live**, verified against the app sources.
+The package contains more analytics than the app currently surfaces. This section is the honest map of **library-only** vs **live**, verified against the app sources. The status below is shared across the Swift targets (macOS + iOS); Android runs the equivalent code through its own Kotlin/Room layer.
 
-| Engine | File | Status in the macOS app |
+| Engine | File | Status in the app |
 |---|---|---|
 | `HRVAnalyzer` | `HRVAnalyzer.swift` | **Library-only** as a type. The app computes RMSSD inline via `AppModel.rmssd(_:)` (same Task-Force formula) for the live stress nudge. |
-| `RecoveryScorer` | `RecoveryScorer.swift` | **Library-only.** The recovery values shown in `TodayView` come from imported WHOOP CSV (`recovery_score_pct`), not from this scorer yet. |
-| `StrainScorer` | `StrainScorer.swift` | **Library-only.** Day strain shown in the UI is the imported `day_strain` column. The TRIMP scorer is the on-device recompute path. |
-| `SleepStager` | `SleepStager.swift` | **Library-only.** Sleep stages/efficiency in the store come from imports; the stager is the recompute path. |
-| `Baselines` | `Baselines.swift` | **Library-only** type. The illness early-warning in `AppModel` uses its own trailing-window baseline math inline (see below). |
-| `WorkoutDetector` / `Calories` | `WorkoutDetector.swift` | **Library-only.** |
-| `AnalyticsEngine` | `AnalyticsEngine.swift` | **Library-only orchestrator.** `analyzeDay(...)` is implemented and tested but **not** currently called from the import/store pipeline. |
+| `RecoveryScorer` | `RecoveryScorer.swift` | **Live.** Runs inside `AnalyticsEngine.analyzeDay` via `Strand/Data/IntelligenceEngine.swift`; computed recoveries are persisted under the `"<deviceId>-noop"` source and merged **under** any imported `recovery_score_pct` (imports always win). APPROXIMATE. |
+| `StrainScorer` | `StrainScorer.swift` | **Live.** Day strain is computed on-device for nights the strap offloaded; the imported `day_strain` column still wins for imported days. APPROXIMATE. |
+| `SleepStager` | `SleepStager.swift` | **Live.** Stages each offloaded night inside `analyzeDay`; computed sessions are persisted under the `"-noop"` source, with imported sleeps taking precedence. APPROXIMATE. |
+| `Baselines` | `Baselines.swift` | **Live.** Seeds the recovery baseline in `IntelligenceEngine.analyzeRecent` (two-pass cold-start). The illness early-warning in `AppModel` still uses its own trailing-window baseline math inline (see below). |
+| `WorkoutDetector` / `Calories` | `WorkoutDetector.swift` | **Live.** Runs inside `AnalyticsEngine.analyzeDay`; detected bouts are persisted as `workout` rows under the computed `"<deviceId>-noop"` source (sport `"detected"`), de-duplicated against imported WHOOP workouts. All intensity/calorie fields are APPROXIMATE. Not yet surfaced in the Workouts screen. |
+| `AnalyticsEngine` | `AnalyticsEngine.swift` | **Live orchestrator.** `analyzeDay(...)` is called by `Strand/Data/IntelligenceEngine.swift` — every 15 minutes while connected, and from the Intelligence screen — and its `DailyMetric`, sleep sessions and detected workouts are persisted under the `"-noop"` source. |
 | `HRZones` | `HRZones.swift` | **Library-only** (display zone model). The app's live zone coaching computes `%HRmax` inline in `AppModel.coachZone(_:)`. |
 | `CorrelationEngine` | `CorrelationEngine.swift` | **Live.** Used by `InsightsView`, `CompareView`, `MetricExplorerView`. |
 | `BehaviorInsights` | `BehaviorInsights.swift` | **Live.** Used by `InsightsView` (`rank` + `sentence`). |
 | `ComparisonEngine` | `ComparisonEngine.swift` | **Live.** Used by `MetricExplorerView`. |
 
-**In short:** the *interactive data-interrogation* engines (correlation, behavior effects, period comparison) are wired into screens today. The *recompute-from-raw-streams* engines (recovery, strain, sleep staging, workouts) are complete and tested but currently sit behind the importers, which copy WHOOP's own per-day numbers straight from your export. The live BLE app additionally runs four small inline analytics in `AppModel`: HR smoothing, RMSSD, HR-zone coaching, an illness/strain early-warning, and a resting-stress nudge.
+**In short:** the *interactive data-interrogation* engines (correlation, behavior effects, period comparison) are wired into screens, and the *recompute-from-raw-streams* engines (recovery, strain, sleep staging, workout detection) run live too: `IntelligenceEngine` calls `analyzeDay` for every night the strap offloaded and persists the APPROXIMATE results under the `"-noop"` source, merged under any imported rows — a WHOOP export still wins wherever it covers a day. The live BLE app additionally runs four small inline analytics in `AppModel`: HR smoothing, RMSSD, HR-zone coaching, an illness/strain early-warning, and a resting-stress nudge.
 
 ---
 
@@ -393,7 +393,7 @@ Source: `ComparisonEngine.swift`. Period-over-period comparison of one daily met
 
 ## The library orchestrator: `AnalyticsEngine`
 
-Source: `AnalyticsEngine.swift`. A pure function that ties the recompute engines together for one day. **Implemented and tested, but not yet wired into the import/store pipeline** — the importers currently copy WHOOP's own per-day recovery/strain/sleep numbers from your export.
+Source: `AnalyticsEngine.swift`. A pure function that ties the recompute engines together for one day. **Live:** `analyzeDay` is wired in via `Strand/Data/IntelligenceEngine.swift` — it runs every ~15 minutes while connected and on demand from the Intelligence screen, persisting the computed recovery/strain/sleep/workouts under the `"<deviceId>-noop"` source and **merged under** imports. Where a WHOOP export covers a day, its own per-day recovery/strain/sleep numbers still win; the recompute fills in the days the strap offloaded but no export covers.
 
 `analyzeDay(day:hr:rr:resp:gravity:profile:baselines:maxHROverride:)` runs, in order:
 
@@ -420,10 +420,11 @@ Apple Health XML ──┘                                         │
                                                              │
                           ┌──────────────────────────────────┤
                           ▼                                   ▼
-   AnalyticsEngine.analyzeDay (recompute path,        Repository.days ─► TodayView,
-   library-only today: HRV/recovery/strain/sleep      InsightsView (CorrelationEngine,
-   from raw streams)                                   BehaviorInsights), CompareView,
-                                                       MetricExplorerView (ComparisonEngine)
+   IntelligenceEngine ─► AnalyticsEngine.analyzeDay   Repository.days ─► TodayView,
+   (live recompute: HRV/recovery/strain/sleep/        InsightsView (CorrelationEngine,
+   workouts from raw streams, every ~15 min +         BehaviorInsights), CompareView,
+   Intelligence screen; persisted under the           MetricExplorerView (ComparisonEngine)
+   "<deviceId>-noop" source, merged UNDER imports)
 
    live BLE stream ─► AppModel: HR smoothing · RMSSD · zone coaching ·
                        illness early-warning · resting-stress nudge

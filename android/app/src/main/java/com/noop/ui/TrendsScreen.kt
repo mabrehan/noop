@@ -37,9 +37,9 @@ import kotlin.math.roundToInt
 // ChartCard, and a uniform set of HRV / Resting HR / Day-strain ChartCards (all
 // Metrics.chartHeight tall), followed by a recovery history strip.
 //
-// Windows are taken RELATIVE TO THE LATEST recorded day (not "now"), with the macOS
-// auto-expand rule: if the selected window holds zero points for a metric, the smallest
-// LARGER range that does is used and the card caption notes the widening.
+// Windows are taken relative to the phone's actual local day, with the macOS auto-expand
+// rule: if the selected window holds zero points for a metric, the smallest larger range
+// that does is used and the card caption notes the widening.
 //
 // Data: full history is loaded once via repo.days("my-whoop"); until it arrives the
 // reactive recentDays flow backs the charts, so the screen is never empty when data exists.
@@ -79,7 +79,7 @@ fun TrendsScreen(vm: AppViewModel) {
         val strain = remember(days, range) { resolveMetric(days, range) { it.strain } }
 
         // --- Range control ---
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(verticalArrangement = Arrangement.spacedBy(Metrics.space8)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -215,8 +215,14 @@ private fun windowValues(
     if (days.isEmpty()) return emptyList()
     val sliced = when (val n = range.days) {
         null -> days
-        // The history is already oldest-first; a trailing N-day window is the last N rows.
-        else -> days.takeLast(n)
+        // Trailing N CALENDAR days ending today — anchored to the phone's date, NOT the last N rows
+        // (which on a stale import made months-old data fill the W/M/3M windows, looking current — #23).
+        // ISO yyyy-MM-dd sorts chronologically. Empty short windows auto-widen via resolveMetric, so old
+        // imports surface under a wider range / All history rather than masquerading as recent.
+        else -> {
+            val cutoff = java.time.LocalDate.now().minusDays((n - 1).toLong()).toString()
+            days.filter { it.day >= cutoff }
+        }
     }
     return sliced.mapNotNull(value)
 }
@@ -247,7 +253,7 @@ private fun ChartCard(
     footer: List<Pair<String, String>>,
     modifier: Modifier = Modifier,
 ) {
-    NoopCard(modifier = modifier, padding = 16.dp) {
+    NoopCard(modifier = modifier, padding = Metrics.cardPadding) {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             // Header.
             Row(verticalAlignment = Alignment.Top) {
@@ -256,7 +262,7 @@ private fun ChartCard(
                     Text(subtitle, style = NoopType.footnote, color = Palette.textTertiary)
                 }
                 if (trailing != null) {
-                    Text(trailing, style = NoopType.number(22f), color = color)
+                    Text(trailing, style = NoopType.chartValueLarge, color = color)
                 }
             }
 
@@ -267,6 +273,7 @@ private fun ChartCard(
                     modifier = Modifier.height(Metrics.chartHeight),
                     color = color,
                     fill = true,
+                    selectionEnabled = true,
                 )
             } else {
                 SparsePlaceholder()
@@ -305,7 +312,7 @@ private fun MetricTrendCard(
 /** Evenly-spaced labelled stats under a chart, separated by a hairline rule. */
 @Composable
 private fun ChartFooter(items: List<Pair<String, String>>) {
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(Metrics.space10)) {
         HorizontalDivider(color = Palette.hairline)
         Row(modifier = Modifier.fillMaxWidth()) {
             items.forEach { (label, value) ->
@@ -344,11 +351,11 @@ private fun RecoveryHistoryCard(days: List<DailyMetric>, range: TrendsRange) {
             if (recovery.size >= 2) {
                 BarChart(
                     values = recovery,
-                    modifier = Modifier.height(120.dp),
+                    modifier = Modifier.height(Metrics.trendStripHeight),
                     color = Palette.accent,
                 )
             } else {
-                SparsePlaceholder(height = 120.dp)
+                SparsePlaceholder(height = Metrics.trendStripHeight)
             }
             HorizontalDivider(color = Palette.hairline)
             Text(
@@ -370,7 +377,7 @@ private fun SparsePlaceholder(height: Dp = Metrics.chartHeight) {
         modifier = Modifier
             .fillMaxWidth()
             .height(height)
-            .clip(RoundedCornerShape(12.dp))
+            .clip(RoundedCornerShape(Metrics.cornerSm))
             .background(Palette.surfaceInset),
         contentAlignment = Alignment.Center,
     ) {

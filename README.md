@@ -12,15 +12,46 @@
   <img alt="Account free" src="https://img.shields.io/badge/account-free-2FE6A8?style=flat-square">
   <img alt="WHOOP 4 and 5" src="https://img.shields.io/badge/works%20with-WHOOP%204.0%20%26%205.0-8B9690?style=flat-square">
   <a href="LICENSE"><img alt="License: PolyForm Noncommercial 1.0.0" src="https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-8B9690?style=flat-square"></a>
+  <a href="https://www.reddit.com/r/NOOPApp/"><img alt="Community: r/NOOPApp" src="https://img.shields.io/badge/community-r%2FNOOPApp-18C98B?style=flat-square&logo=reddit&logoColor=white"></a>
 </p>
 
 <p align="center">
+  <a href="#keeping-noop-alive">♥&nbsp;Support</a> ·
   <a href="#download">⬇&nbsp;Download</a> ·
+  <a href="https://www.reddit.com/r/NOOPApp/">💬&nbsp;Community</a> ·
   <a href="#features">Features</a> ·
   <a href="docs/PROTOCOL.md">Protocol</a> ·
-  <a href="docs/DONATIONS.md">♥&nbsp;Support</a> ·
   <a href="mailto:thenoopapp@gmail.com">Contact</a>
 </p>
+
+---
+
+## Keeping NOOP alive
+
+NOOP is **free, forever** — no account, no cloud, no subscription, every feature unlocked, no nag. That doesn't change.
+
+But here's the honest reality, up front: **NOOP is built and maintained by one person, out of pocket.** Reverse-engineering WHOOP's hardware — and keeping up as its firmware changes — takes real time and real test hardware. **The project continues if the people who use it help fund it. If that doesn't happen, it can't.** No drama, no guilt — just the maths of an unfunded project.
+
+If NOOP saves you a subscription, or you just want WHOOP 5.0/MG support finished and the work to keep going, **chipping in is what genuinely decides that.** It's optional, one-off, and tied to nothing about your data or access — there's no server and no record of who has or hasn't.
+
+### How to donate — 2 minutes, even if you've never touched crypto
+
+Donations are **crypto-only**, on purpose: staying anonymous (for the project *and* for you) rules out PayPal, Patreon, or anything with a name attached. If you don't already hold any:
+
+1. **Install a mainstream exchange app** — Coinbase, Binance, Kraken, or **Cash App** (Cash App handles Bitcoin directly).
+2. **Buy a small amount of Bitcoin (BTC) or Ethereum (ETH)** — even $5–10 is genuinely helpful.
+3. **Tap Send / Withdraw, paste the matching address below, and send.** That's it. (Only ever send a coin to its own network.)
+
+| Coin | Network | Address |
+|---|---|---|
+| **BTC** | Bitcoin | `bc1qn2gkl7wslwpws06mvazjn2uu689zlkv7kg3kf5` |
+| **ETH** | Ethereum | `0xd64D508b531c4b1297Ca4023C774e0E97aA67B7F` |
+| **ADA** | Cardano | `addr1qxsju3y0mlke2h6h2g6qgnq4r3jstngtyjxs0nnp5zrv28zv8p5rgzruxyjz33j9k23pffta8z639e2snjdd4vcetfqsn4vwr3` |
+| **XRP** | XRP Ledger | `rpvijHi2nVY9WWAJhojsAX5tJmHdmLtFhq` |
+
+Each address also has a scan-to-donate **QR code** in the app under **Support** (and they're listed in [`docs/DONATIONS.md`](docs/DONATIONS.md)). *Always copy the full address and double-check the first and last characters; crypto transactions are irreversible, and only ever send a coin to its own network.*
+
+**Can't or would rather not?** Also genuinely valued: **⭐ star this repo**, file a good bug report, share a strap log, test on hardware you own, or just tell another WHOOP user. That moves NOOP forward too. **Want to help directly? → [Roadmap & help wanted](https://github.com/NoopApp/noop/issues/132)** lists exactly what we need — some of NOOP's biggest blockers are data only your strap can provide (a single raw frame capture can unlock a feature for everyone on that firmware).
 
 ---
 
@@ -30,10 +61,10 @@ Pre-built apps you can run right now:
 
 | Platform | Build | Notes |
 |---|---|---|
-| **macOS** | `NOOP.app` (see [Releases](../../releases)) | Apple Silicon + Intel. Drag to Applications. Not notarized — see **First launch on macOS** below. |
-| **Android** | `NOOP-full.apk` (see [Releases](../../releases)) | The full app. `minSdk 26` (Android 8+). Sideload — enable "install unknown apps". |
+| **macOS** | `NOOP.app` (see [Releases](../../releases)) or `brew install --cask noopapp/noop/noop` | Apple Silicon + Intel. Drag to Applications. Not notarized — see **First launch on macOS** below. Homebrew needs a one-time `brew trust noopapp/noop` first (Homebrew 6.0+) — see [Homebrew docs](docs/HOMEBREW.md). |
+| **Android** | `NOOP-full.apk` (see [Releases](../../releases)) | The full app. `minSdk 26` (Android 8+). Sideload — enable "install unknown apps". Blocked by Play Protect? See **Installing on Android** below. |
 | **Android (demo)** | `NOOP-demo.apk` | Preloaded with sample data so you can explore every screen with no strap. Installs alongside the full app. |
-| **iOS** | — | The shared library is iOS-ready; the app is on the roadmap. |
+| **iOS** | `NOOP-vX-ios.ipa` (see [Releases](../../releases)) — sideload with AltStore/SideStore | Now a **direct download**. The `.ipa` is unsigned; **you** sign it on your iPhone with your own free Apple ID (no App Store, no developer account — NOOP stays anonymous). Re-signs every 7 days (AltStore automates it); Apple Health + Live Activity widgets may be limited under a free signing identity. See [docs/IOS.md](docs/IOS.md). Or build from source in Xcode. |
 
 > **First launch on macOS.** NOOP is **not notarized** by Apple — notarization needs a paid Apple
 > Developer ID tied to a real identity, which doesn't fit an anonymous, free project. The app *is*
@@ -48,6 +79,23 @@ Pre-built apps you can run right now:
 >   earlier you can also right-click the app → **Open**.)
 >
 > Prefer to avoid this entirely? Build from source — see [Quickstart](#quickstart-macos).
+
+> **Installing on Android (Play Protect blocked it?).** NOOP isn't on the Play Store — it's an
+> **unsigned, source-available APK** you sideload, because the project is anonymous and has no paid
+> Play identity to publish or sign under. So Android treats it as an "unknown app" and **Google
+> Play Protect** may warn or block on install (most stubbornly on stock Pixel / recent Android).
+> Nothing is wrong with the file — it's just missing a Play signature. To get it on:
+>
+> - **Tap "Install anyway."** When the warning appears, choose **More details → Install anyway**.
+> - **No "Install anyway" button?** It can vanish after a first install + uninstall. Grant the source
+>   directly: **Settings → Apps → Special app access → Install unknown apps**, pick the **browser or
+>   file manager you're installing from**, turn on **"Allow from this source"**, then open the APK again.
+> - **Still blocked by Play Protect?** It's your call to make for an unsigned app you trust: open the
+>   **Play Store → your profile icon → Play Protect → ⚙ Settings**, toggle **"Scan apps with Play
+>   Protect" off**, install NOOP, then switch it **back on**.
+> - **Reinstalling is safe.** Uninstalling and installing again won't hurt anything — NOOP keeps all
+>   data on-device with `allowBackup=false`, so a reinstall simply starts fresh. There's no cloud copy
+>   to lose either way.
 
 Prefer to build it yourself? See [`docs/BUILD.md`](docs/BUILD.md).
 
@@ -118,7 +166,8 @@ that premise:
 
 The macOS reference app organizes everything behind a single sidebar
 (`Strand/App/RootView.swift`). Each item below is a real screen in
-`Strand/Screens/`.
+`Strand/Screens/`. The same feature set ships on macOS, Android, and iOS via the
+shared cross-platform code.
 
 | Screen | What it does |
 |---|---|
@@ -139,7 +188,7 @@ The macOS reference app organizes everything behind a single sidebar
 | **Data Sources** | One-tap import of a WHOOP CSV export or an Apple Health export, plus live-strap status. "Bring your history in once, then it's yours." |
 | **Notifications** | Configure local notifications and thresholds (`Strand/Data/NotificationSettingsStore.swift`). |
 | **Automations** | Turn the strap's physical inputs and live biometrics into Mac actions — all on-device (see below). |
-| **Coach** | An optional **AI Coach** you can ask about your data in plain language. It's the one feature that ever uses the network: off until you add your own OpenAI/Anthropic key, and it sends only a short text summary of recent metrics plus your question — never raw streams or identifiers. On the sandboxed macOS build it's blocked by the App Sandbox (no network entitlement); it works on Android. See [`docs/PRIVACY_SECURITY.md`](docs/PRIVACY_SECURITY.md). |
+| **Coach** | An optional **AI Coach** you can ask about your data in plain language. It's the one feature that can ever use the network: off until you add your own key — Anthropic, OpenAI, or any OpenAI-compatible endpoint including a local/self-hosted model (Ollama, LM Studio) — and it sends only a short text summary of recent metrics plus your question, never raw streams or identifiers. With a local model the conversation never leaves your machine. Available on macOS, Android, and iOS. See [`docs/PRIVACY_SECURITY.md`](docs/PRIVACY_SECURITY.md). |
 | **Settings** | Profile, preferences, the in-app **What's new** changelog, and an opt-in **Experimental** section (WHOOP 5/MG protocol probes). |
 | **Support** | Attribution + **optional** crypto donations. The whole app works without them. |
 
@@ -177,7 +226,7 @@ import required.
 |---|---|
 | **macOS** | ✅ Full app (`Strand/`, SwiftUI, macOS 13+). Pairs over BLE, offloads the strap's history, and scores recovery / strain / sleep on-device. The complete feature set above runs here. |
 | **Android** | ✅ Full app (`android/`, Jetpack Compose, Android 8+). Pairs over BLE, persists and scores on-device, and imports WHOOP / Apple Health / Health Connect. Grab the APK from [Releases](../../releases). |
-| **iOS** | 🟡 Libraries ready. Every package declares `.iOS(.v16)` and UI-framework code is guarded with `#if canImport(UIKit)` / `AppKit`; an iOS app target is planned. |
+| **iOS** | 📲 **Direct download** (v1.96): an unsigned `.ipa` you sideload with AltStore/SideStore — it signs on your iPhone with your *own* free Apple ID, so there's an anonymous install path with no App Store / developer account (see [docs/IOS.md](docs/IOS.md)). Also still builds from source in Xcode. Shares the cross-platform Swift packages, so scoring matches macOS. Newer and less battle-tested than macOS/Android — live BLE on a real iPhone is still being validated; Apple Health + Live Activity widgets can be limited under a free signing identity. |
 
 ### Strap support
 
@@ -185,8 +234,36 @@ NOOP is an independent, **experimental** project — capable, but a work in prog
 
 | Strap | Status |
 |---|---|
-| **WHOOP 4.0** | ✅ The tested, supported path. Live HR, recovery, strain, sleep, history offload — the full experience. |
-| **WHOOP 5.0 / MG** | 🧪 **Live heart rate works** (confirmed on real hardware). Pick "WHOOP 5.0 / MG" before connecting. Deeper 5/MG metrics (recovery, strain, sleep) are still being reverse-engineered; there's an opt-in **Settings → Experimental** toggle for 5/MG owners who want to help map the protocol. |
+| **WHOOP 4.0** | ✅ The tested, supported path. Live HR, recovery, strain, sleep, history offload — the full experience. (v1.95 also unlocked sleep + recovery on the newer "v25" 4.0 firmware layout that earlier versions could only read live HR from.) |
+| **WHOOP 5.0 / MG** | 🧪 **Live heart rate works** (confirmed on real hardware). Pick "WHOOP 5.0 / MG" before connecting — and see the pairing note below, because you can't just scan for it. Deeper 5/MG metrics (recovery, strain, sleep) are still being reverse-engineered; there's an opt-in **Settings → Experimental** toggle for 5/MG owners who want to help map the protocol. |
+
+> ### Pairing a WHOOP 5.0 / MG — read this first
+>
+> A WHOOP strap holds an encrypted Bluetooth **bond with only one device at a time**, and yours is
+> normally bonded to the **official WHOOP app** on your phone. **You can't just scan for it in NOOP** —
+> if the strap is still bonded to the WHOOP app, NOOP's pairing is refused and the strap log shows
+> *"Encryption is insufficient"* / *"bond refused."* (Live **heart rate** is the exception — it rides the
+> standard Bluetooth heart-rate profile, so it streams without a bond. But pairing — needed for the
+> deeper features — does not.)
+>
+> **To pair properly:**
+> 1. **Close the official WHOOP app** on your phone (fully quit it, or turn that phone's Bluetooth off) so
+>    it isn't holding the bond.
+> 2. **Put the strap in pairing mode** — on a 5.0/MG, **tap the band repeatedly** (firm taps on the
+>    sensor) until the **LEDs flash blue**.
+> 3. In NOOP: **Live → choose "WHOOP 5.0 / MG" → Scan & Connect.** Success looks like
+>    *"CLIENT_HELLO acked — link established"* in the strap log (not *"bond refused"*). It can take a
+>    couple of attempts.
+>
+> **Only one device at a time.** Because the strap holds a single bond, don't leave it connected to your
+> phone *and* your Mac (or the WHOOP app) at once — live heart rate will still show on all of them
+> (that rides the bond-free standard profile), but **none** of them will have the real encrypted bond.
+> If HR streams fine yet **buzz, alarm, double-tap and history don't work**, that's the tell: the strap
+> isn't truly bonded to this device. Free it from everything else, then pair here.
+>
+> Bonding to NOOP may take the strap's bond away from the WHOOP app, so the official app might need to
+> re-pair afterwards. This is the **hardest part of 5/MG support** — if it refuses, you're almost
+> certainly still bonded to the WHOOP app (or another device); free the strap and retry.
 
 The app always tells you what's live now versus still building, both in onboarding and on each screen.
 
@@ -386,7 +463,9 @@ crypto donation addresses are shown on the in-app **Support** screen and listed 
 [`docs/DONATIONS.md`](docs/DONATIONS.md). Donations are 100% optional and the app
 never asks twice.
 
-**Contact:** questions, feedback, and bug reports → [thenoopapp@gmail.com](mailto:thenoopapp@gmail.com)
+**Community:** questions, setup help, tips, and release news → **[r/NOOPApp](https://www.reddit.com/r/NOOPApp/)**.
+**Bug reports:** please use **[GitHub Issues](https://github.com/NoopApp/noop/issues)** — there's a template, and they're tracked, deduped and linked to fixes (include a strap log).
+**Contact:** [thenoopapp@gmail.com](mailto:thenoopapp@gmail.com)
 
 ---
 
