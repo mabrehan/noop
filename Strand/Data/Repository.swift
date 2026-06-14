@@ -13,6 +13,89 @@ struct ImportedSleepFigures: Equatable {
     var debtMin: Double?          // "sleep_debt_min", minutes
 }
 
+// MARK: - Cross-source resolver model (PR#196 — fresher live charts/metrics)
+//
+// Product surfaces (Compare, Insights, Stress, Explore, Today) historically read rows under the EXACT
+// requested source. That hid freshly-computed and Apple-compatible data that sat under a different
+// device id. `Repository.resolvedSeries` resolves a metric over an explicit source PRECEDENCE — imported
+// WHOOP wins, NOOP-computed fills the days it doesn't cover, and Apple Health only fills declared-
+// compatible vitals on days neither strap source has. These types model that resolution; the exact-source
+// reads (`series(key:source:)`) stay available for surfaces that must not mix sources.
+
+/// One day's resolved value plus the source that actually supplied it (so a caption can name it).
+struct ResolvedMetricPoint: Equatable, Sendable {
+    let day: String
+    let value: Double
+    let source: String
+    let sourceKey: String
+}
+
+/// A candidate (source, key) pair the resolver will try, in precedence order.
+struct MetricSourceCandidate: Equatable, Hashable, Sendable {
+    let source: String
+    let key: String
+}
+
+/// The full result of resolving one metric: which sources were tried, and the merged per-day points.
+struct MetricSeriesResolution: Equatable, Sendable {
+    let requestedSource: String
+    let candidates: [MetricSourceCandidate]
+    let points: [ResolvedMetricPoint]
+
+    /// Plain `(day, value)` rows — the shape the chart/correlation code already consumes.
+    var values: [(day: String, value: Double)] { points.map { ($0.day, $0.value) } }
+
+    /// Distinct sources that actually contributed a point, in first-seen order (for a caption).
+    var usedSources: [String] {
+        var seen = Set<String>()
+        var ordered: [String] = []
+        for point in points where !seen.contains(point.source) {
+            seen.insert(point.source)
+            ordered.append(point.source)
+        }
+        return ordered
+    }
+}
+
+/// Source provenance for daily rows before product surfaces merge them. The UI uses this to say
+/// where a vital came from without changing the stored data.
+enum DailyMetricSource: Equatable {
+    case whoopImport
+    case noopComputed
+    case appleHealth
+    case localCache
+
+    var vitalPriority: Int {
+        switch self {
+        case .whoopImport:  return 0
+        case .noopComputed: return 1
+        case .appleHealth:  return 2
+        case .localCache:   return 3
+        }
+    }
+}
+
+struct SourcedDailyMetric: Equatable {
+    let metric: DailyMetric
+    let source: DailyMetricSource
+}
+
+/// A compact snapshot of how much history each source holds, fed to the Data Sources "Freshness
+/// Pipeline" card and the Android equivalent. Counts only — no per-day rows leave the refresh.
+struct RepositoryFreshness: Equatable, Sendable {
+    var importedDays: Int = 0
+    var computedDays: Int = 0
+    var appleDays: Int = 0
+    var importedSleeps: Int = 0
+    var computedSleeps: Int = 0
+    var earliestDay: String?
+    var latestDay: String?
+
+    static let empty = RepositoryFreshness()
+
+    var hasAnyHistory: Bool { importedDays > 0 || computedDays > 0 || appleDays > 0 }
+}
+
 /// Read model over the on-device WhoopStore. Opens its own handle (WAL + busy-timeout makes the
 /// two-handle BLEManager+Repository pattern safe) and publishes the dashboard caches the screens bind to.
 @MainActor
@@ -31,6 +114,12 @@ final class Repository: ObservableObject {
     /// Imported (export-verbatim) sleep figures by day. Empty until a WHOOP import lands.
     @Published var importedSleep: [String: ImportedSleepFigures] = [:]
     @Published var loaded = false
+    /// How much history each source currently holds, recomputed on every `refresh()`. Powers the
+    /// Data Sources "Freshness Pipeline" card so the user can see imported vs computed vs Apple coverage.
+    @Published private(set) var freshness: RepositoryFreshness = .empty
+    /// Daily metric rows with source provenance, used by vital-sign surfaces that need honest
+    /// "WHOOP import / NOOP computed / Apple Health" captions instead of a silent merged row.
+    @Published private(set) var vitalRows: [SourcedDailyMetric] = []
     /// Monotonic counter bumped on every successful `refresh()`. Intraday-updating views key their
     /// data load on this so they reload when fresh strap data lands — `today?.day` alone is a stable
     /// date string within a day and would freeze e.g. the Today HR trend until the date rolls over.
@@ -38,12 +127,37 @@ final class Repository: ObservableObject {
 
     init(deviceId: String) { self.deviceId = deviceId }
 
-    /// Today's row, by the device's ACTUAL local calendar date — NOT just the newest stored row, which
-    /// after a historical import was months-old data shown as today's hero (issue #23). nil if no row
-    /// for today yet (the dashboard then shows its empty/pending state).
+    /// Today's row, by the device's LOGICAL local day — NOT just the newest stored row, which after a
+    /// historical import was months-old data shown as today's hero (issue #23). The logical day rolls at
+    /// 04:00 local (see `logicalDayKey`), so between midnight and 4am we keep resolving the prior logical
+    /// day's row instead of an empty new-calendar-day row that blanks the dashboard (#144). nil if no row
+    /// for that day yet (the dashboard then shows its empty/pending state). Presentation-only — stored
+    /// row keys are untouched.
+    ///
+    /// Non-UTC pre-04:00 carve-out (#304): a user who falls asleep before midnight and wakes before the
+    /// 04:00 rollover has the just-finished night banked under the NEW local calendar day (sleep is keyed
+    /// by the local wake-day — `mergeSleep` / IntelligenceEngine), while `logicalDayKey` still points at
+    /// yesterday. Resolving strictly by logical day would then surface the PREVIOUS night. So: if the
+    /// local calendar day differs from the logical day AND a row for the local day has a banked night
+    /// (`totalSleepMin != nil`), prefer that row. Otherwise fall back to the logical-day row — which keeps
+    /// the #144 anti-blank guard (no night banked yet ⇒ keep yesterday's logical row, never blank).
     var today: DailyMetric? {
-        let key = Repository.localDayKey(Date())
-        return days.last(where: { $0.day == key })
+        let now = Date()
+        return Repository.resolveToday(days: days,
+                                       logicalKey: Repository.logicalDayKey(now),
+                                       localKey: Repository.localDayKey(now))
+    }
+
+    /// Pure resolver behind `today` (extracted so the #304 boundary is testable without a live clock):
+    /// prefer the LOCAL-calendar-day row when it differs from the logical day AND has a banked night
+    /// (`totalSleepMin != nil`); otherwise the logical-day row (preserving the #144 anti-blank guard).
+    /// `localKey == logicalKey` (the common daytime case) collapses to the plain logical-day lookup.
+    nonisolated static func resolveToday(days: [DailyMetric], logicalKey: String, localKey: String) -> DailyMetric? {
+        if localKey != logicalKey,
+           let localRow = days.last(where: { $0.day == localKey && $0.totalSleepMin != nil }) {
+            return localRow
+        }
+        return days.last(where: { $0.day == logicalKey })
     }
     /// The trailing 7 CALENDAR days ending today (for the week strip), oldest→newest — not the last 7
     /// stored rows, which on a stale import were old data. ISO yyyy-MM-dd compares chronologically.
@@ -52,17 +166,70 @@ final class Repository: ObservableObject {
         return days.filter { $0.day >= cutoff }
     }
 
+    /// Source-aware rows for vital-sign cards. During previews/tests that set `days` directly,
+    /// fall back to the merged local cache so the component still renders.
+    var vitalMetricRows: [SourcedDailyMetric] {
+        vitalRows.isEmpty ? days.map { SourcedDailyMetric(metric: $0, source: .localCache) } : vitalRows
+    }
+
+    /// Canonical source ids the resolver knows how to cross-reference. The strap's actual id is
+    /// `deviceId` (and its computed sibling `deviceId + "-noop"`); these are the FIXED ids.
+    static let whoopSource = "my-whoop"
+    static let appleHealthSource = "apple-health"
+
     /// `yyyy-MM-dd` in the device's local zone, matching how `DailyMetric.day` is stored.
     private static let dayKeyFormatter: DateFormatter = {
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.locale = Locale(identifier: "en_US_POSIX"); return f
     }()
     static func localDayKey(_ date: Date) -> String { dayKeyFormatter.string(from: date) }
 
+    /// The hour the LOGICAL day rolls (04:00 local). Between midnight and this hour, "Today" stays put.
+    nonisolated static let logicalDayRolloverHour = 4
+
+    /// The LOGICAL local day for `now` — the calendar date of `now - rolloverHour hours`. Rolls at
+    /// 04:00 local rather than midnight, so the small hours after midnight still resolve to the prior
+    /// calendar date's row instead of an empty new-calendar-day row (#144). Pure + injectable so the
+    /// boundary is testable (23:59 → same day, 01:00 → previous day, 04:01 → new day). Presentation-only:
+    /// used solely to pick which stored row is Today and to anchor the Today HR-trend window start; stored
+    /// row keys are never rewritten.
+    static func logicalDay(_ now: Date, rolloverHour: Int = logicalDayRolloverHour) -> Date {
+        now.addingTimeInterval(-Double(rolloverHour) * 3_600)
+    }
+
+    /// `yyyy-MM-dd` key for the logical day of `now` (see `logicalDay`).
+    static func logicalDayKey(_ now: Date, rolloverHour: Int = logicalDayRolloverHour) -> String {
+        localDayKey(logicalDay(now, rolloverHour: rolloverHour))
+    }
+
+    /// Start of the logical day (its real calendar midnight) for `now`, in `calendar`'s zone — the anchor
+    /// for the Today HR-trend window so it spans from the logical day's 00:00 rather than restarting at the
+    /// new calendar midnight while we're still showing yesterday's logical day in the small hours (#144).
+    static func logicalDayStart(_ now: Date, calendar: Calendar = .current,
+                                rolloverHour: Int = logicalDayRolloverHour) -> Date {
+        calendar.startOfDay(for: logicalDay(now, rolloverHour: rolloverHour))
+    }
+
     private func ensureStore() async -> WhoopStore? {
         if let store { return store }
-        guard let path = try? StorePaths.defaultDatabasePath() else { return nil }
-        let s = try? await WhoopStore(path: path)
-        if let s { try? await s.upsertDevice(id: deviceId, mac: nil, name: "WHOOP") }
+        // Don't swallow the open failure with `try?` (#222): an import-time open failure (e.g. the iOS
+        // data-protected store while the device is locked) was previously invisible, surfacing only as a
+        // generic "Couldn't open the local store." Log the real error so the cause is diagnosable.
+        let path: String
+        do {
+            path = try StorePaths.defaultDatabasePath()
+        } catch {
+            NSLog("WhoopStore: ensureStore FAILED resolving DB path — \(error)")
+            return nil
+        }
+        let s: WhoopStore
+        do {
+            s = try await WhoopStore(path: path)
+        } catch {
+            let ns = error as NSError
+            NSLog("WhoopStore: ensureStore FAILED opening store — \(ns.domain) code=\(ns.code): \(ns.localizedDescription)")
+            return nil
+        }
+        try? await s.upsertDevice(id: deviceId, mac: nil, name: "WHOOP")
         store = s
         return s
     }
@@ -90,6 +257,7 @@ final class Repository: ObservableObject {
 
         let imported = (try? await store.dailyMetrics(deviceId: deviceId, from: fromDay, to: toDay)) ?? []
         let computed = (try? await store.dailyMetrics(deviceId: computedDeviceId, from: fromDay, to: toDay)) ?? []
+        let apple = (try? await store.dailyMetrics(deviceId: Self.appleHealthSource, from: fromDay, to: toDay)) ?? []
         let impSleep = (try? await store.sleepSessions(deviceId: deviceId, from: lo, to: hi, limit: 4000)) ?? []
         let compSleep = (try? await store.sleepSessions(deviceId: computedDeviceId, from: lo, to: hi, limit: 4000)) ?? []
 
@@ -108,16 +276,59 @@ final class Repository: ObservableObject {
         self.importedSleep = fig   // assigned BEFORE days/sleeps: one consistent publish per refresh
         self.days = Self.mergeDaily(imported: imported, computed: computed)
         self.sleeps = Self.mergeSleep(imported: impSleep, computed: compSleep)
+        self.vitalRows = Self.sourceRows(imported: imported, computed: computed, apple: apple)
+        self.freshness = Self.computeFreshness(imported: imported, computed: computed, apple: apple,
+                                               importedSleeps: impSleep, computedSleeps: compSleep)
         self.loaded = true
         self.refreshSeq += 1
     }
 
-    /// Imported daily rows win per day; computed rows fill the days the import doesn't cover.
-    private static func mergeDaily(imported: [DailyMetric], computed: [DailyMetric]) -> [DailyMetric] {
+    /// Per-source coverage counts for the Freshness Pipeline card. Pure over the rows already read.
+    private static func computeFreshness(imported: [DailyMetric], computed: [DailyMetric],
+                                         apple: [DailyMetric], importedSleeps: [CachedSleepSession],
+                                         computedSleeps: [CachedSleepSession]) -> RepositoryFreshness {
+        let days = (imported + computed + apple).map(\.day)
+        return RepositoryFreshness(
+            importedDays: imported.count,
+            computedDays: computed.count,
+            appleDays: apple.count,
+            importedSleeps: importedSleeps.count,
+            computedSleeps: computedSleeps.count,
+            earliestDay: days.min(),
+            latestDay: days.max()
+        )
+    }
+
+    /// Imported daily values win field-by-field; computed rows fill only nil imported fields.
+    /// This preserves official export/import values while allowing fresh local analysis to populate
+    /// Charge, skin temperature deviation, activity totals, or other fields missing from that row.
+    nonisolated static func mergeDaily(imported: [DailyMetric], computed: [DailyMetric]) -> [DailyMetric] {
         var byDay: [String: DailyMetric] = [:]
-        for d in computed { byDay[d.day] = d }   // computed first…
-        for d in imported { byDay[d.day] = d }   // …import overwrites, so a real WHOOP import always wins
+        for d in computed { byDay[d.day] = d }
+        for d in imported {
+            if let existing = byDay[d.day] {
+                byDay[d.day] = d.fillingNilFields(from: existing)
+            } else {
+                byDay[d.day] = d
+            }
+        }
         return byDay.values.sorted { $0.day < $1.day }
+    }
+
+    /// Daily rows tagged with the source that supplied them, for the source-aware vital-sign cards.
+    /// One entry per (source, day) — the consumer resolves precedence per metric (imported > computed
+    /// > Apple); ordered by day, then source priority, so a stable list reaches the UI.
+    private static func sourceRows(imported: [DailyMetric], computed: [DailyMetric],
+                                   apple: [DailyMetric]) -> [SourcedDailyMetric] {
+        (imported.map { SourcedDailyMetric(metric: $0, source: .whoopImport) }
+            + computed.map { SourcedDailyMetric(metric: $0, source: .noopComputed) }
+            + apple.map { SourcedDailyMetric(metric: $0, source: .appleHealth) })
+            .sorted { lhs, rhs in
+                if lhs.metric.day == rhs.metric.day {
+                    return lhs.source.vitalPriority < rhs.source.vitalPriority
+                }
+                return lhs.metric.day < rhs.metric.day
+            }
     }
 
     /// Same precedence for sleep sessions, keyed by the day the night ends on.
@@ -155,6 +366,33 @@ final class Repository: ObservableObject {
         return (try? await store.sleepSessions(deviceId: deviceId, from: from, to: to, limit: limit)) ?? []
     }
 
+    /// Every sleep BLOCK across BOTH sources, UN-deduplicated — so a split-sleep day (a nap
+    /// + a main sleep, or any night recorded as multiple blocks) keeps ALL of its blocks.
+    /// `sleeps` collapses each day to a single winner for the dashboard; this does not.
+    ///
+    /// Crucially this reads the on-device COMPUTED source (`computedDeviceId`) directly, not
+    /// just the imported `deviceId`. A Bluetooth-only user (no WHOOP/Apple-Health import) has
+    /// every block under the computed source, so a loader that only un-dedupes the imported
+    /// device sees nothing to expand and silently falls back to the deduped one-per-day list —
+    /// hiding the day's extra blocks. Imported blocks still win on any day they cover (matching
+    /// the dashboard's imported-wins merge); computed blocks fill days with no import.
+    /// Oldest→newest by onset.
+    func allSleepSessions(days: Int = 4000) async -> [CachedSleepSession] {
+        guard let store = await ensureStore() else { return [] }
+        let now = Int(Date().timeIntervalSince1970)
+        let lo = now - days * 86_400, hi = now + 86_400
+        let imported = (try? await store.sleepSessions(deviceId: deviceId, from: lo, to: hi, limit: 4000)) ?? []
+        let computed = (try? await store.sleepSessions(deviceId: computedDeviceId, from: lo, to: hi, limit: 4000)) ?? []
+        let cal = Calendar.current
+        func endDay(_ s: CachedSleepSession) -> Date {
+            cal.startOfDay(for: Date(timeIntervalSince1970: TimeInterval(s.endTs)))
+        }
+        var importedDays = Set<Date>()
+        for s in imported { importedDays.insert(endDay(s)) }
+        let computedKept = computed.filter { !importedDays.contains(endDay($0)) }
+        return (imported + computedKept).sorted { $0.startTs < $1.startTs }
+    }
+
     // MARK: - Metric explorer reads (generic substrate)
 
     /// Daily series for any metric key from a given source ("my-whoop" / "apple-health").
@@ -165,6 +403,175 @@ final class Repository: ObservableObject {
         let to = Self.dayString(now.addingTimeInterval(86_400))
         let pts = (try? await store.metricSeries(deviceId: source, key: key, from: from, to: to)) ?? []
         return pts.map { ($0.day, $0.value) }
+    }
+
+    // MARK: - Cross-source resolver (PR#196)
+
+    /// Product-facing daily series for a metric across every COMPATIBLE source, freshest-wins. Use this
+    /// on surfaces where the user expects the best available signal (Compare/Insights/Stress/Explore/
+    /// Today); use `series(key:source:)` where a single source must be honoured verbatim. Precedence is
+    /// explicit per `sourceCandidates`: imported WHOOP > NOOP-computed > declared-compatible Apple Health.
+    func resolvedSeries(key: String, source preferredSource: String, days: Int = 4000) async -> MetricSeriesResolution {
+        let candidates = Self.sourceCandidates(forKey: key, preferredSource: preferredSource,
+                                               actualWhoopSource: deviceId)
+        guard let store = await ensureStore() else {
+            return MetricSeriesResolution(requestedSource: preferredSource, candidates: candidates, points: [])
+        }
+        let now = Date()
+        let from = Self.dayString(now.addingTimeInterval(-Double(days) * 86_400))
+        let to = Self.dayString(now.addingTimeInterval(86_400))
+
+        // First candidate wins per day; later candidates only fill days no earlier one covered.
+        var byDay: [String: ResolvedMetricPoint] = [:]
+        for candidate in candidates {
+            let rows = await resolvedRows(store: store, candidate: candidate, from: from, to: to)
+            for row in rows where byDay[row.day] == nil {
+                byDay[row.day] = ResolvedMetricPoint(day: row.day, value: row.value,
+                                                     source: candidate.source, sourceKey: candidate.key)
+            }
+        }
+        let points = byDay.values.sorted { $0.day < $1.day }
+        return MetricSeriesResolution(requestedSource: preferredSource, candidates: candidates, points: points)
+    }
+
+    /// Read one candidate's rows for the window: its metricSeries, plus the matching DailyMetric column
+    /// for any day the metricSeries doesn't carry (a Bluetooth-only WHOOP 5 user has values in the daily
+    /// columns but not the long-format series). Ascending by day.
+    private func resolvedRows(store: WhoopStore, candidate: MetricSourceCandidate,
+                             from: String, to: String) async -> [(day: String, value: Double)] {
+        let metricRows = (try? await store.metricSeries(deviceId: candidate.source, key: candidate.key,
+                                                        from: from, to: to)) ?? []
+        var byDay = Dictionary(metricRows.map { ($0.day, $0.value) }, uniquingKeysWith: { _, last in last })
+        if let dailyRows = try? await store.dailyMetrics(deviceId: candidate.source, from: from, to: to) {
+            for row in dailyRows where byDay[row.day] == nil {
+                if let value = Self.dailyColumn(key: candidate.key, day: row) { byDay[row.day] = value }
+            }
+        }
+        return byDay.keys.sorted().compactMap { day in byDay[day].map { (day, $0) } }
+    }
+
+    /// The candidate (source, key) pairs to try for `key`, in precedence order, given the user's
+    /// `preferredSource`. The strap's real id is `actualWhoopSource` (`deviceId`), so the computed
+    /// sibling is `actualWhoopSource + "-noop"`.
+    ///  • strap-preferred → [imported strap, computed strap, compatible Apple] (Apple only for vitals
+    ///    that have a declared 1:1 mapping);
+    ///  • Apple-preferred → [Apple] (+ computed strap ONLY for steps/active_kcal, which the strap
+    ///    estimates and Apple may not carry);
+    ///  • any other source → itself only (nutrition/mood are single-source by design).
+    static func sourceCandidates(forKey key: String, preferredSource: String,
+                                 actualWhoopSource: String) -> [MetricSourceCandidate] {
+        let computedSource = actualWhoopSource + "-noop"
+        func uniqued(_ cs: [MetricSourceCandidate]) -> [MetricSourceCandidate] {
+            var seen = Set<MetricSourceCandidate>(); var out: [MetricSourceCandidate] = []
+            for c in cs where !seen.contains(c) { seen.insert(c); out.append(c) }
+            return out
+        }
+
+        if preferredSource == whoopSource || preferredSource == actualWhoopSource {
+            var candidates = [
+                MetricSourceCandidate(source: actualWhoopSource, key: key),
+                MetricSourceCandidate(source: computedSource, key: key),
+            ]
+            if let appleKey = appleCompatibleKey(forWhoopKey: key) {
+                candidates.append(MetricSourceCandidate(source: appleHealthSource, key: appleKey))
+            }
+            return uniqued(candidates)
+        }
+        if preferredSource == appleHealthSource {
+            var candidates = [MetricSourceCandidate(source: appleHealthSource, key: key)]
+            if noopComputedCanFillAppleMetric(key) {
+                candidates.append(MetricSourceCandidate(source: computedSource, key: key))
+            }
+            return uniqued(candidates)
+        }
+        return [MetricSourceCandidate(source: preferredSource, key: key)]
+    }
+
+    /// The Apple-Health series key that carries the SAME physiological quantity as a WHOOP key — used
+    /// only for the declared-compatible vitals; nil means "no Apple equivalent, don't fall back to it".
+    static func appleCompatibleKey(forWhoopKey key: String) -> String? {
+        switch key {
+        case "rhr":              return "resting_hr"
+        case "hrv", "spo2", "resp_rate", "avg_hr", "max_hr", "in_bed_min", "active_kcal":
+            return key
+        case "sleep_total_min":  return "asleep_min"
+        case "sleep_deep_min":   return "deep_min"
+        case "sleep_rem_min":    return "rem_min"
+        case "sleep_light_min":  return "core_min"
+        default:                 return nil
+        }
+    }
+
+    /// Whether the NOOP-computed strap source may fill an Apple-preferred metric. Only the two daily
+    /// totals the strap genuinely estimates (steps, calories) — never a derived WHOOP score.
+    private static func noopComputedCanFillAppleMetric(_ key: String) -> Bool {
+        switch key {
+        case "steps", "active_kcal": return true
+        default:                     return false
+        }
+    }
+
+    /// The Explore read path (#199). Like `series(key:source:)` but, for the strap source
+    /// ("my-whoop"), falls back to the on-device COMPUTED dailies a Bluetooth-only WHOOP 5 user
+    /// has (no CSV/Health import) — so Charge/Rest/Effort/Health metrics still resolve. Three layers,
+    /// imported-wins per day:
+    ///  1. the imported metricSeries under `deviceId` (a real WHOOP export);
+    ///  2. the COMPUTED metricSeries under `computedDeviceId` — for keys written there but absent from
+    ///     the DailyMetric columns (notably `sleep_performance`, IntelligenceEngine's Rest composite);
+    ///  3. the merged daily metrics (`self.days`, imported ∪ computed) for keys with a DailyMetric
+    ///     column — the same key→column map InsightsView.dailyOutcome / Android's dailyPick use,
+    ///     extended to the full daily column set.
+    /// Any OTHER source (apple-health / nutrition-csv / noop-mood) reads only its own series, unchanged.
+    func exploreSeries(key: String, source: String, days: Int = 4000) async -> [(day: String, value: Double)] {
+        guard source == "my-whoop" else { return await series(key: key, source: source, days: days) }
+        guard let store = await ensureStore() else { return [] }
+        let now = Date()
+        let from = Self.dayString(now.addingTimeInterval(-Double(days) * 86_400))
+        let to = Self.dayString(now.addingTimeInterval(86_400))
+
+        // day → value, lowest-priority source first; higher-priority sources overwrite per day so a
+        // real import always wins over the computed strap value.
+        var byDay: [String: Double] = [:]
+
+        // Layer 3 (lowest): merged daily column for keys that have one. `self.days` is the published
+        // imported ∪ computed daily cache (parameter `days` is the lookback window, not this).
+        for d in self.days where byDay[d.day] == nil {
+            if let v = Self.dailyColumn(key: key, day: d) { byDay[d.day] = v }
+        }
+        // Layer 2: computed metricSeries (covers sleep_performance, which has no daily column).
+        let computedPts = (try? await store.metricSeries(deviceId: computedDeviceId, key: key, from: from, to: to)) ?? []
+        for p in computedPts { byDay[p.day] = p.value }
+        // Layer 1 (highest): the imported export's metricSeries.
+        let importedPts = (try? await store.metricSeries(deviceId: deviceId, key: key, from: from, to: to)) ?? []
+        for p in importedPts { byDay[p.day] = p.value }
+
+        return byDay.sorted { $0.key < $1.key }.map { (day: $0.key, value: $0.value) }
+    }
+
+    /// The merged DailyMetric column backing an Explore metric key, for the days the imported/computed
+    /// metricSeries doesn't cover (strap-only WHOOP 5 users). Mirrors InsightsView.dailyOutcome and
+    /// Android's dailyPick, extended to every Explore "my-whoop" key that maps to a daily column.
+    /// Also handles the Apple-compatible sleep aliases (asleep_min / deep_min / rem_min / core_min) the
+    /// resolver may request when filling an Apple candidate from its daily columns. Keys with no daily
+    /// column (avg_hr / max_hr / sleep_performance …) return nil — they resolve from metricSeries only.
+    private static func dailyColumn(key: String, day d: DailyMetric) -> Double? {
+        switch key {
+        case "recovery":         return d.recovery
+        case "hrv":              return d.avgHrv
+        case "rhr", "resting_hr": return d.restingHr.map(Double.init)
+        case "strain":           return d.strain
+        case "resp_rate":        return d.respRateBpm
+        case "spo2":             return d.spo2Pct
+        case "skin_temp":        return d.skinTempDevC
+        case "sleep_total_min", "asleep_min": return d.totalSleepMin
+        case "sleep_efficiency": return d.efficiency
+        case "sleep_deep_min", "deep_min": return d.deepMin
+        case "sleep_rem_min", "rem_min":   return d.remMin
+        case "sleep_light_min", "core_min": return d.lightMin
+        case "steps":            return d.steps.map(Double.init)
+        case "active_kcal", "energy_kcal": return d.activeKcalEst
+        default:                 return nil
+        }
     }
 
     func availableKeys(source: String) async -> [String] {
@@ -213,7 +620,7 @@ final class Repository: ObservableObject {
 
     /// Union; the NATIVE row wins per (day, question) — the in-app answer is the user's most recent
     /// explicit action and stays editable, unlike the immutable imported history.
-    static func mergeJournal(imported: [JournalEntry], native: [JournalEntry]) -> [JournalEntry] {
+    nonisolated static func mergeJournal(imported: [JournalEntry], native: [JournalEntry]) -> [JournalEntry] {
         var byKey: [String: JournalEntry] = [:]
         for e in imported { byKey[e.day + "\u{1F}" + e.question] = e }
         for e in native { byKey[e.day + "\u{1F}" + e.question] = e }
@@ -248,6 +655,8 @@ final class Repository: ObservableObject {
         var rows = (try? await store.workouts(deviceId: deviceId, from: lo, to: hi, limit: 5000)) ?? []
         rows += (try? await store.workouts(deviceId: "apple-health", from: lo, to: hi, limit: 5000)) ?? []
         rows += (try? await store.workouts(deviceId: computedDeviceId, from: lo, to: hi, limit: 5000)) ?? []
+        // Imported lifting sessions (Hevy / Liftosaur) live under their own "lifting" source.
+        rows += (try? await store.workouts(deviceId: "lifting", from: lo, to: hi, limit: 5000)) ?? []
         let spans = WorkoutSource.parseDismissedSpans(dismissedDetectedSpans)
         return rows.filter { !WorkoutSource.isDismissed($0, spans: spans) }
             .sorted { $0.startTs > $1.startTs }
@@ -347,4 +756,31 @@ final class Repository: ObservableObject {
     }()
 
     static func dayString(_ d: Date) -> String { dayFormatter.string(from: d) }
+}
+
+private extension DailyMetric {
+    /// A copy of self where every nil field is backfilled from `fallback`. Used by the field-by-field
+    /// daily merge so an imported export keeps its own values while a computed row fills the gaps it
+    /// doesn't carry (e.g. on-device Charge / skin-temp deviation / activity totals).
+    func fillingNilFields(from fallback: DailyMetric) -> DailyMetric {
+        DailyMetric(
+            day: day,
+            totalSleepMin: totalSleepMin ?? fallback.totalSleepMin,
+            efficiency: efficiency ?? fallback.efficiency,
+            deepMin: deepMin ?? fallback.deepMin,
+            remMin: remMin ?? fallback.remMin,
+            lightMin: lightMin ?? fallback.lightMin,
+            disturbances: disturbances ?? fallback.disturbances,
+            restingHr: restingHr ?? fallback.restingHr,
+            avgHrv: avgHrv ?? fallback.avgHrv,
+            recovery: recovery ?? fallback.recovery,
+            strain: strain ?? fallback.strain,
+            exerciseCount: exerciseCount ?? fallback.exerciseCount,
+            spo2Pct: spo2Pct ?? fallback.spo2Pct,
+            skinTempDevC: skinTempDevC ?? fallback.skinTempDevC,
+            respRateBpm: respRateBpm ?? fallback.respRateBpm,
+            steps: steps ?? fallback.steps,
+            activeKcalEst: activeKcalEst ?? fallback.activeKcalEst
+        )
+    }
 }

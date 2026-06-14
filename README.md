@@ -16,6 +16,14 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/NoopApp/noop/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/NoopApp/noop?style=flat-square&label=latest&color=18C98B"></a>
+  <a href="https://github.com/NoopApp/noop/releases"><img alt="Total downloads" src="https://img.shields.io/github/downloads/NoopApp/noop/total?style=flat-square&label=downloads&color=2FE6A8"></a>
+  <a href="https://github.com/NoopApp/noop/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/NoopApp/noop?style=flat-square&color=18C98B"></a>
+  <a href="https://github.com/NoopApp/noop/issues?q=is%3Aissue+is%3Aclosed"><img alt="Issues resolved" src="https://img.shields.io/github/issues-closed/NoopApp/noop?style=flat-square&label=resolved&color=2FE6A8"></a>
+  <a href="https://github.com/NoopApp/noop/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/NoopApp/noop?style=flat-square&label=last%20commit&color=8B9690"></a>
+</p>
+
+<p align="center">
   <a href="#keeping-noop-alive">♥&nbsp;Support</a> ·
   <a href="#download">⬇&nbsp;Download</a> ·
   <a href="https://www.reddit.com/r/NOOPApp/">💬&nbsp;Community</a> ·
@@ -30,7 +38,9 @@
 
 NOOP is **free, forever** — no account, no cloud, no subscription, every feature unlocked, no nag. That doesn't change.
 
-But here's the honest reality, up front: **NOOP is built and maintained by one person, out of pocket.** Reverse-engineering WHOOP's hardware — and keeping up as its firmware changes — takes real time and real test hardware. **The project continues if the people who use it help fund it. If that doesn't happen, it can't.** No drama, no guilt — just the maths of an unfunded project.
+But here's the honest reality, up front: **NOOP is built and maintained by one person, out of pocket.** Building interoperability support for WHOOP's hardware — and keeping up as its firmware changes — takes real time and real test hardware. **The project continues if the people who use it help fund it. If that doesn't happen, it can't.** No drama, no guilt — just the maths of an unfunded project.
+
+📰 **Featured in** [AOL](https://www.aol.com/articles/open-source-app-lets-whoop-231700000.html) · [Yahoo](https://tech.yahoo.com/wearables/articles/open-source-app-lets-whoop-081754863.html) · [Android Authority](https://www.androidauthority.com/open-source-whoop-app-3673542/) · [TechRadar](https://www.techradar.com/health-fitness/fitness-trackers/this-looks-awesome-theres-now-an-unofficial-open-source-app-for-reading-whoop-data-that-doesnt-need-a-subscription) · [BGR](https://www.bgr.com/2193528/noop-app-use-whoop-band-without-subscription-fee/) · [Android Central](https://www.androidcentral.com/wearables/this-open-source-app-lets-you-use-your-whoop-without-a-monthly-fee) · [Android Police](https://www.androidpolice.com/i-tried-open-source-whoop-app/) · [Notebookcheck](https://www.notebookcheck.net/Whoop-users-could-soon-be-free-from-expensive-subscriptions-thanks-to-this-open-source-app.1314364.0.html) · [Trusted Reviews](https://www.trustedreviews.com/news/this-open-source-app-could-let-whoop-users-ditch-the-subscription) — **and used by thousands.** If even a small fraction of them tipped, NOOP's future would be secure for a long time to come.
 
 If NOOP saves you a subscription, or you just want WHOOP 5.0/MG support finished and the work to keep going, **chipping in is what genuinely decides that.** It's optional, one-off, and tied to nothing about your data or access — there's no server and no record of who has or hasn't.
 
@@ -39,7 +49,7 @@ If NOOP saves you a subscription, or you just want WHOOP 5.0/MG support finished
 Donations are **crypto-only**, on purpose: staying anonymous (for the project *and* for you) rules out PayPal, Patreon, or anything with a name attached. If you don't already hold any:
 
 1. **Install a mainstream exchange app** — Coinbase, Binance, Kraken, or **Cash App** (Cash App handles Bitcoin directly).
-2. **Buy a small amount of Bitcoin (BTC) or Ethereum (ETH)** — even $5–10 is genuinely helpful.
+2. **Buy some Bitcoin (BTC) or Ethereum (ETH)** — a suggested **$50+** genuinely keeps the project alive (it's a fraction of a year's WHOOP subscription). Anything is appreciated, but $50+ is what moves the needle.
 3. **Tap Send / Withdraw, paste the matching address below, and send.** That's it. (Only ever send a coin to its own network.)
 
 | Coin | Network | Address |
@@ -58,6 +68,13 @@ Each address also has a scan-to-donate **QR code** in the app under **Support** 
 ## Download
 
 Pre-built apps you can run right now:
+
+<p>
+  <a href="https://github.com/NoopApp/noop/releases/latest"><img alt="Version" src="https://img.shields.io/github/v/release/NoopApp/noop?style=flat-square&label=version&color=18C98B"></a>
+  <img alt="Total downloads" src="https://img.shields.io/github/downloads/NoopApp/noop/total?style=flat-square&label=total%20downloads&color=2FE6A8">
+  <img alt="Downloads of this release" src="https://img.shields.io/github/downloads/NoopApp/noop/latest/total?style=flat-square&label=this%20release&color=2FE6A8">
+  <img alt="Released" src="https://img.shields.io/github/release-date/NoopApp/noop?style=flat-square&label=released&color=8B9690">
+</p>
 
 | Platform | Build | Notes |
 |---|---|---|
@@ -109,7 +126,7 @@ own device in SQLite, imports your existing WHOOP and Apple Health history, and
 computes recovery, strain, HRV, and sleep **locally**, with no WHOOP account and
 no WHOOP cloud.
 
-It is built on prior community reverse-engineering work and exists for one
+It is built on prior community interoperability work and exists for one
 reason: to let someone who owns a WHOOP strap read **their own biometric data**
 from **their own device**, on a machine **they** control.
 
@@ -171,25 +188,26 @@ shared cross-platform code.
 
 | Screen | What it does |
 |---|---|
-| **Today** (Control Center) | Home dashboard: recovery ring, a "today's synthesis" insight, a grid of stat tiles (recovery, strain, sleep, HRV, RHR, SpO₂, respiratory, steps, weight, calories) each with a 14-day sparkline, recent workouts, and a data-sources footer. |
+| **Today** (Control Center) | Home dashboard: recovery ring, a "today's synthesis" insight, a grid of stat tiles (recovery, strain, sleep, HRV, RHR, SpO₂, respiratory, steps, weight, calories) each with a 14-day sparkline, live strap **battery %** and HR trend, recent workouts, and a data-sources footer. |
 | **Readiness** | An on-device "should you push today?" read that synthesizes established sports-science signals from your own history — HRV vs your baseline (Plews/Buchheit), resting-HR drift (Lamberts), sleeping respiratory-rate drift, training-load balance (acute:chronic workload ratio, Gabbett) and training monotony (Foster) — into a single headline (Primed / Balanced / Strained / Run down) with the drivers behind it. Pure local math, not medical advice. |
 | **Live** | Real-time view of the connected strap — heart rate and frame stream as they arrive (~1 Hz). |
-| **Breathe** | **HRV haptic breathing biofeedback.** The strap both *measures* HRV (R-R intervals) and *buzzes* its haptic motor, so NOOP paces your breath with felt cues (one buzz inhale, two exhale) and shows live HR + rolling RMSSD responding as the session deepens. Presets: Relax 4-6, Coherence 5.5, Box 4-4. |
+| **Breathe** | **HRV haptic breathing biofeedback.** The strap both *measures* HRV (R-R intervals) and *buzzes* its haptic motor, so NOOP paces your breath with felt cues (one buzz inhale, two exhale) and shows live HR + rolling RMSSD responding as the session deepens. Presets: Relax 4-6, Coherence 5.5, Box 4-4. Each session reports a **pre/post HRV outcome** so you can see how much you settled. |
 | **Intervals** | **Silent haptic HIIT timer.** The strap buzzes every transition (triple-buzz into WORK, single into REST, 3-2-1 tick at phase ends, long buzz on finish) so you train hands-free. Falls back to a glanceable visual timer with no strap. |
 | **Explore** (Metric Explorer) | Interrogate any single metric over time, built from the metric catalog (`Strand/Data/MetricCatalog.swift`). |
 | **Compare** | Plot two metrics together / against each other over a shared timeline. |
 | **Insights** | Behavioral and correlational insights derived from your own series. |
-| **Sleep** | Sleep sessions with a hypnogram, stage breakdown, efficiency, resting HR, and HRV — computed by the on-device sleep stager. |
+| **Sleep** | Sleep sessions with a hypnogram, stage breakdown, efficiency, resting HR, and HRV — computed by the on-device sleep stager. Browse back through **past nights**, not just last night. |
 | **Trends** | Long-range trends across recovery, strain, sleep, and biometrics. |
 | **Workouts** | Detected exercise sessions with strain and heart-rate detail. |
 | **Health** | Biometric overview (HR, HRV, SpO₂, skin temperature, respiratory rate, etc.). |
 | **Stress** | Day-level stress / autonomic load visualization. |
+| **Mind** | A quick **daily mood check-in** that correlates how you feel against your own recovery, sleep and HRV over time — so you can see what actually moves your mood. On-device and **non-clinical**: a self-reflection log, not a mental-health assessment. |
 | **Apple Health** | Browse and reconcile data imported from your Apple Health export. |
-| **Data Sources** | One-tap import of a WHOOP CSV export or an Apple Health export, plus live-strap status. "Bring your history in once, then it's yours." |
+| **Data Sources** | One-tap import of a WHOOP CSV export, an Apple Health export, or a **nutrition CSV** (Cronometer / MacroFactor), plus live-strap status. "Bring your history in once, then it's yours." |
 | **Notifications** | Configure local notifications and thresholds (`Strand/Data/NotificationSettingsStore.swift`). |
 | **Automations** | Turn the strap's physical inputs and live biometrics into Mac actions — all on-device (see below). |
 | **Coach** | An optional **AI Coach** you can ask about your data in plain language. It's the one feature that can ever use the network: off until you add your own key — Anthropic, OpenAI, or any OpenAI-compatible endpoint including a local/self-hosted model (Ollama, LM Studio) — and it sends only a short text summary of recent metrics plus your question, never raw streams or identifiers. With a local model the conversation never leaves your machine. Available on macOS, Android, and iOS. See [`docs/PRIVACY_SECURITY.md`](docs/PRIVACY_SECURITY.md). |
-| **Settings** | Profile, preferences, the in-app **What's new** changelog, and an opt-in **Experimental** section (WHOOP 5/MG protocol probes). |
+| **Settings** | Profile, preferences, **step calibration** (tune the stride/step estimate to your own walking), unit choices, the in-app **What's new** changelog, and an opt-in **Experimental** section (WHOOP 5/MG protocol probes). On **iOS**, also **Export for Shortcuts** — a HealthKit-free path that hands your metrics to Apple Health via the Shortcuts app. |
 | **Support** | Attribution + **optional** crypto donations. The whole app works without them. |
 
 There is also a **menu-bar extra** (`Strand/MenuBar/MenuBarContent.swift`) with a
@@ -222,11 +240,18 @@ storage, analytics, and scoring is ported to Kotlin on Android. Both apps pair
 with the strap and **score recovery, strain and sleep on your own device** — no
 import required.
 
+<p>
+  <a href="https://github.com/NoopApp/noop/releases/latest"><img alt="Latest across all platforms" src="https://img.shields.io/github/v/release/NoopApp/noop?style=flat-square&label=all%20platforms&color=18C98B"></a>
+  <img alt="Commits per month" src="https://img.shields.io/github/commit-activity/m/NoopApp/noop?style=flat-square&label=commits%2Fmo&color=2FE6A8">
+  <img alt="Top language" src="https://img.shields.io/github/languages/top/NoopApp/noop?style=flat-square&color=18C98B">
+  <img alt="Code size" src="https://img.shields.io/github/languages/code-size/NoopApp/noop?style=flat-square&label=code&color=8B9690">
+</p>
+
 | Platform | Status |
 |---|---|
 | **macOS** | ✅ Full app (`Strand/`, SwiftUI, macOS 13+). Pairs over BLE, offloads the strap's history, and scores recovery / strain / sleep on-device. The complete feature set above runs here. |
 | **Android** | ✅ Full app (`android/`, Jetpack Compose, Android 8+). Pairs over BLE, persists and scores on-device, and imports WHOOP / Apple Health / Health Connect. Grab the APK from [Releases](../../releases). |
-| **iOS** | 📲 **Direct download** (v1.96): an unsigned `.ipa` you sideload with AltStore/SideStore — it signs on your iPhone with your *own* free Apple ID, so there's an anonymous install path with no App Store / developer account (see [docs/IOS.md](docs/IOS.md)). Also still builds from source in Xcode. Shares the cross-platform Swift packages, so scoring matches macOS. Newer and less battle-tested than macOS/Android — live BLE on a real iPhone is still being validated; Apple Health + Live Activity widgets can be limited under a free signing identity. |
+| **iOS** | 📲 **Direct download**: an unsigned `.ipa` you sideload with AltStore/SideStore — it signs on your iPhone with your *own* free Apple ID, so there's an anonymous install path with no App Store / developer account (see [docs/IOS.md](docs/IOS.md)). Also still builds from source in Xcode. Shares the cross-platform Swift packages, so scoring matches macOS. Newer and less battle-tested than macOS/Android — live BLE on a real iPhone is still being validated; Apple Health + Live Activity widgets can be limited under a free signing identity. |
 
 ### Strap support
 
@@ -235,7 +260,7 @@ NOOP is an independent, **experimental** project — capable, but a work in prog
 | Strap | Status |
 |---|---|
 | **WHOOP 4.0** | ✅ The tested, supported path. Live HR, recovery, strain, sleep, history offload — the full experience. (v1.95 also unlocked sleep + recovery on the newer "v25" 4.0 firmware layout that earlier versions could only read live HR from.) |
-| **WHOOP 5.0 / MG** | 🧪 **Live heart rate works** (confirmed on real hardware). Pick "WHOOP 5.0 / MG" before connecting — and see the pairing note below, because you can't just scan for it. Deeper 5/MG metrics (recovery, strain, sleep) are still being reverse-engineered; there's an opt-in **Settings → Experimental** toggle for 5/MG owners who want to help map the protocol. |
+| **WHOOP 5.0 / MG** | 🧪 **Live heart rate works** (confirmed on real hardware). Pick "WHOOP 5.0 / MG" before connecting — and see the pairing note below, because you can't just scan for it. Deeper 5/MG metrics (recovery, strain, sleep) are still being mapped; there's an opt-in **Settings → Experimental** toggle for 5/MG owners who want to help document the protocol. |
 
 > ### Pairing a WHOOP 5.0 / MG — read this first
 >
@@ -300,10 +325,11 @@ Tools/Backfill/          CLI tool for backfilling decoded data
 Fixtures/                sample WHOOP export for tests
 ```
 
-### `WhoopProtocol` — the reverse-engineering core
+### `WhoopProtocol` — the protocol-support core
 
 Platform-pure (no CoreBluetooth import) so it runs in tests and CLI tools
-unchanged. It decodes the on-wire frame format for both strap generations:
+unchanged. It implements the on-wire frame format for both strap generations,
+so NOOP can speak to a device you own:
 
 ```swift
 public enum DeviceFamily: String, Sendable, CaseIterable {
@@ -360,6 +386,9 @@ model):
 - **Apple Health export** (`AppleHealthImporter.swift`): a **streaming** SAX parser
   (`XMLParser`) for `export.xml` (which can exceed 1 GB), with correlation-dedupe,
   unit normalization (e.g. SpO₂ fraction → %), and sleep-stage mapping.
+- **Nutrition CSV** — a tolerant importer for daily-nutrition exports from
+  **Cronometer** and **MacroFactor**, so calories and macros line up alongside your
+  recovery and sleep on a shared timeline.
 
 ### `StrandDesign` — the SwiftUI design system
 
@@ -414,9 +443,9 @@ cd Packages/WhoopProtocol && swift build && swift test
 ```
 WHOOP strap ──BLE──▶ Strand/BLE + Strand/Collect ──▶ WhoopProtocol (decode)
                                                           │
-WHOOP CSV  ─┐                                             ▼
-Apple Health├─▶ StrandImport (parse) ───────────▶ WhoopStore (local SQLite)
- export.xml ─┘                                            │
+WHOOP CSV   ─┐                                            ▼
+Apple Health ├─▶ StrandImport (parse) ──────────▶ WhoopStore (local SQLite)
+Nutrition CSV┘                                            │
                                                           ▼
                                             StrandAnalytics (recovery/strain/
                                             HRV/sleep, on-device)
@@ -439,12 +468,12 @@ device and never leave it.
 
 ## Attribution
 
-NOOP stands on community reverse-engineering and interoperability work. With
+NOOP stands on community interoperability and protocol-documentation work. With
 thanks:
 
 - **`johnmiddleton12/my-whoop`** — the WHOOP 4.0 BLE protocol; the `WhoopProtocol`
   and `WhoopStore` packages and the collection logic are adapted from this work.
-- **`b-nnett/goose`** — the WHOOP 5.0 / MG BLE reverse-engineering (the `fd4b0001-…`
+- **`b-nnett/goose`** — the WHOOP 5.0 / MG BLE protocol documentation (the `fd4b0001-…`
   service family, CRC16-Modbus header, and "puffin" packet types) that NOOP's
   WHOOP 5.0 path is ported from.
 - **`groue/GRDB.swift`** — SQLite persistence.
@@ -511,3 +540,28 @@ under the same terms — see [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md).
 - [`ATTRIBUTION.md`](ATTRIBUTION.md) — full credits and licensing notes.
 - [`docs/DONATIONS.md`](docs/DONATIONS.md) — optional donation addresses (also in-app under **Support**).
 - [`project.yml`](project.yml) — XcodeGen project definition (source of `Strand.xcodeproj`).
+
+---
+
+## Activity
+
+A live snapshot of the last 30 days — issues, pull requests, pushes, and the people moving NOOP
+forward. Huge thanks to everyone filing reports, sharing strap logs, and reverse-engineering the
+protocol alongside us — this project is built on it.
+
+<p>
+  <img alt="Open issues" src="https://img.shields.io/github/issues/NoopApp/noop?style=flat-square&label=open&color=18C98B">
+  <img alt="Issues resolved" src="https://img.shields.io/github/issues-closed/NoopApp/noop?style=flat-square&label=resolved&color=2FE6A8">
+  <a href="https://github.com/NoopApp/noop/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/NoopApp/noop?style=flat-square&color=18C98B"></a>
+  <img alt="Forks" src="https://img.shields.io/github/forks/NoopApp/noop?style=flat-square&color=8B9690">
+  <img alt="Commits per month" src="https://img.shields.io/github/commit-activity/m/NoopApp/noop?style=flat-square&label=commits%2Fmo&color=2FE6A8">
+  <img alt="Last commit" src="https://img.shields.io/github/last-commit/NoopApp/noop?style=flat-square&label=last%20commit&color=8B9690">
+</p>
+
+![Repobeats analytics image](https://repobeats.axiom.co/api/embed/97acba228c083adca8453a1ebf15f18dad2894be.svg "Repobeats analytics image")
+
+### Star history
+
+If NOOP's useful to you, a ⭐ genuinely helps it reach more WHOOP users — and it's the single best free way to support the project.
+
+[![Star History Chart](https://api.star-history.com/svg?repos=NoopApp/noop&type=Date)](https://star-history.com/#NoopApp/noop&Date)

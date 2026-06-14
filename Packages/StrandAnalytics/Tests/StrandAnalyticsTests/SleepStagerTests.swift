@@ -330,4 +330,203 @@ final class SleepStagerTests: XCTestCase {
             onsetIdx: 0, finalWakeIdx: 3)
         XCTAssertEqual(allLate, ["deep", "deep", "deep", "deep"])
     }
+
+    // MARK: - Fragment merge / hypnogram smoothing (#274)
+
+    /// Expand a [(stage, epochs)] run-list into a flat per-epoch label array.
+    private func expand(_ runs: [(String, Int)]) -> [String] {
+        var out: [String] = []
+        for (s, n) in runs { out.append(contentsOf: repeatElement(s, count: n)) }
+        return out
+    }
+    /// Collapse a flat label array back into [(stage, epochs)] runs for terse assertions.
+    private func runs(_ labels: [String]) -> [(String, Int)] {
+        var out: [(String, Int)] = []
+        for s in labels {
+            if let last = out.last, last.0 == s { out[out.count - 1].1 += 1 }
+            else { out.append((s, 1)) }
+        }
+        return out
+    }
+    private func assertRuns(_ labels: [String], _ expected: [(String, Int)],
+                            _ msg: String = "", file: StaticString = #filePath, line: UInt = #line) {
+        let got = runs(labels)
+        XCTAssertEqual(got.count, expected.count, "\(msg) run count — got \(got)", file: file, line: line)
+        for i in 0..<min(got.count, expected.count) {
+            XCTAssertEqual(got[i].0, expected[i].0, "\(msg) run \(i) stage", file: file, line: line)
+            XCTAssertEqual(got[i].1, expected[i].1, "\(msg) run \(i) len", file: file, line: line)
+        }
+    }
+
+    func testMergeFragmentsAbsorbsSameStageBridge() {
+        // A 2-epoch "deep" fleck (< 6-epoch threshold) bridged by light on both sides is
+        // absorbed: the choppy light→deep→light blip becomes one continuous light block.
+        let input = expand([("light", 8), ("deep", 2), ("light", 8)])
+        let out = SleepStager.mergeFragments(input)
+        XCTAssertEqual(out.count, input.count, "length preserved")
+        assertRuns(out, [("light", 18)], "same-stage bridge")
+    }
+
+    func testMergeFragmentsPreservesGenuineTransition() {
+        // Three real multi-minute blocks (each ≥ 6 epochs = 3 min) — a genuine cycle, not
+        // noise — pass through completely untouched.
+        let input = expand([("light", 10), ("deep", 10), ("rem", 10)])
+        let out = SleepStager.mergeFragments(input)
+        assertRuns(out, [("light", 10), ("deep", 10), ("rem", 10)], "genuine transition")
+    }
+
+    func testMergeFragmentsBiasesLighterOnTie() {
+        // A 3-epoch "deep" fleck between equal-length light and rem neighbours (8 vs 8) is a
+        // tie; the lighter stage (light, rank 1 < rem rank 2) wins so smoothing never inflates
+        // deep/REM. The deep fleck must NOT survive and must NOT become rem.
+        let input = expand([("light", 8), ("deep", 3), ("rem", 8)])
+        let out = SleepStager.mergeFragments(input)
+        assertRuns(out, [("light", 11), ("rem", 8)], "tie → lighter neighbour")
+        XCTAssertFalse(out.contains("deep"), "a stray deep fleck must not survive a tie merge")
+    }
+
+    func testMergeFragmentsFoldsIntoLongerNeighbour() {
+        // A short rem fleck (2) with a longer light neighbour (8) on one side and a short deep
+        // run (4, itself sub-threshold) on the other collapses entirely into light — the longer
+        // neighbour dominates and the trailing short deep folds back too. No deep/REM inflation.
+        let input = expand([("light", 8), ("rem", 2), ("deep", 4)])
+        let out = SleepStager.mergeFragments(input)
+        assertRuns(out, [("light", 14)], "fold into longer neighbour")
+    }
+
+    func testMergeFragmentsLeadingAndTrailingFlecks() {
+        // A leading deep fleck folds forward into light; a trailing rem fleck folds back into
+        // light. Edge runs with only one neighbour are still smoothed.
+        let input = expand([("deep", 2), ("light", 10), ("rem", 2)])
+        let out = SleepStager.mergeFragments(input)
+        assertRuns(out, [("light", 14)], "leading + trailing flecks")
+    }
+
+    func testMergeFragmentsThresholdConstant() {
+        // The threshold is the named 3-min constant, i.e. 6 epochs at 30 s.
+        XCTAssertEqual(SleepStager.fragmentMergeEpochs, 6)
+        // A run exactly AT the threshold (6 epochs) is a real transition and is preserved.
+        let input = expand([("light", 10), ("deep", 6), ("light", 10)])
+        let out = SleepStager.mergeFragments(input)
+        assertRuns(out, [("light", 10), ("deep", 6), ("light", 10)], "at-threshold run kept")
+    }
+
+    func testMergeFragmentsDegenerateInputs() {
+        // Empty and single-run inputs pass through unchanged (nothing to merge into).
+        XCTAssertTrue(SleepStager.mergeFragments([]).isEmpty)
+        let single = expand([("light", 3)])  // sub-threshold but no neighbours
+        assertRuns(SleepStager.mergeFragments(single), [("light", 3)], "single run kept")
+    }
+
+    // MARK: - Sparse-gravity robustness (#308)
+
+    /// Still gravity sampled sparsely — one sample every `everyS` seconds (constant orientation,
+    /// so every inter-sample delta is 0 → "still"). Reproduces the WHOOP 5.0 v18/v26 backfill where
+    /// gravity is clumped/sparse, leaving multiple >maxGapMin gaps across the night.
+    private func sparseStillGravity(start: Int, durationS: Int, everyS: Int) -> [GravitySample] {
+        stride(from: 0, to: durationS, by: everyS).map { GravitySample(ts: start + $0, x: 0, y: 0, z: 1.0) }
+    }
+
+    func testSparseGravityNightNotShredded() {
+        // A ~6 h overnight window: DENSE 1 Hz sleep-band HR (50 bpm) but SPARSE gravity — one still
+        // sample every 25 min, so every inter-sample gap (1500 s) exceeds maxGapMin (1200 s). Before
+        // #308 buildRuns broke the run at every gap and detectSleep dropped every <60-min fragment,
+        // collapsing the night to ~0. Now the sparse path keeps it as ONE continuous ~6 h session.
+        let start = nightStart(01)                  // 01:00, center stays overnight
+        let dur = 6 * 60 * 60                        // 6 h
+        let grav = sparseStillGravity(start: start, durationS: dur, everyS: 25 * 60)
+        let hr = hrStream(start: start, durationS: dur, bpm: 50)
+
+        // The gate must classify this gravity as sparse (median gap 1500 s > 1200 s).
+        XCTAssertTrue(SleepStager.isGravitySparse(grav, hr: hr), "clumped gravity must read as sparse")
+
+        let sessions = SleepStager.detectSleep(hr: hr, gravity: grav)
+        XCTAssertEqual(sessions.count, 1, "a sparse-gravity night must be ONE session, not shredded")
+        let s = sessions[0]
+        // One ~6 h span (bounded by first/last gravity sample), not a sub-60-min fragment.
+        XCTAssertGreaterThan(Double(s.end - s.start), 5.0 * 60 * 60,
+                             "the bridged session must be ~6 h, not a sub-hour fragment")
+        XCTAssertEqual(s.restingHR, 50)
+    }
+
+    func testDenseGravityNightUnchangedBySparsePath() {
+        // Snapshot/regression guard for the 4.0 path: a DENSE 1 Hz still gravity night must NOT be
+        // classified sparse, and must produce the SAME single stable session it did before #308 —
+        // identical start, end and resting HR. Proves the sparse branches never touch the dense path.
+        let start = nightStart(02)
+        let dur = 6 * 60 * 60
+        let grav = stillGravity(start: start, durationS: dur)    // dense 1 Hz
+        let hr = hrStream(start: start, durationS: dur, bpm: 50)
+
+        XCTAssertFalse(SleepStager.isGravitySparse(grav, hr: hr), "dense 1 Hz gravity must NOT read as sparse")
+
+        let sessions = SleepStager.detectSleep(hr: hr, gravity: grav)
+        XCTAssertEqual(sessions.count, 1)
+        let s = sessions[0]
+        // Stable bounds: dense gravity tiles the whole window, so the session is [start, last sample].
+        XCTAssertEqual(s.start, start)
+        XCTAssertEqual(s.end, start + dur - 1)   // last 1 Hz sample is at start+dur-1
+        XCTAssertEqual(s.restingHR, 50)
+    }
+
+    func testBuildRunsDenseGravityByteIdenticalToLegacy() {
+        // Direct byte-identity proof: buildRuns with the sparse override OFF (the default) returns
+        // exactly the same runs as passing sparse:false, on a gravity stream with a real >maxGapMin
+        // gap. The legacy two-arg call and the sparse=false call must be indistinguishable.
+        let start = 5_000_000
+        // Two still blocks separated by a 30-min (>20 min) gap → legacy buildRuns splits them.
+        let blockA = stillGravity(start: start, durationS: 40 * 60)
+        let gapStart = start + 40 * 60 + 30 * 60
+        let blockB = stillGravity(start: gapStart, durationS: 40 * 60)
+        let grav = blockA + blockB
+        let deltas = SleepStager.gravityDeltas(grav)
+        let flags = SleepStager.classifyStill(grav, deltas)
+
+        let legacy = SleepStager.buildRuns(grav, flags)                      // default sparse:false
+        let explicit = SleepStager.buildRuns(grav, flags, sparse: false)
+        XCTAssertEqual(legacy.count, explicit.count)
+        for (a, b) in zip(legacy, explicit) {
+            XCTAssertEqual(a.stage, b.stage); XCTAssertEqual(a.start, b.start); XCTAssertEqual(a.end, b.end)
+        }
+        // The dense >20-min gap still splits the night (a real wake), so there are ≥2 runs.
+        XCTAssertGreaterThanOrEqual(legacy.count, 2, "a real >20-min gap must still split the dense path")
+    }
+
+    func testGravitySparseGateConditions() {
+        // The gate trips on EITHER a short gravity span vs HR span OR a large median gravity gap.
+        let start = 6_000_000
+        let hr = hrStream(start: start, durationS: 6 * 60 * 60, bpm: 50)
+
+        // (a) Span test: gravity confined to the first 30 min of a 6 h HR window (< 0.5 frac).
+        let clumped = stillGravity(start: start, durationS: 30 * 60)
+        XCTAssertTrue(SleepStager.isGravitySparse(clumped, hr: hr), "short gravity span → sparse")
+
+        // (b) Median-gap test: gravity spans the night but every gap is 25 min (> 20 min).
+        let bigGaps = sparseStillGravity(start: start, durationS: 6 * 60 * 60, everyS: 25 * 60)
+        XCTAssertTrue(SleepStager.isGravitySparse(bigGaps, hr: hr), "large median gap → sparse")
+
+        // (c) Dense gravity over the same span is NOT sparse.
+        let dense = stillGravity(start: start, durationS: 6 * 60 * 60)
+        XCTAssertFalse(SleepStager.isGravitySparse(dense, hr: hr), "dense gravity → not sparse")
+
+        // (d) Degenerate HR (<2 samples) keeps the dense path regardless of gravity.
+        XCTAssertFalse(SleepStager.isGravitySparse(bigGaps, hr: []), "no HR span → keep dense path")
+    }
+
+    func testSessionAvgHRVRejectsEctopicSpikes() {
+        // A 5-min window of steady ~900 ms beats (≈67 bpm) with a +600 ms ectopic
+        // spike every 15th beat — the shape of PPG-derived 0x2A37 RR on a WHOOP 5/MG.
+        // rMSSD is built from SUCCESSIVE differences, so the spikes would inflate the
+        // session HRV if left in. cleanRR's Malik ectopic rejection drops them, so the
+        // cleaned series is steady → HRV ≈ 0. Pre-fix (rangeFilter only) this path
+        // returned ~200 ms; this guards the #262/#235 fix against regression.
+        var rr: [RRInterval] = []
+        let start = 1000, end = start + 300
+        for i in 0..<300 {
+            rr.append(RRInterval(ts: start + i, rrMs: (i % 15 == 0) ? 1500 : 900))
+        }
+        let hrv = SleepStager.sessionAvgHRV(start: start, end: end, rr: rr)
+        XCTAssertNotNil(hrv)
+        XCTAssertLessThan(hrv!, 50, "ectopic spikes must be rejected before rMSSD")
+    }
 }

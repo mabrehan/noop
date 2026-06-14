@@ -54,6 +54,33 @@ val STARTER_JOURNAL_QUESTIONS: List<String> = listOf(
     "Did you read before bed?",
 )
 
+/** Dedup/identity key for a question. Normalises ALL whitespace — leading/trailing AND internal
+ *  runs collapse to a single space — then lowercases. A WHOOP export commonly leaves a trailing
+ *  newline or non-breaking space on a journal cell; folding it here is what keeps an imported
+ *  "Did you take magnesium?\n" from sitting beside the starter "Did you take magnesium?" as two
+ *  separate rows (#224). The DISPLAYED string stays verbatim — only the match key is normalised —
+ *  so the stored behaviour key the effects engine joins on is untouched.
+ *  Kept value-for-value in step with macOS `JournalCatalogStore.norm` (JournalCatalog.swift). */
+internal fun normJournalKey(s: String): String =
+    // Collapse every run of whitespace to a single space, then trim + lowercase. Uses Kotlin's
+    // `Char.isWhitespace()` (Unicode-aware — it includes non-breaking space U+00A0 etc.) rather than
+    // a regex: the previous `Regex("(?U)\\s+")` compiled on the desktop JVM but THREW
+    // PatternSyntaxException on Android's ICU engine (the `(?U)` inline flag is unsupported there),
+    // crashing the Insights screen for anyone with journal entries to merge (#224/#267). Matches the
+    // Swift `.whitespacesAndNewlines` normalisation value-for-value.
+    buildString {
+        var prevSpace = true // suppress leading whitespace
+        for (c in s) {
+            if (c.isWhitespace()) {
+                if (!prevSpace) append(' ')
+                prevSpace = true
+            } else {
+                append(c)
+                prevSpace = false
+            }
+        }
+    }.trim().lowercase()
+
 /** Catalog = imported questions (exact strings → logged days join imported history), then starter
  *  defaults, then user customs. Case-insensitive dedupe, first casing wins, with `hidden` questions
  *  (starter/imported ones the user removed) filtered out. */
@@ -63,12 +90,14 @@ internal fun mergeJournalCatalog(
     hidden: List<String> = emptyList(),
     starter: List<String> = STARTER_JOURNAL_QUESTIONS,
 ): List<String> {
-    val hiddenSet = hidden.map { it.trim().lowercase() }.toHashSet()
+    val hiddenSet = hidden.map { normJournalKey(it) }.toHashSet()
     val out = ArrayList<String>()
     val seen = HashSet<String>()
     for (q in imported + starter + custom) {
+        // Display text trims surrounding whitespace; the dedup key normalises ALL whitespace (see
+        // normJournalKey) so an imported "…magnesium?\n" folds onto the starter (#224).
         val t = q.trim()
-        val key = t.lowercase()
+        val key = normJournalKey(q)
         if (t.isNotEmpty() && key !in hiddenSet && seen.add(key)) out.add(t)
     }
     return out
@@ -88,7 +117,8 @@ internal fun mergeJournalEntries(
 
 /** Importer convention (WhoopCsvImporter.parseJournal): journal day = the wake/cycle day whose
  *  morning recovery the previous ~24 h affected. "Log today" = answers about yesterday / last
- *  night, attributed to TODAY's local day key; daysBack=1 edits yesterday. */
+ *  night, attributed to TODAY's local day key; daysBack=1 edits yesterday; daysBack=-1 logs ahead
+ *  for TOMORROW (today's activities inform tomorrow's recovery). */
 internal fun journalDayKey(daysBack: Long = 0L, today: LocalDate = LocalDate.now()): String =
     today.minusDays(daysBack).toString()
 
@@ -129,7 +159,7 @@ internal fun saveHiddenJournalQuestions(context: Context, questions: List<String
  * Yes/no chips for the merged behaviour catalog + a free-text custom-question field. Tri-state:
  * no answer logged → neither chip filled; tapping the selected chip again clears the answer
  * (deletes the native row — imported rows are never touched). Day attribution follows the
- * importer's wake-day convention, with a Today/Yesterday toggle for late logging.
+ * importer's wake-day convention, with a Tomorrow/Today/Yesterday toggle for logging ahead or late.
  */
 @Composable
 fun JournalLogCard(
@@ -146,11 +176,11 @@ fun JournalLogCard(
     onRestoreQuestion: (String) -> Unit = {},
 ) {
     var editing by remember { mutableStateOf(false) }
-    val customKeys = remember(customQuestions) { customQuestions.map { it.trim().lowercase() }.toHashSet() }
-    fun isCustom(q: String) = q.trim().lowercase() in customKeys
+    val customKeys = remember(customQuestions) { customQuestions.map { normJournalKey(it) }.toHashSet() }
+    fun isCustom(q: String) = normJournalKey(q) in customKeys
 
     Column(verticalArrangement = Arrangement.spacedBy(Metrics.gap)) {
-        // Header: title/overline on the left, the Today/Yesterday toggle (or Edit/Done) on the right.
+        // Header: title/overline on the left, the Tomorrow/Today/Yesterday toggle (or Edit/Done) on the right.
         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Box(modifier = Modifier.weight(1f)) {
                 SectionHeader(title = "Journal", overline = "Log")
@@ -160,6 +190,8 @@ fun JournalLogCard(
             } else {
                 JournalChip("Edit", selected = false) { editing = true }
                 Spacer(Modifier.width(6.dp))
+                JournalChip("Tomorrow", selected = dayOffset == -1L) { onDayOffset(-1L) }
+                Spacer(Modifier.width(6.dp))
                 JournalChip("Today", selected = dayOffset == 0L) { onDayOffset(0L) }
                 Spacer(Modifier.width(6.dp))
                 JournalChip("Yesterday", selected = dayOffset == 1L) { onDayOffset(1L) }
@@ -168,12 +200,19 @@ fun JournalLogCard(
         NoopCard {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    if (editing)
-                        "Remove a question to tidy your list. Custom questions are deleted; the " +
-                            "built-in ones are hidden and can be restored below."
-                    else
-                        "Answers are about the night and day leading into this morning — the same " +
-                            "attribution a WHOOP export uses, so logged and imported days line up.",
+                    when {
+                        editing ->
+                            "Remove a question to tidy your list. Custom questions are deleted; the " +
+                                "built-in ones are hidden and can be restored below."
+                        dayOffset == -1L ->
+                            "Logging ahead for tomorrow: today's activities inform tomorrow's " +
+                                "recovery, just as yesterday's are reflected in today's. Tomorrow's " +
+                                "answers line up with tomorrow's morning."
+                        else ->
+                            "Answers are about the night and day leading into this morning — the " +
+                                "same attribution a WHOOP export uses, so logged and imported days " +
+                                "line up."
+                    },
                     style = NoopType.footnote,
                     color = Palette.textTertiary,
                 )

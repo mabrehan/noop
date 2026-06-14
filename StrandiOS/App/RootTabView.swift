@@ -47,9 +47,13 @@ struct RootTabView: View {
                 Section("Data") {
                     link("Apple Health", "heart.fill") { AppleHealthView() }
                     link("Data Sources", "externaldrive.fill") { DataSourcesView() }
+                    // #155: HealthKit-free Apple Health path for sideloaded installs (Siri Shortcut
+                    // reads the opt-in Documents/noop_sync.txt drop file).
+                    link("Shortcuts Export", "square.and.arrow.up.fill") { ShortcutExportSettingsView() }
                 }
                 Section("App") {
                     link("Automations", "wand.and.stars") { AutomationsView() }
+                    link("Siri & Shortcuts", "mic.fill") { SiriShortcutsSettingsView() }
                     link("Settings", "gearshape.fill") { SettingsView() }
                     link("Support", "hands.clap.fill") { SupportView() }
                 }
@@ -69,7 +73,15 @@ struct RootTabView: View {
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbarBackground(StrandPalette.surfaceBase, for: .navigationBar)
         } label: {
-            Label(title, systemImage: icon)
+            // Pin the icon to the accent explicitly. A plain `Label(_:systemImage:)` icon inherits the
+            // list's tint, which iOS re-resolves to its default blue a beat after first render — so the
+            // icons flashed green→blue (#184). An explicit foregroundStyle on the image overrides that;
+            // the title keeps its default (primary) colour.
+            Label {
+                Text(title)
+            } icon: {
+                Image(systemName: icon).foregroundStyle(StrandPalette.accent)
+            }
         }
         .listRowBackground(StrandPalette.surfaceRaised)
     }

@@ -20,6 +20,7 @@ enum NavItem: String, CaseIterable, Identifiable, Hashable {
     case dataSources = "Data Sources"
     case notifications = "Notifications"
     case automation = "Automations"
+    case smartAlarm = "Smart Alarm"
     case settings = "Settings"
     case support = "Support"
 
@@ -47,6 +48,7 @@ enum NavItem: String, CaseIterable, Identifiable, Hashable {
         case .dataSources: return "Data Sources"
         case .notifications: return "Notifications"
         case .automation: return "Automations"
+        case .smartAlarm: return "Smart Alarm"
         case .settings: return "Settings"
         case .support: return "Support"
         }
@@ -72,6 +74,7 @@ enum NavItem: String, CaseIterable, Identifiable, Hashable {
         case .dataSources: return "square.and.arrow.down.fill"
         case .notifications: return "bell.badge.fill"
         case .automation: return "wand.and.stars"
+        case .smartAlarm: return "alarm.fill"
         case .settings: return "gearshape.fill"
         case .support: return "heart.fill"
         }
@@ -110,8 +113,13 @@ struct RootView: View {
 
     private var brand: some View {
         HStack(spacing: 8) {
+            // Wordmark with a soft green brand glow + a leading accent dot — the Bevel chrome nod.
+            Circle()
+                .fill(StrandPalette.accent)
+                .frame(width: 8, height: 8)
+                .shadow(color: StrandPalette.accent.opacity(0.8), radius: 4)
             Text("NOOP")
-                .font(.system(size: 20, weight: .bold))
+                .font(.system(size: 20, weight: .bold, design: .rounded))
                 .foregroundStyle(StrandPalette.textPrimary)
             Spacer()
         }
@@ -138,6 +146,7 @@ struct RootView: View {
         case .dataSources: DataSourcesView()
         case .notifications: NotificationSettingsView()
         case .automation: AutomationsView()
+        case .smartAlarm: SmartAlarmView()
         case .settings: SettingsView()
         case .support: SupportView()
         }
@@ -168,12 +177,14 @@ private struct SidebarStatus: View {
         .background(StrandPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 10))
     }
 
+    // Shares LiveState.connectionStatus* with the Settings strap card so the two never disagree (#266):
+    // a connected-but-unbonded 5/MG now reads "Connected" here too, not a misleading "Connecting…".
     private var statusColor: Color {
-        live.bonded ? StrandPalette.statusPositive
-            : live.connected ? StrandPalette.statusWarning
+        live.connectionStatusIsActive ? StrandPalette.statusPositive
+            : live.connectionStatusIsIdle ? StrandPalette.statusWarning
             : StrandPalette.statusCritical
     }
     private var statusText: String {
-        live.bonded ? "WHOOP · Bonded" : live.connected ? "Connecting…" : "Disconnected"
+        live.connectionStatusLabel
     }
 }

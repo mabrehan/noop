@@ -48,6 +48,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.noop.data.DailyMetric
+import com.noop.data.MoodStore
+import com.noop.ingest.NutritionCsvImporter
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.sqrt
@@ -122,7 +124,7 @@ data class CompareMetric(
  * [DailyMetric] so a my-whoop metric can be derived from the daily cache as a fallback.
  */
 private object CompareCatalog {
-    val categories = listOf("Heart", "Recovery", "Sleep", "Strain", "Health")
+    val categories = listOf("Heart", "Charge", "Rest", "Effort", "Health", "Nutrition", "Mind")
 
     val all: List<CompareMetric> = listOf(
         // Heart
@@ -130,29 +132,37 @@ private object CompareCatalog {
         CompareMetric("max_hr", "Max Heart Rate", "Heart", "bpm", "my-whoop", 0),
         CompareMetric("energy_kcal", "Calories", "Heart", "kcal", "my-whoop", 0),
         CompareMetric("vo2max", "VO₂ Max", "Heart", "", "apple-health", 1),
-        // Recovery
-        CompareMetric("recovery", "Recovery", "Recovery", "%", "my-whoop", 0),
-        CompareMetric("hrv", "Heart Rate Variability", "Recovery", "ms", "my-whoop", 0),
-        CompareMetric("rhr", "Resting Heart Rate", "Recovery", "bpm", "my-whoop", 0),
-        CompareMetric("resp_rate", "Respiratory Rate", "Recovery", "rpm", "my-whoop", 1),
-        CompareMetric("spo2", "Blood Oxygen", "Recovery", "%", "my-whoop", 0),
-        CompareMetric("skin_temp", "Skin Temperature", "Recovery", "°C", "my-whoop", 1),
-        // Sleep
-        CompareMetric("sleep_performance", "Sleep Performance", "Sleep", "%", "my-whoop", 0),
-        CompareMetric("sleep_total_min", "Asleep Time", "Sleep", "min", "my-whoop", 0),
-        CompareMetric("sleep_efficiency", "Sleep Efficiency", "Sleep", "%", "my-whoop", 0),
-        CompareMetric("sleep_deep_min", "Deep (SWS) Sleep", "Sleep", "min", "my-whoop", 0),
-        CompareMetric("sleep_rem_min", "REM Sleep", "Sleep", "min", "my-whoop", 0),
-        CompareMetric("sleep_light_min", "Light Sleep", "Sleep", "min", "my-whoop", 0),
-        // Strain
-        CompareMetric("strain", "Day Strain", "Strain", "/21", "my-whoop", 1),
-        CompareMetric("steps", "Steps", "Strain", "", "apple-health", 0),
-        CompareMetric("active_kcal", "Active Energy", "Strain", "kcal", "apple-health", 0),
+        // Charge (was Recovery)
+        CompareMetric("recovery", "Charge", "Charge", "%", "my-whoop", 0),
+        CompareMetric("hrv", "Heart Rate Variability", "Charge", "ms", "my-whoop", 0),
+        CompareMetric("rhr", "Resting Heart Rate", "Charge", "bpm", "my-whoop", 0),
+        CompareMetric("resp_rate", "Respiratory Rate", "Charge", "rpm", "my-whoop", 1),
+        CompareMetric("spo2", "Blood Oxygen", "Charge", "%", "my-whoop", 0),
+        CompareMetric("skin_temp", "Skin Temperature", "Charge", "°C", "my-whoop", 1),
+        // Rest (was Sleep)
+        CompareMetric("sleep_performance", "Rest", "Rest", "%", "my-whoop", 0),
+        CompareMetric("sleep_total_min", "Asleep Time", "Rest", "min", "my-whoop", 0),
+        CompareMetric("sleep_efficiency", "Sleep Efficiency", "Rest", "%", "my-whoop", 0),
+        CompareMetric("sleep_deep_min", "Deep (SWS) Sleep", "Rest", "min", "my-whoop", 0),
+        CompareMetric("sleep_rem_min", "REM Sleep", "Rest", "min", "my-whoop", 0),
+        CompareMetric("sleep_light_min", "Light Sleep", "Rest", "min", "my-whoop", 0),
+        // Effort (was Strain)
+        CompareMetric("strain", "Effort", "Effort", "/100", "my-whoop", 1),
+        CompareMetric("steps", "Steps", "Effort", "", "apple-health", 0),
+        CompareMetric("active_kcal", "Active Energy", "Effort", "kcal", "apple-health", 0),
         // Health / Body
         CompareMetric("weight", "Weight", "Health", "kg", "apple-health", 1),
         CompareMetric("body_fat", "Body Fat", "Health", "%", "apple-health", 1),
         CompareMetric("lean_mass", "Lean Body Mass", "Health", "kg", "apple-health", 1),
         CompareMetric("bmi", "BMI", "Health", "", "apple-health", 1),
+        // Nutrition (imported from a food-tracker CSV — calories-in next to calories-out).
+        // Mirrors the macOS MetricCatalog entries exactly (same keys + sources, v2.2.0 parity).
+        CompareMetric("calories_in", "Calories In", "Nutrition", "kcal", NutritionCsvImporter.SOURCE_ID, 0),
+        CompareMetric("protein_g", "Protein", "Nutrition", "g", NutritionCsvImporter.SOURCE_ID, 0),
+        CompareMetric("carbs_g", "Carbs", "Nutrition", "g", NutritionCsvImporter.SOURCE_ID, 0),
+        CompareMetric("fat_g", "Fat", "Nutrition", "g", NutritionCsvImporter.SOURCE_ID, 0),
+        // Mind (daily mood check-in, 1–5; non-clinical self-tracking).
+        CompareMetric("mood", "Mood", "Mind", "/5", MoodStore.MOOD_DEVICE_ID, 0),
     )
 
     fun inCategory(c: String): List<CompareMetric> = all.filter { it.category == c }
@@ -460,34 +470,20 @@ fun CompareScreen(vm: AppViewModel) {
 
 /**
  * Load the full history for [metric] (ascending by day). Mirrors macOS
- * repo.series(key, source) over the generic metricSeries store; for core my-whoop
- * metrics with a matching DailyMetric column, falls back to the daily cache when the
- * generic store is empty so the screen shows real on-device data.
+ * repo.resolvedSeries(key, source) (PR#196): resolves across compatible sources freshest-wins —
+ * imported WHOOP > NOOP-computed > declared-compatible Apple Health — and gap-fills from the
+ * DailyMetric columns for the days the long-format metricSeries doesn't carry, so the screen shows
+ * real on-device data even when only the daily cache (not the generic importer) has populated.
  */
 private suspend fun loadFullSeries(
     vm: AppViewModel,
     metric: CompareMetric,
-    cachedDays: List<DailyMetric>,
+    @Suppress("UNUSED_PARAMETER") cachedDays: List<DailyMetric>,
 ): List<Pair<String, Double>> {
     // Wide window covering all of history (the macOS days = 4000 default).
     val to = todayDay(1)
     val from = todayDay(-4000)
-    val generic = vm.repo.metricSeries(metric.source, metric.key, from, to)
-        .map { it.day to it.value }
-        .sortedBy { it.first }
-    if (generic.isNotEmpty()) return generic
-
-    // Fallback: derive from the daily metric cache for my-whoop columns.
-    if (metric.source == "my-whoop") {
-        val pick = CompareCatalog.dailyPick(metric.key)
-        if (pick != null) {
-            // Merged: imported WHOOP days win; on-device computed days gap-fill the series.
-            val all = vm.repo.daysMerged("my-whoop")
-            val derived = if (all.isNotEmpty()) all else cachedDays
-            return derived.mapNotNull { d -> pick(d)?.let { d.day to it } }.sortedBy { it.first }
-        }
-    }
-    return emptyList()
+    return vm.repo.resolvedSeries(metric.key, metric.source, from, to).values
 }
 
 /** "yyyy-MM-dd" for today offset by [deltaDays], fixed UTC. */
@@ -666,7 +662,9 @@ private fun OverlaySection(
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(Metrics.gap)) {
         SectionHeader("Overlay", overline = range.phrase, trailing = "${series.size} series")
-        NoopCard {
+        // Anchor the overlay card to the brand-green chrome world; each line keeps its own categorical
+        // series colour so the overlaid lines stay distinguishable against the wash.
+        NoopCard(tint = Palette.accent) {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Overline("Normalized overlay")
                 Text(
@@ -761,6 +759,11 @@ private fun OverlayChart(series: List<CompareSeries>, modifier: Modifier) {
                 color = s.color,
                 style = Stroke(width = 2.2f, cap = StrokeCap.Round, join = StrokeJoin.Round),
             )
+            // Bevel "now" end-cap on this series' latest point — soft halo + bright core + white centre.
+            val last = pts.last()
+            drawCircle(color = s.color.copy(alpha = 0.30f), radius = 8f, center = last)
+            drawCircle(color = s.color.copy(alpha = 0.65f), radius = 5f, center = last)
+            drawCircle(color = Color.White, radius = 2.2f, center = last)
         }
     }
 }
@@ -869,7 +872,9 @@ private fun CorrelationSection(series: List<CompareSeries>, range: CompareRange)
 @Composable
 private fun PairCard(p: PairResult) {
     val tint = correlationColor(p.r)
-    NoopCard {
+    // Frosted card washed by the relationship's own colour (green positive / rose negative), with a
+    // TrendChip surfacing the signed direction at a glance — Today's delta idiom, applied to r.
+    NoopCard(tint = tint) {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -887,6 +892,7 @@ private fun PairCard(p: PairResult) {
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f),
                 )
+                TrendChip(text = signedR(p.r), color = tint)
                 Text("r = ${signedR(p.r)}", style = NoopType.number(18f), color = tint)
             }
 

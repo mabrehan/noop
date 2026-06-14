@@ -66,6 +66,7 @@ import com.noop.BuildConfig
 import com.noop.analytics.Zones
 import com.noop.ble.PuffinExperiment
 import com.noop.data.DataBackup
+import com.noop.ingest.RawSensorExport
 import com.noop.ingest.WhoopCsvExporter
 import com.noop.update.UpdateCheck
 import kotlinx.coroutines.Dispatchers
@@ -128,6 +129,16 @@ class ProfileStore(private val prefs: SharedPreferences) {
         get() = prefs.getInt(KEY_HRMAX, 0).coerceIn(0, 230)
         set(v) = prefs.edit().putInt(KEY_HRMAX, v.coerceIn(0, 230)).apply()
 
+    /**
+     * Step-calibration divisor (#139): counter ticks per real step for the @57 motion
+     * counter. 1.0 = raw pass-through (default — no behavior change). Clamped 0.5–4.0.
+     */
+    var stepTicksPerStep: Double
+        get() = prefs.getFloat(KEY_STEP_SCALE, 1f).toDouble().coerceIn(STEP_SCALE_MIN, STEP_SCALE_MAX)
+        set(v) = prefs.edit()
+            .putFloat(KEY_STEP_SCALE, v.coerceIn(STEP_SCALE_MIN, STEP_SCALE_MAX).toFloat())
+            .apply()
+
     /** The auto (Tanaka) HR-max for the current age. */
     val hrMaxAuto: Int get() = Zones.hrMaxTanaka(age)
 
@@ -141,6 +152,7 @@ class ProfileStore(private val prefs: SharedPreferences) {
         private const val KEY_WEIGHT = "weight_kg"
         private const val KEY_HEIGHT = "height_cm"
         private const val KEY_HRMAX = "hr_max_override"
+        private const val KEY_STEP_SCALE = "step_ticks_per_step"
 
         private const val AGE_MIN = 13
         private const val AGE_MAX = 100
@@ -148,6 +160,8 @@ class ProfileStore(private val prefs: SharedPreferences) {
         private const val WEIGHT_MAX = 250.0
         private const val HEIGHT_MIN = 120.0
         private const val HEIGHT_MAX = 230.0
+        private const val STEP_SCALE_MIN = 0.5
+        private const val STEP_SCALE_MAX = 4.0
 
         fun from(context: Context): ProfileStore =
             ProfileStore(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE))
@@ -180,15 +194,24 @@ fun SettingsScreen(vm: AppViewModel) {
     // is a manual re-open and writes nothing.
     var showWhatsNew by remember { mutableStateOf(false) }
 
+    // "How your scores work" explainer sheet, reachable any time from About (macOS/iOS parity).
+    var showScoringGuide by remember { mutableStateOf(false) }
+
     // EXPERIMENTAL WHOOP 5/MG protocol probes (off by default). Mirrors the macOS @AppStorage toggle;
     // SharedPreferences isn't reactive, so the Switch drives a local mutableState that the store reads.
     val puffinExperiment = remember { PuffinExperiment.from(context) }
     var puffinExperiments by remember { mutableStateOf(puffinExperiment.isEnabled) }
     var puffinCapture by remember { mutableStateOf(puffinExperiment.isCaptureEnabled) }
+    var deepData by remember { mutableStateOf(puffinExperiment.isDeepDataEnabled) }
+    var broadcastHr by remember { mutableStateOf(puffinExperiment.broadcastHr) }
 
     // "Keep connected in the background" — drives WhoopConnectionService (foreground service). Default
     // on. SharedPreferences isn't reactive, so the Switch mirrors into a local state.
     var backgroundConnection by remember { mutableStateOf(NoopPrefs.backgroundConnection(context)) }
+
+    // "Continuous HRV capture" — hold the dense realtime stream armed 24/7 (better overnight HRV) at the
+    // cost of more battery. Default OFF; only does anything with background connection on. Local mirror.
+    var continuousHrv by remember { mutableStateOf(NoopPrefs.continuousHrv(context)) }
 
     // "Debug logging" — mirror the strap log to logcat (adb). Default OFF so normal users don't.
     var debugLogging by remember { mutableStateOf(NoopPrefs.debugLogging(context)) }
@@ -201,6 +224,9 @@ fun SettingsScreen(vm: AppViewModel) {
     var temperatureRaw by remember {
         mutableStateOf(NoopPrefs.of(context).getString(NoopPrefs.KEY_TEMPERATURE_UNIT, "") ?: "")
     }
+    // Effort display scale (#268) — show NOOP's native 0–100 Effort or WHOOP's 0–21 Day Strain axis.
+    // Display-only; the stored value never changes. Mirrors into local state like the toggles above.
+    var effortScale by remember { mutableStateOf(UnitPrefs.effortScale(context)) }
 
     // SAF launchers — CreateDocument for export, OpenDocument for import.
     val exportLauncher = rememberLauncherForActivityResult(
@@ -378,6 +404,23 @@ fun SettingsScreen(vm: AppViewModel) {
                         )
                     }
                 }
+                RowDivider()
+                // Step calibration (#139): daily steps = @57 counter ticks ÷ this divisor.
+                // 1.0 = raw pass-through until the true 5/MG tick rate is known.
+                FormRow(label = "Step calibration") {
+                    StepperField(
+                        value = "%.1f".format(profile.stepTicksPerStep),
+                        accessibility = "Step calibration, %.1f counter ticks per step"
+                            .format(profile.stepTicksPerStep),
+                        onMinus = { mutate { profile.stepTicksPerStep -= 0.1 } },
+                        onPlus = { mutate { profile.stepTicksPerStep += 0.1 } },
+                    )
+                }
+                Text(
+                    "Counter ticks per step — leave at 1.0 unless your steps run high. Walk a known 1,000 steps and divide NOOP's count by the real count to get your value.",
+                    style = NoopType.footnote,
+                    color = Palette.textTertiary,
+                )
             }
         }
 
@@ -388,7 +431,7 @@ fun SettingsScreen(vm: AppViewModel) {
         SettingsSection(
             icon = Icons.Filled.Straighten,
             title = "Units",
-            blurb = "Choose how distances, weights, heights and temperatures are shown. Your data is always stored the same way — this only changes the display.",
+            blurb = "Choose how distances, weights, heights, temperatures and Effort are shown. Your data is always stored the same way — this only changes the display.",
         ) {
             Column {
                 FormRow(label = "Measurement system") {
@@ -419,6 +462,20 @@ fun SettingsScreen(vm: AppViewModel) {
                         onSelect = {
                             temperatureRaw = it
                             NoopPrefs.setTemperatureUnit(context, TemperatureUnit.fromRaw(it))
+                        },
+                    )
+                }
+                RowDivider()
+                // Effort scale (#268) — NOOP's native 0–100 Effort or WHOOP's 0–21 Day Strain axis.
+                // Display-only; the stored value never changes, so a flip just re-labels every read-out.
+                FormRow(label = "Effort scale") {
+                    SegmentedPillControl(
+                        items = listOf(EffortScale.HUNDRED, EffortScale.WHOOP),
+                        selection = effortScale,
+                        label = { if (it == EffortScale.HUNDRED) "0–100" else "0–21" },
+                        onSelect = {
+                            effortScale = it
+                            UnitPrefs.setEffortScale(context, it)
                         },
                     )
                 }
@@ -496,6 +553,43 @@ fun SettingsScreen(vm: AppViewModel) {
                         onCheckedChange = {
                             backgroundConnection = it
                             vm.setBackgroundConnection(it)
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Palette.surfaceBase,
+                            checkedTrackColor = Palette.accent,
+                            uncheckedThumbColor = Palette.textSecondary,
+                            uncheckedTrackColor = Palette.surfaceInset,
+                            uncheckedBorderColor = Palette.hairline,
+                        ),
+                    )
+                }
+
+                // Continuous HRV capture: keep the dense beat-to-beat (R-R) stream armed even with no Live
+                // screen open, so the strap banks far more data overnight for better HRV/recovery/sleep.
+                // Honest battery framing — continuous HR streaming uses more battery. Needs background
+                // connection on (there's no background link to stream over otherwise). Default OFF.
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            "Continuous HRV capture",
+                            style = NoopType.subhead,
+                            color = Palette.textPrimary,
+                        )
+                        Text(
+                            "Keeps the detailed beat-to-beat stream running all day and night, not just while a live screen is open, so NOOP captures much more for overnight HRV, recovery and sleep. Uses more battery (your strap streams heart rate continuously). Needs \"Keep connected in the background\" on.",
+                            style = NoopType.footnote,
+                            color = Palette.textTertiary,
+                        )
+                    }
+                    Switch(
+                        checked = continuousHrv,
+                        onCheckedChange = {
+                            continuousHrv = it
+                            vm.setContinuousHrv(it)
                         },
                         colors = SwitchDefaults.colors(
                             checkedThumbColor = Palette.surfaceBase,
@@ -598,6 +692,117 @@ fun SettingsScreen(vm: AppViewModel) {
                     color = Palette.textTertiary,
                 )
 
+                // --- Broadcast heart rate (turn the strap into a standard BLE HR sensor). (#181) ---
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    Text(
+                        "Broadcast heart rate (Garmin/ANT)",
+                        style = NoopType.subhead,
+                        color = Palette.textPrimary,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Switch(
+                        checked = broadcastHr,
+                        onCheckedChange = {
+                            broadcastHr = it
+                            puffinExperiment.broadcastHr = it
+                            vm.ble.setBroadcastHr(it)
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Palette.surfaceBase,
+                            checkedTrackColor = Palette.accent,
+                            uncheckedThumbColor = Palette.textSecondary,
+                            uncheckedTrackColor = Palette.surfaceInset,
+                            uncheckedBorderColor = Palette.hairline,
+                        ),
+                        modifier = Modifier.semantics {
+                            contentDescription = "Broadcast heart rate"
+                        },
+                    )
+                }
+                Text(
+                    "Makes your WHOOP 5.0/MG advertise its heart rate as a standard Bluetooth HR sensor, so a Garmin (Edge/watch), Zwift or gym equipment can use it during a workout. Applied on the next connection (and immediately if connected); writes the strap's whoop_live_hr_in_adv_ind_pkt flag. Reversible. 5/MG only.",
+                    style = NoopType.caption,
+                    color = Palette.textTertiary,
+                )
+
+                // --- R22 deep-data unlock — the one probe that writes to the strap. (#174) ---
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    Text(
+                        "Unlock WHOOP 5/MG deep data (R22)",
+                        style = NoopType.subhead,
+                        color = Palette.textPrimary,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Switch(
+                        checked = deepData,
+                        onCheckedChange = {
+                            deepData = it
+                            puffinExperiment.isDeepDataEnabled = it
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Palette.surfaceBase,
+                            checkedTrackColor = Palette.accent,
+                            uncheckedThumbColor = Palette.textSecondary,
+                            uncheckedTrackColor = Palette.surfaceInset,
+                            uncheckedBorderColor = Palette.hairline,
+                        ),
+                        modifier = Modifier.semantics {
+                            contentDescription = "Unlock WHOOP 5/MG deep data"
+                        },
+                    )
+                }
+                Text(
+                    "WHOOP 5/MG straps hand a fresh app only live heart rate. The official app switches on the deeper streams (high-rate HR + motion + history) by writing a set of feature flags — a sequence two independent projects have documented. With this on, the button below sends that exact sequence to your strap. Unlike everything else here it does write to the strap, but it's reversible (it only changes which data the strap emits) and is the same thing the official app does. Experimental — it may do nothing on your firmware.",
+                    style = NoopType.caption,
+                    color = Palette.textTertiary,
+                )
+                if (deepData) {
+                    Button(
+                        onClick = { vm.ble.enableWhoop5DeepData() },
+                        enabled = live.encryptedBond && live.worn,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Palette.accent, contentColor = Palette.surfaceBase,
+                        ),
+                    ) { Text("Send enable sequence to strap") }
+                    Text(
+                        if (!live.encryptedBond) "Needs the full encrypted bond — close the official WHOOP app and pair the strap to NOOP first (a live-HR-only link can't carry the unlock)."
+                        else if (!live.worn) "Put the strap on first — the deep stream is on-wrist only."
+                        else "Wear the strap, tap once, then let it sync and share your strap log.",
+                        style = NoopType.caption,
+                        color = Palette.textTertiary,
+                    )
+                    // Live R22 telemetry (#174): proof of what the strap is doing right now.
+                    if (live.r22FlagsAccepted > 0) {
+                        Text(
+                            if (live.r22FlagsAccepted >= 15) "✓ Strap accepted all 15 R22 flags"
+                            else "Strap accepted ${live.r22FlagsAccepted}/15 R22 flags…",
+                            style = NoopType.caption,
+                            color = if (live.r22FlagsAccepted >= 15) Palette.statusPositive else Palette.textSecondary,
+                        )
+                    }
+                    if (live.deepPacketsThisSession > 0) {
+                        Text(
+                            "🎯 Deep data is flowing — ${live.deepPacketsThisSession} R22 packet(s) this session. Please share your strap log!",
+                            style = NoopType.caption,
+                            color = Palette.statusPositive,
+                        )
+                    } else if (live.r22FlagsAccepted >= 15) {
+                        Text(
+                            "Flags accepted, but no deep packets yet — keep the strap on for a couple of minutes, then share your strap log on #174.",
+                            style = NoopType.caption,
+                            color = Palette.textTertiary,
+                        )
+                    }
+                }
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -637,6 +842,20 @@ fun SettingsScreen(vm: AppViewModel) {
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = Palette.textSecondary),
                 ) { Text("Share 5/MG capture (for the decode effort)", style = NoopType.captionNumber) }
+
+                // Diagnostics: dump the decoded per-sample sensor streams (last 24h) to one long-format
+                // CSV so power users / external devs can prototype sleep/activity/VBT algorithms on real
+                // data without a BLE stream (#308/#276/#322). On-device only; plain text, no BLE hex.
+                OutlinedButton(
+                    onClick = { scope.launch { RawSensorExport.export(context, vm.repo) } },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Palette.textSecondary),
+                ) { Text("Export raw sensor data (CSV)", style = NoopType.captionNumber) }
+                Text(
+                    "Saves the last 24h of decoded sensor samples (heart rate, R-R, motion, steps and any 5/MG deep streams you've unlocked) as one CSV you can share — for tinkering with your own data. Nothing leaves the phone unless you share it.",
+                    style = NoopType.caption,
+                    color = Palette.textTertiary,
+                )
             }
         }
 
@@ -848,6 +1067,41 @@ fun SettingsScreen(vm: AppViewModel) {
                     }
                 }
 
+                // How your scores work — the honest explainer for Charge/Effort/Rest + the
+                // confidence labels, opened any time (macOS/iOS About parity).
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Palette.surfaceInset)
+                        .border(1.dp, Palette.hairline, RoundedCornerShape(10.dp))
+                        .clickable { showScoringGuide = true }
+                        .padding(horizontal = 14.dp, vertical = 12.dp)
+                        .semantics { contentDescription = "How your scores work" },
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Icon(
+                            Icons.Filled.Science,
+                            contentDescription = null,
+                            tint = Palette.accent,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("How your scores work", style = NoopType.headline, color = Palette.textPrimary)
+                            Text(
+                                "Charge, Effort and Rest — and how they differ from WHOOP",
+                                style = NoopType.footnote,
+                                color = Palette.textSecondary,
+                            )
+                        }
+                        Text("›", style = NoopType.title2, color = Palette.accent)
+                    }
+                }
+
                 // Medical disclaimer — inset well with a warning-tinted hairline.
                 Row(
                     modifier = Modifier
@@ -939,6 +1193,18 @@ fun SettingsScreen(vm: AppViewModel) {
                 }
             }
         }
+
+        // Scoring guide sheet, opened from the About row above. Same full-screen Dialog idiom.
+        if (showScoringGuide) {
+            Dialog(
+                onDismissRequest = { showScoringGuide = false },
+                properties = DialogProperties(usePlatformDefaultWidth = false),
+            ) {
+                Surface(modifier = Modifier.fillMaxSize(), color = Palette.surfaceBase) {
+                    ScoringGuideScreen(onClose = { showScoringGuide = false })
+                }
+            }
+        }
     }
 }
 
@@ -986,7 +1252,10 @@ private val SEX_OPTIONS = listOf(
 
 // MARK: - Section card (ports SettingsView's private SettingsSection)
 
-/** A grouped settings card: icon + title header, an explanatory blurb, then content. */
+/**
+ * A grouped settings card: a "Settings" overline + icon + title header, an explanatory blurb, then
+ * content. A faint brand-green wash anchors the card to NOOP's neutral chrome (mirrors macOS).
+ */
 @Composable
 private fun SettingsSection(
     icon: ImageVector,
@@ -994,14 +1263,17 @@ private fun SettingsSection(
     blurb: String,
     content: @Composable () -> Unit,
 ) {
-    NoopCard(padding = 20.dp) {
+    NoopCard(padding = 20.dp, tint = Palette.accent) {
         Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                Icon(icon, contentDescription = null, tint = Palette.accent, modifier = Modifier.size(18.dp))
-                Text(title, style = NoopType.headline, color = Palette.textPrimary)
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Overline("Settings")
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Icon(icon, contentDescription = null, tint = Palette.accent, modifier = Modifier.size(18.dp))
+                    Text(title, style = NoopType.title2, color = Palette.textPrimary)
+                }
             }
             Text(blurb, style = NoopType.subhead, color = Palette.textSecondary)
             content()

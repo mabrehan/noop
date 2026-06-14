@@ -16,21 +16,26 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.noop.analytics.RecoveryForecast
+import com.noop.analytics.RecoveryForecaster
 import com.noop.data.DailyMetric
+import java.time.LocalDate
 import java.util.Calendar
-import java.util.Locale
 import kotlin.math.roundToInt
 
 /**
- * Intelligence — NOOP's own recovery / strain / sleep scores, presented with the
+ * Intelligence — NOOP's own Charge / Effort / Rest scores, presented with the
  * WHOOP-model explanation so the read-out is legible rather than a black box.
  *
  * Ports macOS Strand/Screens/IntelligenceView.swift. The macOS build runs an
@@ -46,36 +51,160 @@ fun IntelligenceScreen(vm: AppViewModel) {
     val days by vm.recentDays.collectAsStateWithLifecycle()
     val live by vm.live.collectAsStateWithLifecycle()
 
+    // Effort display scale (#268) — routes every Effort value/label on this screen. Display-only.
+    val effortScale = UnitPrefs.effortScale(LocalContext.current)
+
     // Newest first for the per-day list (macOS ForEach renders most-recent at top).
     val ordered = remember(days) { days.reversed() }
 
+    // Evening forecast of tomorrow-morning Charge from tonight's known levers. `days` is
+    // already OLDEST→NEWEST (what the forecaster wants); today's Effort is the newest day.
+    // null (and the card hidden) until there are enough scored nights to anchor honestly.
+    val forecast = remember(days) {
+        val charge = days.mapNotNull { it.recovery }
+        val effort = days.mapNotNull { it.strain }
+        val sleeps = days.mapNotNull { it.totalSleepMin }
+        val plannedHours = if (sleeps.isEmpty()) RecoveryForecaster.defaultNeedHours
+            else (sleeps.sum() / sleeps.size) / 60.0
+        RecoveryForecaster.forecast(
+            recentCharge = charge,
+            recentEffort = effort,
+            todayEffort = ordered.firstOrNull()?.strain,
+            plannedSleepHours = plannedHours,
+        )
+    }
+
     ScreenScaffold(
         title = "Intelligence",
-        subtitle = "Recovery, strain and sleep — scored with the model, explained in plain terms.",
+        subtitle = "Charge, effort and rest — scored with the model, explained in plain terms.",
     ) {
-        ExplainerCard()
-        ModelBreakdownCard()
+        forecast?.let { ForecastCard(it) }
+        ExplainerCard(effortScale)
+        ModelBreakdownCard(effortScale)
 
         if (ordered.isEmpty()) {
             // While the strap is mid-offload, say so — an empty list reads as final otherwise (#77).
             if (live.backfilling) SyncingHistoryNote(chunks = live.syncChunksThisSession)
             EmptyNote()
         } else {
-            SectionHeader(
-                title = "By Day",
-                overline = "Recent",
-                trailing = "${ordered.size} ${if (ordered.size == 1) "day" else "days"}",
+            var range by remember { mutableStateOf(IntelRange.Month) }
+            val filtered = remember(ordered, range) {
+                val n = range.days ?: return@remember ordered
+                val cutoff = LocalDate.now().minusDays((n - 1).toLong()).toString()
+                ordered.filter { it.day >= cutoff }
+            }
+
+            // Header row: section label left, range control right. Lets you narrow the
+            // per-day list to a recent window (lexicographic YYYY-MM-DD compare == chronological).
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(Metrics.gap),
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Overline("Recent")
+                    Text("By Day", style = NoopType.title2, color = Palette.textPrimary)
+                }
+                SegmentedPillControl(
+                    items = IntelRange.entries.toList(),
+                    selection = range,
+                    label = { it.label },
+                    onSelect = { range = it },
+                )
+            }
+            Text(
+                "${filtered.size} ${if (filtered.size == 1) "day" else "days"}",
+                style = NoopType.footnote,
+                color = Palette.textTertiary,
             )
-            ordered.forEach { day -> DayCard(day) }
+
+            if (filtered.isEmpty()) {
+                NoopCard(padding = 18.dp) {
+                    Text(
+                        "No scored days in this window. Widen the range or import more history.",
+                        style = NoopType.subhead,
+                        color = Palette.textSecondary,
+                    )
+                }
+            } else {
+                filtered.forEach { day -> DayCard(day, effortScale) }
+            }
         }
     }
+}
+
+// MARK: - Tomorrow's Charge forecast hero (ported from IntelligenceView.forecastCard)
+//
+// An evening ESTIMATE of tomorrow-morning Charge from tonight's known levers —
+// today's Effort vs your norm, your typical sleep, and the recent recovery baseline.
+// Bevel hero: the estimate as a layered Charge-world [BevelGauge] over a scenic
+// [ScenicHeroBackground], with the ± band as the caption and the plain-English read-out
+// beneath. Labelled an estimate; the real Charge is scored from tomorrow's HRV. The
+// number, band and copy are unchanged — only the container + gauge are new.
+
+@Composable
+private fun ForecastCard(f: RecoveryForecast) {
+    val charge = f.charge.roundToInt()
+    val band = f.band.roundToInt()
+    Column(verticalArrangement = Arrangement.spacedBy(Metrics.gap)) {
+        SectionHeader("Tomorrow's Charge", overline = "Evening forecast", trailing = "Estimate")
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(Metrics.cardRadius)),
+        ) {
+            ScenicHeroBackground(modifier = Modifier.matchParentSize(), domain = DomainTheme.Charge)
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                BevelGauge(
+                    fraction = (f.charge / 100.0).coerceIn(0.0, 1.0),
+                    stops = Palette.recoveryStops,
+                    tipColor = Palette.recoveryColor(f.charge),
+                    numberText = "$charge",
+                    captionText = "± $band",
+                    stateText = Palette.recoveryState(f.charge),
+                    diameter = 184.dp,
+                    lineWidth = 15.dp,
+                )
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text(
+                        "You'll likely wake around $charge ± $band Charge if you sleep about " +
+                            "${sleepHoursLabel(f.plannedSleepHours)} tonight.",
+                        style = NoopType.subhead,
+                        color = Palette.textSecondary,
+                    )
+                    Text(
+                        "Estimate from today's effort, your typical sleep and your ${f.nights}-night " +
+                            "recovery baseline — not a measurement. Your real Charge is scored from " +
+                            "tomorrow's HRV when you wake.",
+                        style = NoopType.footnote,
+                        color = Palette.textTertiary,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** "~7h" / "~7h 30m" for the planned-sleep assumption (rounded to the nearest 30 min). */
+private fun sleepHoursLabel(hours: Double): String {
+    val half = (hours * 2).roundToInt() / 2.0
+    val h = half.toInt()
+    val m = ((half - h) * 60).roundToInt()
+    return if (m == 0) "${h}h" else "${h}h ${m}m"
 }
 
 // MARK: - Explainer (ported from IntelligenceView.explainerCard)
 
 @Composable
-private fun ExplainerCard() {
-    NoopCard(padding = 20.dp) {
+private fun ExplainerCard(effortScale: EffortScale) {
+    NoopCard(padding = 20.dp, tint = Palette.chargeColor) {
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Row(
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -84,18 +213,18 @@ private fun ExplainerCard() {
                 Icon(
                     Icons.Filled.AutoAwesome,
                     contentDescription = null,
-                    tint = Palette.accent,
+                    tint = Palette.chargeColor,
                     modifier = Modifier.size(20.dp),
                 )
                 Text("How this works", style = NoopType.headline, color = Palette.textPrimary)
             }
             Text(
-                "Recovery weighs your heart-rate variability against your personal baseline " +
-                    "(~60%), resting heart rate (~20%), sleep performance (~15%) and respiration " +
-                    "(~5%). Day strain is a 0–21 cardiovascular load from time spent in each " +
-                    "heart-rate zone. Sleep is staged from movement and heart rate. The full " +
-                    "on-device recompute from the strap's raw streams is a later port; the scores " +
-                    "below are read from each day's cached metrics.",
+                "Charge weighs your heart-rate variability against your personal baseline " +
+                    "(~55%), resting heart rate (~20%), rest quality (~15%), respiration (~5%) " +
+                    "and skin-temperature deviation (~5%). Effort is a 0–${UnitFormatter.effortScaleMax(effortScale)} " +
+                    "cardiovascular load from time spent in each heart-rate zone. Rest is staged " +
+                    "from movement and heart rate. The full on-device recompute from the strap's raw " +
+                    "streams is a later port; the scores below are read from each day's cached metrics.",
                 style = NoopType.subhead,
                 color = Palette.textSecondary,
             )
@@ -107,7 +236,7 @@ private fun ExplainerCard() {
 
 @Composable
 private fun EmptyNote() {
-    NoopCard(padding = 20.dp) {
+    NoopCard(padding = 20.dp, tint = Palette.chargeColor) {
         Row(
             horizontalArrangement = Arrangement.spacedBy(10.dp),
             verticalAlignment = Alignment.Top,
@@ -115,12 +244,12 @@ private fun EmptyNote() {
             Icon(
                 Icons.Filled.AutoAwesome,
                 contentDescription = null,
-                tint = Palette.accent,
+                tint = Palette.chargeColor,
                 modifier = Modifier.size(18.dp),
             )
             Text(
-                "No scored days yet. Sync your strap to collect raw streams — recovery, " +
-                    "strain and sleep are scored once a day's data is in.",
+                "No scored days yet. Sync your strap to collect raw streams — charge, " +
+                    "effort and rest are scored once a day's data is in.",
                 style = NoopType.subhead,
                 color = Palette.textSecondary,
             )
@@ -130,34 +259,35 @@ private fun EmptyNote() {
 
 // MARK: - Model weighting breakdown
 //
-// Makes the recovery formula concrete: the four weighted inputs plus the 0–21
-// strain scale. Pure presentation of the model the macOS engine uses — no per-day
+// Makes the Charge formula concrete: the five weighted inputs plus the 0–100
+// Effort scale. Pure presentation of the model the macOS engine uses — no per-day
 // data, so it's always legible even before any day is scored.
 
 @Composable
-private fun ModelBreakdownCard() {
-    NoopCard(padding = 20.dp) {
+private fun ModelBreakdownCard(effortScale: EffortScale) {
+    NoopCard(padding = 20.dp, tint = Palette.chargeColor) {
         Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-            Overline("Recovery model")
-            WeightRow("Heart-rate variability", "~60%", 0.60f, Palette.metricPurple)
+            Overline("Charge model")
+            WeightRow("Heart-rate variability", "~55%", 0.55f, Palette.metricPurple)
             WeightRow("Resting heart rate", "~20%", 0.20f, Palette.metricRose)
-            WeightRow("Sleep performance", "~15%", 0.15f, Palette.metricCyan)
+            WeightRow("Rest quality", "~15%", 0.15f, Palette.metricCyan)
             WeightRow("Respiration", "~5%", 0.05f, Palette.accent)
+            WeightRow("Skin-temperature deviation", "~5%", 0.05f, Palette.metricAmber)
 
             Row(
                 modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    "Day strain",
+                    "Effort",
                     style = NoopType.subhead,
                     color = Palette.textSecondary,
                     modifier = Modifier.weight(1f),
                 )
                 Text(
-                    "0–21 scale",
+                    "0–${UnitFormatter.effortScaleMax(effortScale)} scale",
                     style = NoopType.captionNumber,
-                    color = Palette.metricCyan,
+                    color = Palette.effortColor,
                 )
             }
         }
@@ -204,12 +334,12 @@ private fun Meter(fraction: Float, color: Color) {
 // MARK: - Per-day card (ported from IntelligenceView.dayCard)
 //
 // Header = the day + a NOOP-computed source badge; a row of the five headline
-// scores (Recovery / Strain / Sleep / HRV / RHR) tinted to the design-system metric
-// colors, then a thin strain meter for at-a-glance load.
+// scores (Charge / Effort / Rest / HRV / RHR) tinted to the design-system metric
+// colors, then a thin Effort meter for at-a-glance load.
 
 @Composable
-private fun DayCard(d: DailyMetric) {
-    NoopCard(padding = 18.dp) {
+private fun DayCard(d: DailyMetric, effortScale: EffortScale) {
+    NoopCard(padding = 18.dp, tint = Palette.chargeColor) {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
@@ -223,21 +353,21 @@ private fun DayCard(d: DailyMetric) {
 
             Row(modifier = Modifier.fillMaxWidth()) {
                 DayStat(
-                    "Recovery",
+                    "Charge",
                     d.recovery?.let { "${it.roundToInt()}%" } ?: "—",
-                    d.recovery?.let { recoveryStatColor(it) } ?: Palette.textSecondary,
+                    d.recovery?.let { Palette.recoveryColor(it) } ?: Palette.textSecondary,
                     Modifier.weight(1f),
                 )
                 DayStat(
-                    "Strain",
-                    d.strain?.let { String.format(Locale.US, "%.1f", it) } ?: "—",
-                    Palette.metricCyan,
+                    "Effort",
+                    d.strain?.let { UnitFormatter.effortDisplay(it, effortScale) } ?: "—",
+                    d.strain?.let { Palette.strainColor(it) } ?: Palette.textSecondary,
                     Modifier.weight(1f),
                 )
                 DayStat(
-                    "Sleep",
+                    "Rest",
                     sleepValue(d.totalSleepMin),
-                    Palette.metricPurple,
+                    Palette.restColor,
                     Modifier.weight(1f),
                 )
                 DayStat(
@@ -254,10 +384,10 @@ private fun DayCard(d: DailyMetric) {
                 )
             }
 
-            // Strain load meter (0–21), tinted along the strain ramp.
+            // Effort load meter (0–100), tinted along the strain ramp.
             d.strain?.let { s ->
                 Meter(
-                    fraction = (s / 21.0).toFloat(),
+                    fraction = (s / 100.0).toFloat(),
                     color = Palette.strainColor(s),
                 )
             }
@@ -287,17 +417,16 @@ private fun DayStat(label: String, value: String, color: Color, modifier: Modifi
 
 // MARK: - Derived helpers
 
-/** Recovery-band status color, mirroring IntelligenceView.recoveryColor (67 / 34 cuts). */
-private fun recoveryStatColor(r: Double): Color = when {
-    r >= 67 -> Palette.statusPositive
-    r >= 34 -> Palette.statusWarning
-    else -> Palette.statusCritical
-}
-
 private fun sleepValue(totalMin: Double?): String {
     val m = totalMin ?: return "—"
     val total = m.roundToInt()
     return "${total / 60}h ${total % 60}m"
+}
+
+/** Recent-window options for the By Day list. `days == null` means show everything. */
+private enum class IntelRange(val days: Int?, val label: String) {
+    Week(7, "W"), Month(30, "M"), Quarter(90, "3M"),
+    Half(180, "6M"), Year(365, "1Y"), All(null, "ALL"),
 }
 
 /** "YYYY-MM-DD" → "Mon 5 Jun"; falls back to the raw key if it doesn't parse. */

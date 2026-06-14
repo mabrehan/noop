@@ -11,7 +11,7 @@ struct NotificationSettingsView: View {
 
     var body: some View {
         ScreenScaffold(title: "Notifications",
-                       subtitle: "Buzz your strap when these apps notify you. Everything runs on this Mac.") {
+                       subtitle: "Buzz your strap when these apps notify you. Everything runs on \(Platform.deviceNounPhrase).") {
             masterCard
             if store.activeCategories.isEmpty {
                 emptyAppsCard
@@ -28,7 +28,7 @@ struct NotificationSettingsView: View {
 
     private var masterCard: some View {
         AlertSection(icon: "bell.badge.fill", title: "Wrist alerts",
-                     blurb: "When on, NOOP taps your wrist for the apps you pick below — so you can leave the Mac and still feel what matters.") {
+                     blurb: "When on, NOOP taps your wrist for the apps you pick below — so you can leave the \(Platform.deviceNoun) and still feel what matters.") {
             VStack(alignment: .leading, spacing: 16) {
                 Toggle(isOn: $store.masterEnabled) {
                     Text("Enable wrist alerts")
@@ -111,7 +111,7 @@ struct NotificationSettingsView: View {
     private var emptyAppsCard: some View {
         AlertSection(icon: "bell.slash",
                      title: "No supported apps found",
-                     blurb: "NOOP looks for known notification apps on this Mac — Mail, Outlook, WhatsApp, Teams, Messages, Slack and similar. Install one and it'll appear here automatically.") {
+                     blurb: "NOOP looks for known notification apps on \(Platform.deviceNounPhrase) — Mail, Outlook, WhatsApp, Teams, Messages, Slack and similar. Install one and it'll appear here automatically.") {
             EmptyView()
         }
     }
@@ -147,6 +147,10 @@ struct NotificationSettingsView: View {
         }
         .frame(minHeight: 42)
         .padding(.vertical, 4)
+        .padding(.horizontal, 8)
+        // An enabled app reads as a selected row: a soft accentMuted wash behind it.
+        .background(enabled ? StrandPalette.accentMuted : .clear,
+                    in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     private func appIcon(_ app: NotifApp) -> some View {
@@ -284,18 +288,23 @@ private struct AlertSection<Content: View>: View {
     let icon: String
     let title: String
     var blurb: String? = nil
+    /// The section overline ("Alerts" by default). Lets a section group itself in the Bevel idiom.
+    var overline: String = "Alerts"
     @ViewBuilder var content: () -> Content
 
     var body: some View {
-        StrandCard(padding: 20) {
+        StrandCard(padding: 20, tint: StrandPalette.accent) {
             VStack(alignment: .leading, spacing: 16) {
-                HStack(spacing: 10) {
-                    Image(systemName: icon)
-                        .foregroundStyle(StrandPalette.accent)
-                        .accessibilityHidden(true)
-                    Text(title)
-                        .font(StrandFont.headline)
-                        .foregroundStyle(StrandPalette.textPrimary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(overline)").strandOverline()
+                    HStack(spacing: 10) {
+                        Image(systemName: icon)
+                            .foregroundStyle(StrandPalette.accent)
+                            .accessibilityHidden(true)
+                        Text(title)
+                            .font(StrandFont.title2)
+                            .foregroundStyle(StrandPalette.textPrimary)
+                    }
                 }
                 if let blurb {
                     Text(blurb)

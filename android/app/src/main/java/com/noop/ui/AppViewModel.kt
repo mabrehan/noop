@@ -4,6 +4,10 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.noop.NoopApplication
+import com.noop.alarm.SmartAlarmScheduler
+import com.noop.alarm.SmartAlarmStore
+import com.noop.alarm.WindDownScheduler
+import com.noop.alarm.WindDownStore
 import com.noop.analytics.IllnessWatch
 import com.noop.analytics.IntelligenceEngine
 import com.noop.analytics.RouteMath
@@ -12,7 +16,7 @@ import com.noop.analytics.Calories
 import com.noop.analytics.StrainScorer
 import com.noop.analytics.UserProfile
 import com.noop.analytics.WorkoutSport
-import com.noop.location.LocationTracker
+import com.noop.location.GpsSession
 import kotlinx.coroutines.Job
 import com.noop.ble.LiveState
 import com.noop.ble.WhoopConnectionService
@@ -24,6 +28,7 @@ import com.noop.data.WhoopRepository
 import com.noop.data.WorkoutRow
 import com.noop.ingest.HealthConnectImporter
 import com.noop.ingest.HealthConnectWriter
+import com.noop.ingest.LiftingImporter
 import com.noop.notif.IllnessAlertNotifier
 import com.noop.protocol.CommandNumber
 import com.noop.widget.WidgetSnapshot
@@ -121,6 +126,28 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _smartAlarmMinutes = MutableStateFlow(NoopPrefs.smartAlarmMinutes(appContext))
     val smartAlarmMinutes: StateFlow<Int> = _smartAlarmMinutes.asStateFlow()
 
+    // PHONE smart alarm (#207) — distinct from the strap-firmware buzz alarm above. The state lives in
+    // its own [SmartAlarmStore]; the GUARANTEED wake is an exact OS alarm via [SmartAlarmScheduler],
+    // independent of Bluetooth, sleep detection, or this process being alive. The overnight watcher
+    // (WhoopConnectionService) may only move it EARLIER within the window.
+    private val phoneAlarmStore = SmartAlarmStore.from(appContext)
+    private val _phoneAlarmEnabled = MutableStateFlow(phoneAlarmStore.enabled)
+    /** Whether the phone smart alarm is armed (a guaranteed OS alarm is scheduled). */
+    val phoneAlarmEnabled: StateFlow<Boolean> = _phoneAlarmEnabled.asStateFlow()
+    private val _phoneAlarmTargetMinutes = MutableStateFlow(phoneAlarmStore.targetMinutes)
+    /** Earliest acceptable wake time, minutes since midnight. */
+    val phoneAlarmTargetMinutes: StateFlow<Int> = _phoneAlarmTargetMinutes.asStateFlow()
+    private val _phoneAlarmWindowMinutes = MutableStateFlow(phoneAlarmStore.windowMinutes)
+    /** How long after the target the guaranteed hard deadline sits. */
+    val phoneAlarmWindowMinutes: StateFlow<Int> = _phoneAlarmWindowMinutes.asStateFlow()
+
+    // Wind-down nudge (#207) — cross-platform, NON-safety-critical. A gentle evening notification
+    // derived from the user's earliest wake time. Inexact daily alarm; no exact-alarm permission.
+    private val windDownStore = WindDownStore.from(appContext)
+    private val _windDownEnabled = MutableStateFlow(windDownStore.enabled)
+    /** Whether the evening wind-down nudge is scheduled. */
+    val windDownEnabled: StateFlow<Boolean> = _windDownEnabled.asStateFlow()
+
     // MARK: - Today's cached metrics
 
     private val _today = MutableStateFlow<DailyMetric?>(null)
@@ -160,8 +187,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 // Only treat a row as "today" if its date is the phone's ACTUAL local calendar day.
                 // Was days.lastOrNull() — the newest stored row regardless of date — so after importing
                 // historical data the newest import (e.g. months old) showed as today's synthesis (#23).
-                val todayKey = java.time.LocalDate.now().toString()   // ISO yyyy-MM-dd, local
-                _today.value = days.lastOrNull { it.day == todayKey }
+                // Resolve via the LOGICAL day (rolls at 04:00 local), so between midnight and 4am we keep
+                // showing the prior logical day's row instead of an empty new-calendar-day row (#144).
+                // Presentation-only: stored row keys are untouched.
+                //
+                // Non-UTC pre-04:00 carve-out (#304): a user who sleeps before midnight and wakes before
+                // the 04:00 rollover has the just-finished night banked under the NEW local calendar day
+                // (sleep is keyed by the local wake-day), while the logical key still points at yesterday.
+                // So: if the local calendar day differs from the logical day AND a row for the local day
+                // has a banked night (totalSleepMin != null), prefer it; otherwise fall back to the
+                // logical-day row, preserving the #144 anti-blank guard (no night yet ⇒ keep yesterday's).
+                val logicalKey = logicalDayKeyNow()       // ISO yyyy-MM-dd, local logical day
+                val localKey = java.time.LocalDate.now().toString()
+                _today.value = resolveTodayRow(days, logicalKey, localKey)
                 val previousAlert = _healthAlert.value
                 _healthAlert.value =
                     if (_illnessWatchEnabled.value) IllnessWatch.evaluate(days) else null
@@ -196,6 +234,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // Mirrors macOS AppModel's launch + 15-min analyze loop.
         viewModelScope.launch {
             delay(FIRST_OFFLOAD_GRACE_MS) // give the first offload a moment
+            // One-shot on-upgrade Effort rescore (#313): recompute strain from source across the FULL
+            // history once, so any deep-history rows an older build left on the 0–21 axis regenerate on
+            // the 0–100 axis. Guarded by a persisted flag, so it's a no-op on every subsequent launch.
+            runCatching {
+                IntelligenceEngine.runEffortRescoreIfNeeded(
+                    repo = repository,
+                    profile = currentProfile(),
+                    importedDeviceId = deviceId,
+                    maxHROverride = profileStore.hrMaxOverride.takeIf { it > 0 }?.toDouble(),
+                    flagGet = { NoopPrefs.effortRescoreDone(appContext) },
+                    flagSet = { NoopPrefs.setEffortRescoreDone(appContext) },
+                )
+            }.onFailure { if (it is kotlin.coroutines.cancellation.CancellationException) throw it }
             while (isActive) {
                 runCatching {
                     IntelligenceEngine.analyzeRecent(
@@ -220,10 +271,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
 
+        // Apply the persisted "Continuous HRV capture" intent so the BLE client holds the dense realtime
+        // stream armed once bonded (the reconciler arms it post-bond). Only effective with background
+        // connection on — without it there's nothing keeping the link up to stream over, so a continuous
+        // want would be meaningless. Pushed BEFORE autoReconnectOnLaunch so a launch reconnect arms it.
+        ble.setKeepStreamForData(continuousHrvEffective())
+
         // Reconnect to the strap we last bonded to, so the user doesn't have to tap Connect after an
         // app update / restart (#67). Self-gates on the keep-connected pref + a saved strap + permission.
         autoReconnectOnLaunch()
     }
+
+    /** The effective continuous-HRV want: the user's "Continuous HRV capture" preference AND
+     *  "Keep connected in the background" — the latter is what holds the link up for the stream to ride,
+     *  so continuous capture is meaningless without it. */
+    private fun continuousHrvEffective(): Boolean =
+        NoopPrefs.continuousHrv(appContext) && NoopPrefs.backgroundConnection(appContext)
 
     /**
      * On launch, reconnect DIRECTLY to the strap we last bonded to (no scan), so the connection
@@ -251,6 +314,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         heightCm = profileStore.heightCm,
         age = profileStore.age.toDouble(),
         sex = profileStore.sex,
+        stepTicksPerStep = profileStore.stepTicksPerStep,
     )
 
     // MARK: - HR smoothing (median filter)
@@ -292,28 +356,55 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _lastWorkout = MutableStateFlow<WorkoutRow?>(null)
     val lastWorkout: StateFlow<WorkoutRow?> = _lastWorkout.asStateFlow()
 
-    private val locationTracker by lazy { LocationTracker(appContext) }
+    /** Mirrors the process-level [GpsSession] route into [_activeWorkout] for live display. The route
+     *  itself is collected by [WhoopConnectionService], not here, so it survives the screen turning off
+     *  (#215) — this observer just republishes it to the UI while the ViewModel is alive. */
     private var gpsJob: Job? = null
 
     /** Begin a workout for [sport]; start GPS route tracking when [gpsEnabled]. Single buzz confirms. */
     fun startWorkout(sport: Sport = WorkoutSport.default, gpsEnabled: Boolean = false) {
         if (_activeWorkout.value != null) return
         _lastWorkout.value = null
-        _activeWorkout.value = ActiveWorkout(startMs = System.currentTimeMillis(), sport = sport, gpsEnabled = gpsEnabled)
+        val startMs = System.currentTimeMillis()
+        _activeWorkout.value = ActiveWorkout(startMs = startMs, sport = sport, gpsEnabled = gpsEnabled)
         buzz(1)
         if (gpsEnabled) {
-            gpsJob = viewModelScope.launch {
-                locationTracker.stream().collect { pt -> appendTrackPoint(pt) }
+            // Hand the route to the process-level session and make sure the foreground service is up to
+            // collect it — even if the user hasn't opted into background connection, the route must keep
+            // tracking with the screen off (#215). Then mirror the shared route back into the UI state.
+            GpsSession.start(startMs, sport.name)
+            WhoopConnectionService.start(appContext)
+            observeGpsSession()
+        }
+    }
+
+    /** Mirror the process-level [GpsSession] route into [_activeWorkout] while the ViewModel is alive.
+     *  Re-attachable: also used by [rehydrateActiveGpsWorkout] after a VM/process restart. */
+    private fun observeGpsSession() {
+        gpsJob?.cancel()
+        gpsJob = viewModelScope.launch {
+            GpsSession.state.collect { s ->
+                val w = _activeWorkout.value ?: return@collect
+                _activeWorkout.value = w.copy(track = s.track, distanceM = s.distanceM, paceSecPerKm = s.paceSecPerKm)
             }
         }
     }
 
-    private fun appendTrackPoint(pt: RouteMath.LatLng) {
-        val w = _activeWorkout.value ?: return
-        val track = w.track + pt
-        val dist = RouteMath.totalMeters(track)
-        val secs = (System.currentTimeMillis() - w.startMs) / 1000.0
-        _activeWorkout.value = w.copy(track = track, distanceM = dist, paceSecPerKm = RouteMath.paceSecPerKm(dist, secs))
+    /**
+     * If a GPS workout is still tracking in the background (process kept alive by the foreground
+     * service) but this ViewModel was recreated, rebuild the active-workout card from [GpsSession] so
+     * reopening the app doesn't hide an in-flight ride. HR samples that elapsed while the UI was gone
+     * aren't recoverable here (they stream live), but the route — the thing #215 was about — is intact.
+     */
+    private fun rehydrateActiveGpsWorkout() {
+        val s = GpsSession.state.value
+        if (!s.active || _activeWorkout.value != null) return
+        val sport = WorkoutSport.all.firstOrNull { it.name == s.sportName } ?: WorkoutSport.default
+        _activeWorkout.value = ActiveWorkout(
+            startMs = s.startMs, sport = sport, gpsEnabled = true,
+            track = s.track, distanceM = s.distanceM, paceSecPerKm = s.paceSecPerKm,
+        )
+        observeGpsSession()
     }
 
     /** Finish the active workout: score the captured HR window + finalize the GPS route, save a
@@ -323,8 +414,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val w = _activeWorkout.value ?: return
         _activeWorkout.value = null
         gpsJob?.cancel(); gpsJob = null
+        // The process-level session is authoritative for the route: it kept accumulating even if this
+        // ViewModel was cleared mid-ride (screen off), so [w.track] may be stale. Stop it and take its
+        // final track. A non-GPS workout has nothing in the session, so fall back to the local track. (#215)
+        val track = if (w.gpsEnabled) GpsSession.stop() else w.track
+        val distanceM = if (w.gpsEnabled) RouteMath.totalMeters(track) else w.distanceM
+        // If we promoted the foreground service ONLY to keep GPS tracking alive (the user hasn't opted
+        // into the background connection), drop it now the route is finished — otherwise a lingering
+        // "Connected" notification would outlive the workout. With background-connection on, leave it
+        // up. Done here (before the discard early-return) so an empty GPS session tears down too. (#215)
+        if (w.gpsEnabled && !NoopPrefs.backgroundConnection(appContext)) {
+            WhoopConnectionService.stop(appContext)
+        }
         val samples = w.samples
-        if (samples.size < 2 && w.track.size < 2) { _lastWorkout.value = null; return }
+        if (samples.size < 2 && track.size < 2) { _lastWorkout.value = null; return }
         val endMs = System.currentTimeMillis()
         val avg = if (samples.isNotEmpty()) samples.sumOf { it.bpm } / samples.size else null
         val peak = if (samples.isNotEmpty()) samples.maxOf { it.bpm } else null
@@ -341,8 +444,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             sport = w.sport.name, source = "manual", durationS = (endMs - w.startMs) / 1000.0,
             energyKcal = energyKcal,
             avgHr = avg, maxHr = peak, strain = strain,
-            distanceM = w.distanceM.takeIf { it > 0 },
-            routePolyline = if (w.track.size >= 2) RouteMath.encode(w.track) else null,
+            distanceM = distanceM.takeIf { it > 0 },
+            routePolyline = if (track.size >= 2) RouteMath.encode(track) else null,
         )
         _lastWorkout.value = row
         buzz(2)
@@ -357,7 +460,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Append the current smoothed bpm to the active workout and recompute its running strain. Called
      *  from ingestHr on every fresh sample; a no-op when no workout is running. */
     private fun captureWorkoutSample(bpm: Int) {
-        val w = _activeWorkout.value ?: return
+        // `_activeWorkout` (declared further down) can still be null HERE: the HR collector in the first
+        // init block can fire ingestHr -> captureWorkoutSample INLINE during construction (a StateFlow
+        // replays its current value to a new collector), before this field's initializer has run — the
+        // JVM field-init footgun. The safe-call tolerates that one-shot race; once constructed it is
+        // never null. (Fixes the NPE in @maddognik's ADB: captureWorkoutSample -> getValue on null.)
+        @Suppress("UNNECESSARY_SAFE_CALL")
+        val w = _activeWorkout?.value ?: return
         val s = w.samples + HrSample(deviceId = deviceId, ts = System.currentTimeMillis() / 1000, bpm = bpm)
         val strain = StrainScorer.strain(s, maxHR = profileStore.hrMax.toDouble(), sex = profileStore.sex) ?: 0.0
         _activeWorkout.value = w.copy(
@@ -377,6 +486,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** All workouts for the Workouts screen (newest first), dismissed detected bouts removed. */
     val workouts: StateFlow<List<WorkoutRow>> = _workouts.asStateFlow()
 
+    /** Persist a bed/wake-time edit for one sleep session (delete-then-upsert at the new window).
+     *  Swallows failures — the Sleep screen already applied the change optimistically. */
+    suspend fun updateSleepSessionTimes(session: com.noop.data.SleepSession, newStartTs: Long, newEndTs: Long) {
+        runCatching { repository.updateSleepSessionTimes(session, newStartTs, newEndTs) }
+    }
+
+    /** Delete one sleep session. Swallows failures — the Sleep screen already removed it
+     *  optimistically, so the day recomputes without the misread night either way. (#281) */
+    suspend fun deleteSleepSession(session: com.noop.data.SleepSession) {
+        runCatching { repository.deleteSleepSession(session) }
+    }
+
     /** Re-read every source + the dismissed markers and republish [workouts]. */
     fun loadWorkouts() {
         viewModelScope.launch {
@@ -385,12 +506,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val apple = repository.workouts("apple-health", 0L, now) +
                 repository.workouts("health-connect", 0L, now)
             val detected = repository.workouts(repository.computedDeviceId(deviceId), 0L, now)
+            // Imported lifting sessions (Hevy / Liftosaur) carry a volume-load note but no HR — they're
+            // a strength-volume estimate, not cardio. Kept OUT of the strap HR-fill below so we never
+            // fabricate a heart rate the lift never measured.
+            val lifting = repository.workouts(LiftingImporter.SOURCE_ID, 0L, now)
             val markers = repository.dismissedDetected(deviceId)
             // Fill imported sessions' missing HR from strap samples (#77), same as before; detected /
             // manual rows already carry their own HR so they pass through unchanged.
             val filled = repository.fillWorkoutHrFromStrap((whoop + apple + detected))
             _workouts.value = WorkoutEditing
-                .filterDismissed(filled, markers)
+                .filterDismissed(filled + lifting, markers)
                 .sortedByDescending { it.startTs }
         }
     }
@@ -483,6 +608,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         } else {
             WhoopConnectionService.stop(appContext)
         }
+        // Continuous HRV capture is gated on background connection (it has nothing to stream over without
+        // it), so a change here re-reconciles the keep-stream want: turning background off disarms the
+        // continuous stream when no Live screen wants it; turning it back on re-arms it if the pref is on.
+        ble.setKeepStreamForData(continuousHrvEffective())
+    }
+
+    /**
+     * Flip "Continuous HRV capture" (driven by Settings → Strap). Persists the preference and pushes the
+     * effective want to the BLE client so it takes effect immediately: turning it on while bonded +
+     * backgrounded arms the dense realtime stream now; turning it off disarms it unless a Live screen
+     * still wants it (the reconciler only sends the toggle on the false↔true edge). Gated on background
+     * connection — it does nothing while that's off (there'd be no background link to stream over).
+     */
+    fun setContinuousHrv(enabled: Boolean) {
+        NoopPrefs.setContinuousHrv(appContext, enabled)
+        ble.setKeepStreamForData(continuousHrvEffective())
     }
 
     /**
@@ -513,6 +654,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // background-health permission and is unreliable on Android 14+, and opening the app regularly
         // is enough for a personal health app.
         syncHealthConnectIfStale()
+
+        // If a GPS workout is still tracking in the background (the screen was off and this VM was
+        // recreated on reopen), rebuild its active-workout card from the process-level session. Placed
+        // in THIS init — not the first one above — because it reads _activeWorkout, which is declared
+        // below the first init block and would still be null there (JVM field init order). (#215)
+        rehydrateActiveGpsWorkout()
     }
 
     /** Flip auto-sync. Persists and, on enable, kicks an immediate import; thereafter it catches up on
@@ -626,6 +773,55 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _smartAlarmMinutes.value = minutes.coerceIn(0, 24 * 60 - 1)
         NoopPrefs.setSmartAlarmMinutes(appContext, _smartAlarmMinutes.value)
         applySmartAlarm()
+    }
+
+    // --- PHONE smart alarm (#207). The setters persist + (re)arm the GUARANTEED OS alarm via
+    // [SmartAlarmScheduler]: scheduling the hard deadline FIRST, before any smart logic exists, so the
+    // fallback is in place the instant the alarm is enabled. Whether the strap is connected is
+    // irrelevant — that's the whole point. The exact-alarm permission is requested by the UI before
+    // these are called on a fresh enable; if it's somehow missing, arm() returns null and the UI shows
+    // the permission prompt. ---
+
+    /** Enable/disable the phone smart alarm. Enabling arms the guaranteed hard-deadline alarm now;
+     *  disabling cancels it. Returns false if exact alarms aren't permitted (the UI then routes the
+     *  user to grant the permission and re-tries). */
+    fun setPhoneAlarmEnabled(enabled: Boolean): Boolean {
+        if (enabled && !SmartAlarmScheduler.canScheduleExact(appContext)) return false
+        phoneAlarmStore.enabled = enabled
+        _phoneAlarmEnabled.value = enabled
+        if (enabled) SmartAlarmScheduler.arm(appContext, phoneAlarmStore)
+        else SmartAlarmScheduler.cancel(appContext, phoneAlarmStore)
+        return true
+    }
+
+    /** Change the earliest wake time (minutes since midnight). Re-arms while enabled so the new
+     *  window takes effect immediately. */
+    fun setPhoneAlarmTargetMinutes(minutes: Int) {
+        phoneAlarmStore.targetMinutes = minutes
+        _phoneAlarmTargetMinutes.value = phoneAlarmStore.targetMinutes
+        if (phoneAlarmStore.enabled) SmartAlarmScheduler.arm(appContext, phoneAlarmStore)
+        // The wind-down nudge is derived from the wake time, so keep it in step.
+        if (windDownStore.enabled) WindDownScheduler.schedule(appContext, windDownStore, phoneAlarmStore.targetMinutes)
+    }
+
+    /** Change the window length (minutes after the target the hard deadline sits). Re-arms while
+     *  enabled. */
+    fun setPhoneAlarmWindowMinutes(minutes: Int) {
+        phoneAlarmStore.windowMinutes = minutes
+        _phoneAlarmWindowMinutes.value = phoneAlarmStore.windowMinutes
+        if (phoneAlarmStore.enabled) SmartAlarmScheduler.arm(appContext, phoneAlarmStore)
+    }
+
+    /** Whether the OS will honour an exact alarm right now (API 31+ gates it behind a permission). */
+    fun canScheduleExactAlarms(): Boolean = SmartAlarmScheduler.canScheduleExact(appContext)
+
+    /** Enable/disable the evening wind-down nudge. Schedules the daily inexact reminder from the
+     *  current earliest wake time, or cancels it. */
+    fun setWindDownEnabled(enabled: Boolean) {
+        windDownStore.enabled = enabled
+        _windDownEnabled.value = enabled
+        if (enabled) WindDownScheduler.schedule(appContext, windDownStore, phoneAlarmStore.targetMinutes)
+        else WindDownScheduler.cancel(appContext)
     }
 
     // --- Illness watch (opt-out; the evaluation itself is the pure IllnessWatch.evaluate).

@@ -10,9 +10,13 @@ import Charts
 
 /// One point on a trend line.
 public struct TrendPoint: Identifiable, Sendable {
-    public let id = UUID()
     public var date: Date
     public var value: Double
+
+    /// Stable, content-derived identity (one point per date in a series). A random
+    /// `UUID()` defeats Swift Charts' diffing — every render re-identifies all marks
+    /// and replays the draw animation; keying on the date lets Charts diff by data.
+    public var id: Date { date }
 
     public init(date: Date, value: Double) {
         self.date = date
@@ -36,6 +40,16 @@ public struct TrendChart: View {
     public var valueFormat: (Double) -> String
     /// Formats a point's date for the tooltip's secondary line.
     public var dateFormat: (Date) -> String
+    /// Optional human-readable series name for VoiceOver (e.g. "HRV trend"). When nil the
+    /// element falls back to a generic "Trend" label so it's never unlabeled.
+    public var accessibilityLabel: String?
+
+    /// Mean of all point values, computed once in `init` so the area fill's gradient
+    /// stop doesn't run an O(n) reduce for every mark on every render.
+    private let averageValue: Double
+
+    /// One-line VoiceOver summary (count + mean + range), built once in `init`.
+    private let a11ySummary: String
 
     public init(
         points: [TrendPoint],
@@ -45,9 +59,11 @@ public struct TrendChart: View {
         height: CGFloat = 220,
         showsHover: Bool = true,
         valueFormat: @escaping (Double) -> String = { String(Int($0.rounded())) },
-        dateFormat: @escaping (Date) -> String = { TrendChart.defaultDateString($0) }
+        dateFormat: @escaping (Date) -> String = { TrendChart.defaultDateString($0) },
+        accessibilityLabel: String? = nil
     ) {
-        self.points = points.sorted { $0.date < $1.date }
+        let sorted = points.sorted { $0.date < $1.date }
+        self.points = sorted
         self.gradient = gradient
         self.valueRange = valueRange
         self.showsArea = showsArea
@@ -55,6 +71,21 @@ public struct TrendChart: View {
         self.showsHover = showsHover
         self.valueFormat = valueFormat
         self.dateFormat = dateFormat
+        self.accessibilityLabel = accessibilityLabel
+        let avg = sorted.isEmpty
+            ? valueRange.lowerBound
+            : sorted.map(\.value).reduce(0, +) / Double(sorted.count)
+        self.averageValue = avg
+
+        // VoiceOver one-liner: count + mean + range — formatted with the SAME valueFormat the
+        // tooltip uses, so units match. Computed once here, not per render.
+        if sorted.isEmpty {
+            self.a11ySummary = "No data"
+        } else {
+            let vals = sorted.map(\.value)
+            let lo = vals.min()!, hi = vals.max()!
+            self.a11ySummary = "\(sorted.count) points, mean \(valueFormat(avg)), range \(valueFormat(lo)) to \(valueFormat(hi))"
+        }
     }
 
     /// The x-position the cursor is hovering, in chart-local coordinates.
@@ -123,16 +154,25 @@ public struct TrendChart: View {
                 .lineStyle(StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
                 .foregroundStyle(valueGradient)
             }
-            ForEach(points) { p in
-                PointMark(
-                    x: .value("Date", p.date),
-                    y: .value("Value", p.value)
-                )
-                .symbolSize(18)
-                .foregroundStyle(StrandPalette.sample(stops: gradient.toStops(), at: unit(p.value)))
+            // 18pt dots are invisible on dense series (e.g. a 365-day year) but still cost the
+            // GPU a mark each — hide them past a threshold; the line carries the data there.
+            if points.count <= 60 {
+                ForEach(points) { p in
+                    PointMark(
+                        x: .value("Date", p.date),
+                        y: .value("Value", p.value)
+                    )
+                    .symbolSize(18)
+                    .foregroundStyle(StrandPalette.sample(stops: gradient.toStops(), at: unit(p.value)))
+                }
             }
         }
         .chartYScale(domain: valueRange)
+        // Clip the plot to its own bounds. catmullRom interpolation overshoots past the data extremes
+        // on sharp turns, and the AreaMark gradient is drawn UNCLIPPED — so on a spiky HR curve the
+        // rose fill bled down the page behind the cards below the chart. Clipping the plot area bounds
+        // every mark (line, area, points, overshoot) to the chart rectangle.
+        .chartPlotStyle { plotArea in plotArea.clipped() }
         .chartXAxis {
             AxisMarks(values: .automatic(desiredCount: 5)) { _ in
                 AxisGridLine().foregroundStyle(StrandPalette.hairline.opacity(0.4))
@@ -200,11 +240,17 @@ public struct TrendChart: View {
             }
         }
         .frame(height: height)
-    }
-
-    private var averageValue: Double {
-        guard !points.isEmpty else { return valueRange.lowerBound }
-        return points.map(\.value).reduce(0, +) / Double(points.count)
+        // Belt-and-suspenders: also bound the whole chart (axes + overlay) to its frame so nothing
+        // a Charts internal might draw outside the plot can reach the surrounding layout.
+        .clipped()
+        // Collapse the Charts marks (line/area/points) into ONE meaningful VoiceOver element instead
+        // of letting VoiceOver walk raw per-mark axis values with no series context. The decorative
+        // stacked under-glow copy (showsHover:false, no label) is hidden so the same series isn't
+        // double-announced; the crisp interactive copy passes showsHover:true (default) and speaks.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(accessibilityLabel ?? "Trend"))
+        .accessibilityValue(Text(a11ySummary))
+        .accessibilityHidden(!showsHover && accessibilityLabel == nil)
     }
 }
 

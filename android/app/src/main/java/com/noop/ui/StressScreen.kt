@@ -1,7 +1,5 @@
 package com.noop.ui
 
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -10,9 +8,11 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -23,23 +23,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.noop.analytics.DaytimeStress
 import com.noop.data.DailyMetric
 import java.util.Locale
 import kotlin.math.exp
-import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
@@ -66,7 +60,7 @@ import kotlin.math.sqrt
 // internally comparable.
 
 @Composable
-fun StressScreen(vm: AppViewModel) {
+fun StressScreen(vm: AppViewModel, onBreathe: () -> Unit = {}) {
     val days by vm.recentDays.collectAsStateWithLifecycle()
 
     // Stored daily "stress" values (0–3), keyed by day. Loaded once per device; the
@@ -82,6 +76,14 @@ fun StressScreen(vm: AppViewModel) {
         storedLoaded = true
     }
 
+    // Today's intraday stress read (hourly timeline + sustained-high flag), from the day's
+    // banked HR + R-R via the SAME 0–3 proxy the daily score uses. Null until the read
+    // completes; DaytimeStress.Result.EMPTY when the day has no usable intraday HR.
+    var daytime by remember { mutableStateOf<DaytimeStress.Result?>(null) }
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        daytime = runCatching { loadDaytimeStress(vm) }.getOrDefault(DaytimeStress.Result.EMPTY)
+    }
+
     // Rebuild the model only when the inputs (days, stored) actually change — the
     // derivation is O(n) over the full history, so we memoize on the inputs.
     val model = remember(days, stored) { StressModel.build(days, stored) }
@@ -91,40 +93,69 @@ fun StressScreen(vm: AppViewModel) {
         subtitle = "Autonomic load from HRV and resting heart rate",
     ) {
         when {
-            model != null -> StressContent(model)
+            model != null -> StressContent(model, daytime, onBreathe)
             !storedLoaded -> StressLoading()
             else -> StressEmpty()
         }
     }
 }
 
+/**
+ * Read TODAY's banked HR + R-R and build the intraday stress timeline. Local-day window
+ * [midnight, now]; [DaytimeStress] buckets it into waking hours and reuses the daily
+ * score's math, so this is the same proxy at a finer grain — never a new score.
+ */
+private suspend fun loadDaytimeStress(vm: AppViewModel): DaytimeStress.Result {
+    val nowSeconds = System.currentTimeMillis() / 1000L
+    val tzOffsetSeconds = java.util.TimeZone.getDefault().getOffset(nowSeconds * 1_000L) / 1_000L
+    // Local midnight (wall-clock seconds): floor the LOCAL time to the day, then undo the
+    // offset so the bound is back on the wall clock the samples are stored in.
+    val localNow = nowSeconds + tzOffsetSeconds
+    val from = (localNow - Math.floorMod(localNow, 86_400L)) - tzOffsetSeconds
+    val hr = vm.repo.hrSamples("my-whoop", from, nowSeconds, limit = 200_000)
+    if (hr.size < DaytimeStress.minHourHrSamples) return DaytimeStress.Result.EMPTY
+    val rr = vm.repo.rrIntervals("my-whoop", from, nowSeconds, limit = 200_000)
+    return DaytimeStress.analyze(hr, rr, tzOffsetSeconds)
+}
+
 // MARK: - Loaded content
 
 @Composable
-private fun androidx.compose.foundation.layout.ColumnScope.StressContent(model: StressModel) {
-    // 1 · HERO — the gauge + band + one plain-English line, all in one card.
-    NoopCard {
-        Column(
-            modifier = Modifier.fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            Row(
+private fun androidx.compose.foundation.layout.ColumnScope.StressContent(
+    model: StressModel,
+    daytime: DaytimeStress.Result?,
+    onBreathe: () -> Unit,
+) {
+    // 1 · HERO — the layered Bevel gauge in the teal Stress world over a scenic hero.
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(Metrics.cardRadius)),
+    ) {
+        ScenicHeroBackground(modifier = Modifier.matchParentSize(), domain = DomainTheme.Stress)
+        NoopCard(tint = Palette.stressColor) {
+            Column(
                 modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
+                verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
-                Overline("Stress monitor", modifier = Modifier.weight(1f))
-                StatePill(model.band.title, tone = model.band.tone, showsDot = true)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Overline("Stress monitor", modifier = Modifier.weight(1f))
+                    StatePill(model.band.title, tone = model.band.tone, showsDot = true)
+                }
+                StressHeroGauge(
+                    score = model.score,
+                    bandTitle = model.band.title,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    model.explanation,
+                    style = NoopType.subhead,
+                    color = Palette.textSecondary,
+                )
             }
-            StressGauge(
-                score = model.score,
-                bandTitle = model.band.title,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Text(
-                model.explanation,
-                style = NoopType.subhead,
-                color = Palette.textSecondary,
-            )
         }
     }
 
@@ -134,11 +165,171 @@ private fun androidx.compose.foundation.layout.ColumnScope.StressContent(model: 
         StressTiles(model)
     }
 
-    // 3 · Trend over the chosen window.
+    // 3 · Today's intraday timeline — when in the day stress ran high, + a passive Breathe
+    //     suggestion when the recent hours stay elevated.
+    if (daytime != null && daytime.scored.isNotEmpty()) {
+        StressDaytimeSection(daytime, onBreathe)
+    }
+
+    // 4 · Trend over the chosen window.
     StressTrendSection(model)
 
-    // 4 · Transparency — how the number is built.
+    // 5 · Transparency — how the number is built.
     StressMethodologyCard(model)
+}
+
+// MARK: - 3 · Daytime timeline (intraday, same 0–3 proxy)
+
+@Composable
+private fun StressDaytimeSection(day: DaytimeStress.Result, onBreathe: () -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(Metrics.gap)) {
+        SectionHeader("Today's Timeline", overline = "Intraday", trailing = timelineTrailing(day))
+
+        NoopCard(tint = Palette.stressColor) {
+            Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Overline("Stress through the day", modifier = Modifier.weight(1f))
+                    val peak = day.peak
+                    val peakLevel = peak?.level
+                    if (peak != null && peakLevel != null) {
+                        Text(
+                            "peak ${String.format(Locale.US, "%.1f", peakLevel)} · ${hourLabel(peak.hour)}",
+                            style = NoopType.captionNumber,
+                            color = StressRamp.color(peakLevel),
+                        )
+                    }
+                }
+
+                DaytimeStressStrip(day.hours)
+
+                // Hour ruler under the strip (first / midday / last covered hour).
+                val lo = day.hours.firstOrNull()?.hour
+                val hi = day.hours.lastOrNull()?.hour
+                if (lo != null && hi != null) {
+                    Row(modifier = Modifier.fillMaxWidth()) {
+                        Text(hourLabel(lo), style = NoopType.footnote, color = Palette.textTertiary)
+                        Spacer(Modifier.weight(1f))
+                        Text(hourLabel((lo + hi) / 2), style = NoopType.footnote, color = Palette.textTertiary)
+                        Spacer(Modifier.weight(1f))
+                        Text(hourLabel(hi), style = NoopType.footnote, color = Palette.textTertiary)
+                    }
+                }
+
+                Text(
+                    "Each bar is one waking hour, scored against your own calm hours today — " +
+                        "the same 0–3 proxy as the score above, read hour by hour. Hours without " +
+                        "enough data are left blank.",
+                    style = NoopType.footnote,
+                    color = Palette.textTertiary,
+                )
+            }
+        }
+
+        // Sustained-high suggestion — only when the recent run stays in the HIGH band.
+        if (day.sustainedHigh) SustainedBreatheCard(day, onBreathe)
+    }
+}
+
+/** "avg 1.4 · 9h" summary for the timeline header, from the scored hours. */
+private fun timelineTrailing(day: DaytimeStress.Result): String {
+    val n = day.scored.size
+    val mean = day.dayMean ?: return "${n}h"
+    return "avg " + String.format(Locale.US, "%.1f", mean) + " · ${n}h"
+}
+
+/**
+ * A passive, in-app nudge to run a Breathe session after a sustained high-stress run. No
+ * notification — just a card with a CTA that opens the existing trainer.
+ */
+@Composable
+private fun SustainedBreatheCard(day: DaytimeStress.Result, onBreathe: () -> Unit) {
+    NoopCard(tint = Palette.stressColor) {
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Overline("Sustained high stress", modifier = Modifier.weight(1f))
+                StatePill("${day.sustainedRun}h elevated", tone = StrandTone.Warning, showsDot = true)
+            }
+            Text(
+                "Your last ${day.sustainedRun} hours have stayed in the high band. A few minutes " +
+                    "of paced breathing can help downshift your nervous system.",
+                style = NoopType.subhead,
+                color = Palette.textSecondary,
+            )
+            Button(
+                onClick = onBreathe,
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = Palette.accent),
+            ) {
+                Text("Start a Breathe session", style = NoopType.headline, color = Palette.surfaceBase)
+            }
+        }
+    }
+}
+
+/** "6 am" / "2 pm" style hour-of-day label. */
+private fun hourLabel(hour: Int): String {
+    val h = ((hour % 24) + 24) % 24
+    val ampm = if (h < 12) "am" else "pm"
+    val h12 = if (h % 12 == 0) 12 else h % 12
+    return "$h12 $ampm"
+}
+
+// MARK: - Daytime stress strip (one bar per waking hour)
+//
+// A compact intraday strip: each waking hour is a rounded bar whose HEIGHT and COLOR track
+// its 0–3 stress proxy on the shared StressRamp. Hours with no signal render as a faint
+// baseline tick (honest gap), never a guessed value. Mirrors macOS DaytimeStressStrip.
+
+@Composable
+private fun DaytimeStressStrip(hours: List<DaytimeStress.HourPoint>) {
+    val barHeight = 64.dp
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(barHeight)
+            .semantics { contentDescription = daytimeStripDescription(hours) },
+        verticalAlignment = Alignment.Bottom,
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        for (point in hours) {
+            val level = point.level
+            if (level != null) {
+                // Map 0–3 onto a readable height; floor so even a calm hour is visible.
+                val frac = (level / 3.0).toFloat().coerceIn(0f, 1f)
+                val h = barHeight * (0.18f + 0.82f * frac)
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(h.coerceAtLeast(6.dp))
+                        .clip(RoundedCornerShape(3.dp))
+                        .background(StressRamp.color(level)),
+                )
+            } else {
+                // No-data hour: a faint baseline tick so the day's shape stays honest.
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(6.dp)
+                        .clip(RoundedCornerShape(3.dp))
+                        .background(Palette.surfaceInset),
+                )
+            }
+        }
+    }
+}
+
+private fun daytimeStripDescription(hours: List<DaytimeStress.HourPoint>): String {
+    val scored = hours.mapNotNull { p -> p.level?.let { p.hour to it } }
+    if (scored.isEmpty()) return "No intraday stress data yet today."
+    val parts = scored.map { "${it.first}:00 ${String.format(Locale.US, "%.1f", it.second)}" }
+    return "Hourly stress today: " + parts.joinToString(", ")
 }
 
 // MARK: - 2 · Today's tiles (uniform grid)
@@ -244,7 +435,7 @@ private fun StressTrendSection(model: StressModel) {
         SectionHeader("Stress Trend", overline = "History", trailing = range.label)
         if (points.size >= 2) {
             val avg = points.average()
-            NoopCard {
+            NoopCard(tint = Palette.stressColor) {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -269,6 +460,7 @@ private fun StressTrendSection(model: StressModel) {
                         modifier = Modifier.height(Metrics.chartHeight),
                         color = StressRamp.STEADY,
                         fill = true,
+                        selectionEnabled = true,
                     )
                     HorizontalDivider(color = Palette.hairline)
                     Row(modifier = Modifier.fillMaxWidth()) {
@@ -289,7 +481,7 @@ private fun StressTrendSection(model: StressModel) {
                 )
             }
         } else {
-            NoopCard {
+            NoopCard(tint = Palette.stressColor) {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -320,7 +512,7 @@ private fun androidx.compose.foundation.layout.RowScope.TrendFooterItem(label: S
 
 @Composable
 private fun StressMethodologyCard(model: StressModel) {
-    NoopCard {
+    NoopCard(tint = Palette.stressColor) {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Overline("How this is computed")
             Text(
@@ -400,116 +592,37 @@ private fun androidx.compose.foundation.layout.ColumnScope.StressEmpty() {
     )
 }
 
-// MARK: - Semicircular stress gauge (0–3, blue → mint → amber sweep)
+// MARK: - Stress hero gauge — the canonical layered BevelGauge in the teal Stress world
 //
-// A compact half-dial: cool-blue at 0, mint at the midpoint, amber at 3 — its own
-// ramp, never the recovery traffic light. The value + band read inside the bowl.
-// Ports macOS StressGauge / StressArc with a sweep gradient over a faint track.
+// Bevel treatment: the 0–3 score reads as a layered ring gauge in the Stress teal colour
+// world (deep→bright teal stroke, stressColor glow/end-cap), sitting over the scenic hero.
+// The number is the 0–3 value, "of 3" is the caption, and the band (LOW/MEDIUM/HIGH) is the
+// state word — same data the bowl gauge showed, restyled to match the Today rings. The
+// StressRamp stays the semantic scale on the data surfaces (strip / trend / tiles) below.
 
 @Composable
-private fun StressGauge(
+private fun StressHeroGauge(
     score: Double,
     bandTitle: String,
     modifier: Modifier = Modifier,
-    diameter: Dp = 240.dp,
+    diameter: Dp = 200.dp,
 ) {
-    val fraction = (score / 3.0).toFloat().coerceIn(0f, 1f)
-    val animated by animateFloatAsState(
-        targetValue = fraction,
-        animationSpec = tween(Motion.durationSlow, easing = Motion.drawIn),
-        label = "stressArc",
-    )
-    val tipColor = StressRamp.color(score)
-    val lineWidthDp = 16.dp
-
-    // The arc occupies the top half of its box; the readout sits inside the bowl, so
-    // the component's height is roughly half the diameter plus the stroke + readout.
-    val componentHeight = diameter / 2 + lineWidthDp + 30.dp
-
     Box(
         modifier = modifier
-            .height(componentHeight)
             .semantics {
                 contentDescription = "Stress ${String.format(Locale.US, "%.1f", score)} of 3, $bandTitle"
             },
-        contentAlignment = Alignment.TopCenter,
+        contentAlignment = Alignment.Center,
     ) {
-        Box(
-            modifier = Modifier
-                .size(diameter)
-                .drawBehind {
-                    val stroke = lineWidthDp.toPx()
-                    // Bowl opens upward: center on the bottom-middle, radius inset by the stroke.
-                    val radius = (min(size.width, size.height) - stroke) / 2f
-                    val arcSize = Size(radius * 2f, radius * 2f)
-                    // Arc box top-left so the arc spans the top half over a center at the bottom.
-                    val topLeft = Offset(size.width / 2f - radius, size.height - radius)
-                    val sweepStroke = Stroke(width = stroke, cap = StrokeCap.Round)
-
-                    // Background track (full 180° semicircle).
-                    drawArc(
-                        color = Palette.surfaceInset,
-                        startAngle = 180f,
-                        sweepAngle = 180f,
-                        useCenter = false,
-                        topLeft = topLeft,
-                        size = arcSize,
-                        style = sweepStroke,
-                    )
-                    // Subtle ghost of the full ramp under the track.
-                    drawArc(
-                        brush = StressRamp.sweepBrush(),
-                        startAngle = 180f,
-                        sweepAngle = 180f,
-                        useCenter = false,
-                        topLeft = topLeft,
-                        size = arcSize,
-                        style = sweepStroke,
-                        alpha = 0.16f,
-                    )
-                    // Value arc swept to the current fraction.
-                    if (animated > 0.001f) {
-                        drawArc(
-                            brush = StressRamp.sweepBrush(),
-                            startAngle = 180f,
-                            sweepAngle = 180f * animated,
-                            useCenter = false,
-                            topLeft = topLeft,
-                            size = arcSize,
-                            style = sweepStroke,
-                        )
-                        // Soft bloom under the fill, tinted to the sampled stress color.
-                        drawArc(
-                            color = tipColor,
-                            startAngle = 180f,
-                            sweepAngle = 180f * animated,
-                            useCenter = false,
-                            topLeft = topLeft,
-                            size = arcSize,
-                            style = Stroke(width = stroke * 1.6f, cap = StrokeCap.Round),
-                            alpha = 0.22f,
-                        )
-                    }
-                },
+        BevelGauge(
+            fraction = (score / 3.0).coerceIn(0.0, 1.0),
+            stops = DomainTheme.Stress.gradientStops,
+            tipColor = Palette.stressColor,
+            numberText = String.format(Locale.US, "%.1f", score),
+            captionText = "of 3",
+            stateText = bandTitle,
+            diameter = diameter,
         )
-
-        // Center readout (number + band), tucked into the semicircle.
-        Column(
-            modifier = Modifier.padding(top = diameter / 2 - 56.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(2.dp),
-        ) {
-            Text(
-                String.format(Locale.US, "%.1f", score),
-                style = NoopType.display(54f),
-                color = Palette.textPrimary,
-            )
-            Text(
-                "of 3 · $bandTitle",
-                style = NoopType.overline,
-                color = tipColor,
-            )
-        }
     }
 }
 
@@ -547,9 +660,6 @@ private object StressRamp {
 
     /** Sample the ramp at a 0–3 stress score. */
     fun color(score: Double): Color = Palette.sample(stops, (score / 3.0).toFloat())
-
-    /** Horizontal sweep brush over the full ramp (for arc strokes / fills). */
-    fun sweepBrush(): Brush = Brush.horizontalGradient(*stops.toTypedArray())
 }
 
 // MARK: - Trend range (the W/M/3M/6M/1Y/ALL window, mirroring ExploreRange)

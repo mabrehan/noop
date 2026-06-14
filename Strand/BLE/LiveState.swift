@@ -22,7 +22,15 @@ public final class LiveState: ObservableObject {
     /// alarm, double-tap, history offload) only works when this is true.
     @Published public var encryptedBond: Bool = false
     @Published public var heartRate: Int? = nil
+    /// Latest R-R packet exactly as it arrived from the strap. Keep this as the "fresh packet"
+    /// surface for stress/breathing logic that reacts to the most recent arrival (and the standard
+    /// 0x2A37 profile, which is the reliable R-R source). Drive it ONLY via `setRRIntervals(_:)`.
     @Published public var rr: [Int] = []
+    /// Rolling UI buffer of recent R-R intervals (capped, oldest dropped first). Standard BLE HR
+    /// notifications usually carry only one or two intervals per packet, so the Live console needs a
+    /// separate short history to render an actually-moving R-R strip / rolling RMSSD. Appended (never
+    /// replaced) by `setRRIntervals(_:)`; emptied by `clearBiometrics()`.
+    @Published public private(set) var rrRecent: [Int] = []
     @Published public var batteryPct: Double? = nil
     /// Charging flag from the strap's BATTERY_LEVEL events — wire observation: u8 bit0 in the
     /// event payload (4.0 @26 / 5.0 @30), pushed ~every 8 min on captured links. nil until the
@@ -36,6 +44,23 @@ public final class LiveState: ObservableObject {
     @Published public var worn: Bool = true
     /// Rolling log of human-readable lines for the on-device verification checklist.
     @Published public var log: [String] = []
+
+    // MARK: - Connection status (single source of truth, #266)
+
+    /// Short connection-status label shared by the sidebar footer (RootView) and the Settings strap
+    /// card, so the two can't disagree the way they did in #266 (sidebar "Connecting…" vs Settings
+    /// "Connected" for the same connected-but-unbonded 5/MG link). Once the link is up and HR is
+    /// flowing — even over the unbonded standard profile — this reads "Connected", never "Connecting…".
+    public var connectionStatusLabel: String {
+        if connected && bonded { return "Bonded · streaming" }
+        if connected { return "Connected" }
+        if bonded { return "Bonded · idle" }
+        return "Disconnected"
+    }
+    /// True when the link is up (HR flowing) → status reads green. Drives the sidebar + Settings tone.
+    public var connectionStatusIsActive: Bool { connected }
+    /// True when previously paired but not currently connected → amber.
+    public var connectionStatusIsIdle: Bool { !connected && bonded }
 
     /// Fired (live only) when the strap reports a DOUBLE_TAP gesture. Wired by AppModel to the
     /// user's chosen action. Debounced in AppModel.
@@ -77,6 +102,15 @@ public final class LiveState: ObservableObject {
     @Published public var decodedChunksThisSession: Int = 0
     @Published public var consoleChunksThisSession: Int = 0
 
+    /// EXPERIMENTAL R22 telemetry (#174). How many of the 15 `enable_r22_*` SET_CONFIG flags the strap
+    /// has ACKed since the last "Send enable sequence" tap — 15 means the strap accepted the whole
+    /// sequence (hardware-confirmed: it returns a COMMAND_RESPONSE per flag). Reset on each new attempt.
+    @Published public var r22FlagsAccepted: Int = 0
+    /// Count of LIVE type-0x2F deep biometric records seen this session OUTSIDE a history offload — i.e.
+    /// the R22 deep stream actually flowing in realtime. 0 with flags accepted = enable taken but no deep
+    /// data yet (keep wearing it). Any non-zero = the prize: deep packets to decode. Reset per session.
+    @Published public var deepPacketsThisSession: Int = 0
+
     /// Optional hook invoked on every battery update (wired by LiveViewModel to the alert monitor).
     /// Kept as a closure so LiveState stays a plain observable snapshot with no alert dependency.
     public var onBatteryUpdate: ((Double) -> Void)?
@@ -113,6 +147,30 @@ public final class LiveState: ObservableObject {
     public func setBattery(_ pct: Double) {
         batteryPct = pct
         onBatteryUpdate?(pct)
+    }
+
+    /// Single funnel for R-R intervals from EITHER source (the standard 0x2A37 profile in BLEManager,
+    /// the REALTIME_DATA frame in FrameRouter). Updates the fresh-packet `rr` AND appends the valid
+    /// intervals onto the bounded `rrRecent` rolling buffer so the Live console can show a moving
+    /// strip. Non-positive sentinels (a strap "no interval this beat" placeholder) are dropped from the
+    /// rolling buffer. `recentLimit` caps the buffer; the oldest intervals fall off first.
+    public func setRRIntervals(_ intervals: [Int], recentLimit: Int = 60) {
+        rr = intervals
+        let valid = intervals.filter { $0 > 0 }
+        guard !valid.isEmpty else { return }
+        rrRecent.append(contentsOf: valid)
+        if rrRecent.count > recentLimit {
+            rrRecent.removeFirst(rrRecent.count - recentLimit)
+        }
+    }
+
+    /// Blank all live biometric readouts (HR + R-R + the rolling buffer) so a stale heart rate or
+    /// R-R strip can't outlive the link. Called on CoreBluetooth disconnect (BLEManager), the twin of
+    /// the `charging = nil` / `encryptedBond = false` clears on the same path.
+    public func clearBiometrics() {
+        heartRate = nil
+        rr.removeAll()
+        rrRecent.removeAll()
     }
 
     public func append(log line: String) {

@@ -26,20 +26,28 @@ public final class FrameRouter {
         // Reject frames that failed their checksum — never let bad bytes drive state.
         if parsed.crcOK == false { return }
 
-        state.lastFrameType = parsed.typeName
+        // live perf: only republish when the value actually changed. The type-43 raw flood arrives
+        // continuously and repeats the SAME frame type, and each `@Published` write fires
+        // `objectWillChange` → a full LiveView.body re-eval (these frames are separate BLE
+        // notifications, so SwiftUI can't coalesce them). Guarding collapses a steady flood to one
+        // re-eval per genuine change instead of one per frame.
+        if state.lastFrameType != parsed.typeName { state.lastFrameType = parsed.typeName }
 
         switch parsed.typeName {
         case "REALTIME_DATA", "REALTIME_RAW_DATA":
             // Reject 0 / out-of-range spikes from realtime streams; AppModel medians the rest.
             // Some firmware exposes live BPM only on the R10/R11 raw stream after acknowledging
             // BLE_REALTIME_HR_ON, so the UI can consume it even though persistence still ignores raw43.
-            if let hr = parsed.parsed["heart_rate"]?.intValue, hr >= 30, hr <= 220 {
+            // live perf: skip the publish when HR is unchanged — the raw flood carries the same HR
+            // byte across many frames, so an unguarded write re-renders the whole console for nothing.
+            if let hr = parsed.parsed["heart_rate"]?.intValue, hr >= 30, hr <= 220, state.heartRate != hr {
                 state.heartRate = hr
             }
             // The realtime stream usually reports rr_count=0; only update R-R when this frame
             // actually carries intervals, so we don't wipe R-R sourced from the 0x2A37 profile.
+            // setRRIntervals also feeds the Live console's rolling rrRecent buffer.
             if let rr = parsed.parsed["rr_intervals"]?.intArrayValue, !rr.isEmpty {
-                state.rr = rr
+                state.setRRIntervals(rr)
             }
 
         case "COMMAND_RESPONSE":

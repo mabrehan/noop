@@ -27,7 +27,9 @@ import kotlin.math.roundToInt
  */
 class AiCoach(private val repo: WhoopRepository) {
 
-    /** The device key the rest of the app reads/writes daily metrics under. */
+    /** The device key the rest of the app reads/writes daily metrics under. Coach reads go
+     *  through the MERGED raw+computed view ([WhoopRepository.daysMerged]) — the same per-field
+     *  coalesce every screen uses — so on-device "-noop" scores are visible too (#124). */
     private val deviceId = "my-whoop"
 
     private val http: OkHttpClient = OkHttpClient.Builder()
@@ -69,12 +71,19 @@ class AiCoach(private val repo: WhoopRepository) {
         require(history.last().role == "user") { "The last message must be your question." }
 
         // Include the user's data ONLY with explicit consent; otherwise a note, never their numbers.
-        val grounded = if (consent) {
-            val days = runCatching { repo.days(deviceId) }.getOrDefault(emptyList())
+        val groundedFull = if (consent) {
+            // Merged read, NOT raw days(): a live-strap user's scores live under "my-whoop-noop"
+            // and a raw read misses them — the coach then claimed it had no data. (#124)
+            val days = runCatching { repo.daysMerged(deviceId) }.getOrDefault(emptyList())
             injectContext(history, buildContext(days))
         } else {
             injectContext(history, NO_CONSENT_NOTE)
         }
+
+        // Slide a window over a long conversation so the history can't crowd out the reply on a
+        // small local context window (e.g. Ollama's 2048-token default). The first user turn carries
+        // the data context, so it is always kept; the middle is dropped, the recent tail retained.
+        val grounded = trimmedHistory(groundedFull, MAX_HISTORY_TURNS)
 
         when (provider) {
             AiProvider.OPENAI ->
@@ -109,7 +118,9 @@ class AiCoach(private val repo: WhoopRepository) {
         val url = when (provider) {
             AiProvider.CUSTOM -> {
                 if (customBaseUrl.isBlank()) return@withContext emptyList()
-                customModelsUrl(customBaseUrl)
+                // Best-effort: a bad/public-cleartext URL just yields no model list here (the chat
+                // path surfaces the precise guard error). Never throw out of fetchModels.
+                runCatching { customModelsUrl(customBaseUrl) }.getOrNull() ?: return@withContext emptyList()
             }
             else -> provider.modelsEndpoint
         }
@@ -152,8 +163,8 @@ class AiCoach(private val repo: WhoopRepository) {
 
     /**
      * Compact plain-text summary of the user's recent data: the last ~14 days of
-     * recovery / day-strain / sleep-hours / HRV / resting-HR (where present), 30-day averages,
-     * and a recent-workouts line derived from logged exercise counts and day strain.
+     * charge / effort / rest-hours / HRV / resting-HR (where present), 30-day averages,
+     * and a recent-workouts line derived from logged exercise counts and effort.
      *
      * Kept well under ~1500 tokens. If there is no data at all, says so explicitly so the
      * model doesn't invent numbers.
@@ -165,7 +176,7 @@ class AiCoach(private val repo: WhoopRepository) {
                 "to sync their strap so future advice can reference their real metrics."
         }
 
-        // days() returns oldest-first; take the most recent up to 30 for averages, 14 for the table.
+        // daysMerged() returns oldest-first; take the most recent up to 30 for averages, 14 for the table.
         val last30 = days.takeLast(30)
         val last14 = days.takeLast(14)
 
@@ -181,15 +192,15 @@ class AiCoach(private val repo: WhoopRepository) {
             val hrv = d.avgHrv?.let { "${it.roundToInt()}ms" } ?: "-"
             val rhr = d.restingHr?.let { "${it}bpm" } ?: "-"
             sb.append(
-                "  ${d.day}: recovery $recovery, strain $strain, sleep $sleepH, HRV $hrv, RHR $rhr\n"
+                "  ${d.day}: charge $recovery, effort $strain, rest $sleepH, HRV $hrv, RHR $rhr\n"
             )
         }
 
         // --- 30-day averages ---
         sb.append("\n30-day averages (over ${last30.size} days):\n")
-        sb.append("  recovery ${avgInt(last30) { it.recovery }}%, ")
-        sb.append("strain ${avg1(last30) { it.strain }}, ")
-        sb.append("sleep ${avg1(last30) { d -> d.totalSleepMin?.div(60.0) }}h, ")
+        sb.append("  charge ${avgInt(last30) { it.recovery }}%, ")
+        sb.append("effort ${avg1(last30) { it.strain }}, ")
+        sb.append("rest ${avg1(last30) { d -> d.totalSleepMin?.div(60.0) }}h, ")
         sb.append("HRV ${avgInt(last30) { it.avgHrv }}ms, ")
         sb.append("RHR ${avgInt(last30) { d -> d.restingHr?.toDouble() }}bpm\n")
         // Additional vitals when present (#124 — the coach used to see only recovery/strain/sleep/HRV/RHR).
@@ -208,7 +219,7 @@ class AiCoach(private val repo: WhoopRepository) {
             for (d in workoutDays.reversed()) {
                 val n = d.exerciseCount ?: 0
                 val label = if (n == 1) "1 workout" else "$n workouts"
-                val strain = d.strain?.let { ", day strain ${fmt1(it)}" } ?: ""
+                val strain = d.strain?.let { ", effort ${fmt1(it)}" } ?: ""
                 sb.append("  ${d.day}: $label$strain\n")
             }
         }
@@ -217,7 +228,7 @@ class AiCoach(private val repo: WhoopRepository) {
         days.lastOrNull()?.let { latest ->
             val r = latest.recovery?.let { "${it.roundToInt()}%" } ?: "n/a"
             val s = latest.strain?.let { fmt1(it) } ?: "n/a"
-            sb.append("\nMost recent day (${latest.day}): recovery $r, day strain $s.\n")
+            sb.append("\nMost recent day (${latest.day}): charge $r, effort $s.\n")
         }
 
         return sb.toString().trim()
@@ -274,20 +285,88 @@ class AiCoach(private val repo: WhoopRepository) {
         if (code !in 200..299) throw httpError(provider, code, text)
 
         val json = parse(text)
-        val content = json.optJSONArray("choices")
-            ?.optJSONObject(0)
+        val firstChoice = json.optJSONArray("choices")?.optJSONObject(0)
+        val content = firstChoice
             ?.optJSONObject("message")
             ?.optString("content")
             ?.trim()
 
         if (content.isNullOrEmpty()) throw Exception("The provider returned an empty reply. Please try again.")
-        return content
+
+        // Local servers (notably Ollama) stop with finish_reason "length" at the context-window edge
+        // and give NO error — keep the partial text and append the actionable notice so it isn't silent.
+        val truncated = firstChoice?.optString("finish_reason")?.lowercase() == "length"
+        return if (truncated) content + TRUNCATION_NOTE else content
     }
 
     /** Base for the Custom provider — the user's URL with any trailing slashes trimmed. */
     private fun customBase(url: String): String = url.trim().trimEnd('/')
-    private fun customChatUrl(url: String): String = customBase(url) + "/chat/completions"
-    private fun customModelsUrl(url: String): String = customBase(url) + "/models"
+
+    private fun customChatUrl(url: String): String {
+        val base = customBase(url)
+        guardCustomUrl(base)
+        return base + "/chat/completions"
+    }
+
+    private fun customModelsUrl(url: String): String {
+        val base = customBase(url)
+        guardCustomUrl(base)
+        return base + "/models"
+    }
+
+    /**
+     * Gatekeeper for the Custom (local LLM) provider. https:// is always fine. Plain http:// is
+     * only allowed to a PRIVATE-NETWORK host — loopback, RFC1918, link-local, or *.local — because
+     * the app's network-security-config permits cleartext app-wide (Android XML can't scope a
+     * cleartext rule to a CIDR), so THIS check is what actually keeps cleartext off the public
+     * internet (#187). A public http:// host is rejected with a precise, actionable error.
+     */
+    private fun guardCustomUrl(base: String) {
+        val uri = runCatching { java.net.URI(base) }.getOrNull()
+        val host = uri?.host
+        val scheme = uri?.scheme?.lowercase()
+        require(host != null && !scheme.isNullOrBlank()) {
+            "That server URL isn't valid. Use http://<host>:<port> for a local server, or https://… for a remote one."
+        }
+        if (scheme == "https") return
+        require(scheme == "http") {
+            "Unsupported URL scheme \"$scheme\". Use http:// for a local server or https:// for a remote one."
+        }
+        require(isPrivateLanOrLoopback(host)) {
+            "Plain http:// is only allowed to a local-network server (localhost, 10.x, 172.16–31.x, " +
+                "192.168.x, 169.254.x, or a .local name). Use https:// to reach \"$host\"."
+        }
+    }
+
+    /**
+     * True when [host] is on the device's own machine or its private LAN, so plain http:// to it
+     * never crosses the public internet: loopback (localhost / 127.0.0.0/8 / ::1), RFC1918
+     * (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), link-local (169.254.0.0/16 / fe80::/10), the
+     * emulator host alias 10.0.2.2, and any *.local mDNS name. Anything else is treated as public.
+     */
+    private fun isPrivateLanOrLoopback(host: String): Boolean {
+        val h = host.trim().trim('[', ']').lowercase()  // strip IPv6 brackets if present
+        if (h.isEmpty()) return false
+        if (h == "localhost" || h.endsWith(".localhost")) return true
+        if (h == "::1") return true
+        if (h.endsWith(".local")) return true            // mDNS / Bonjour LAN names
+        if (h.startsWith("fe80:") || h.startsWith("fc") || h.startsWith("fd")) return true  // IPv6 link-local / ULA
+
+        // IPv4 dotted-quad: validate and classify by RFC1918 / loopback / link-local.
+        val parts = h.split(".")
+        if (parts.size != 4) return false
+        val octets = parts.map { it.toIntOrNull() ?: -1 }
+        if (octets.any { it < 0 || it > 255 }) return false
+        val (a, b) = octets[0] to octets[1]
+        return when {
+            a == 127 -> true                              // 127.0.0.0/8 loopback
+            a == 10 -> true                               // 10.0.0.0/8
+            a == 172 && b in 16..31 -> true               // 172.16.0.0/12
+            a == 192 && b == 168 -> true                  // 192.168.0.0/16
+            a == 169 && b == 254 -> true                  // 169.254.0.0/16 link-local
+            else -> false
+        }
+    }
 
     // ---------------------------------------------------------------------------------------
     // Anthropic — POST /v1/messages
@@ -352,6 +431,18 @@ class AiCoach(private val repo: WhoopRepository) {
         } catch (e: javax.net.ssl.SSLException) {
             throw Exception("A secure connection to the provider could not be established.")
         } catch (e: java.io.IOException) {
+            // The platform reports a blocked plain-HTTP request as a generic IOException whose
+            // message is "Cleartext HTTP traffic to <host> not permitted" (no dedicated exception
+            // class exists). Detect it and explain, instead of the opaque generic line. This should
+            // be unreachable now that cleartext is permitted app-wide and guardCustomUrl restricts
+            // http:// to private hosts — but stays as a clear fallback if a policy re-blocks it.
+            val msg = e.message.orEmpty()
+            if (msg.contains("Cleartext", ignoreCase = true) && msg.contains("not permitted", ignoreCase = true)) {
+                throw Exception(
+                    "Plain http:// to a LAN address is blocked — update to the build that allows " +
+                        "local-network servers, or use https://."
+                )
+            }
             throw Exception("Network error reaching the provider: ${e.message ?: "unknown"}.")
         }
     }
@@ -408,17 +499,54 @@ class AiCoach(private val repo: WhoopRepository) {
         private val JSON = "application/json; charset=utf-8".toMediaType()
 
         /**
+         * Max chat turns sent on a single request, beyond the context-bearing first user turn. Caps
+         * how much history we ship so a long conversation can't crowd out the reply on a small local
+         * context window (e.g. Ollama's 2048-token default). High enough that normal chats go in full.
+         */
+        const val MAX_HISTORY_TURNS = 10
+
+        /**
+         * Appended to a reply when the server stopped early because it ran out of context window.
+         * Local OpenAI-compatible servers (notably Ollama, which defaults to a 2048-token window and
+         * IGNORES `num_ctx` on the `/v1` endpoint) truncate silently — no error, the text just stops
+         * mid-sentence. We can't raise the window over the OpenAI wire format, so we make the cutoff
+         * visible and tell the user exactly how to fix it.
+         */
+        const val TRUNCATION_NOTE =
+            "\n\n---\n*Reply cut off: the model hit its context-window limit. " +
+                "On a local server like Ollama (default 2048 tokens), raise it — create a Modelfile " +
+                "with `PARAMETER num_ctx 8192` and select that model, or set " +
+                "`OLLAMA_CONTEXT_LENGTH=8192` and relaunch Ollama — then ask again.*"
+
+        /**
+         * Pure: sliding-window the chat. Returns everything when short; otherwise the first user turn
+         * (so the data context still has a turn to ride) followed by the last [maxRecent] messages,
+         * with no duplication. No state — unit-tested.
+         */
+        fun trimmedHistory(msgs: List<ChatMsg>, maxRecent: Int): List<ChatMsg> {
+            if (msgs.size <= maxRecent + 1) return msgs
+            val tailStart = msgs.size - maxRecent
+            val tail = msgs.subList(tailStart, msgs.size)
+            val firstUserIdx = msgs.indexOfFirst { it.role == "user" }
+            // No user turn (shouldn't happen for a real chat), or the first user turn is already
+            // inside the retained tail → just return the tail, no duplication.
+            if (firstUserIdx < 0 || firstUserIdx >= tailStart) return tail.toList()
+            return listOf(msgs[firstUserIdx]) + tail
+        }
+
+        /**
          * The coach persona. Anonymous (names no app author or model vendor) and includes the
          * not-a-doctor guardrail.
          */
         const val SYSTEM_PROMPT =
             "You are an elite, supportive recovery and performance coach with a real training " +
-                "methodology. You may be given a summary of the user's own wearable data (recovery " +
-                "%, day strain 0-21, sleep, HRV, resting heart rate) and recent workouts. Coach " +
-                "using autoregulation: recovery 67-100% = green light to build/push, higher strain " +
-                "is fine; 34-66% = maintain, quality over volume, keep it controlled; 0-33% = active " +
-                "recovery only (Zone 2, mobility, extra sleep) and protect against accumulating " +
-                "strain debt. Optimise workouts with progressive overload, polarised ~80/20 " +
+                "methodology. You may be given a summary of the user's own wearable data (charge " +
+                "0-100, effort 0-100, rest/sleep, HRV, resting heart rate) and recent workouts. " +
+                "Charge is the daily recovery/readiness score; effort is the day's cardiovascular " +
+                "load. Coach using autoregulation: charge 67-100 = green light to build/push, " +
+                "higher effort is fine; 34-66 = maintain, quality over volume, keep it controlled; " +
+                "0-33 = active recovery only (Zone 2, mobility, extra sleep) and protect against " +
+                "accumulating effort debt. Optimise workouts with progressive overload, polarised ~80/20 " +
                 "intensity, spacing hard sessions, deloads/periodisation, and treat sleep as the " +
                 "biggest recovery lever. Always cite the user's ACTUAL numbers, give a concrete plan " +
                 "(today and the week), and be specific, punchy and motivating. If no data is " +

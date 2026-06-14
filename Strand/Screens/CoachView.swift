@@ -29,7 +29,7 @@ struct CoachView: View {
     private let customModelTag = "__custom__"
 
     private let suggestions = [
-        "How's my recovery trending?",
+        "How's my charge trending?",
         "What should today's training look like?",
         "Analyse my sleep",
         "Why am I run down?",
@@ -37,7 +37,7 @@ struct CoachView: View {
 
     var body: some View {
         ScreenScaffold(title: "Coach",
-                       subtitle: "Ask about your recovery, strain, sleep and workouts — grounded in your own numbers.") {
+                       subtitle: "Ask about your charge, effort, rest and workouts — grounded in your own numbers.") {
             if coach.isConfigured {
                 connectedHeader
                 consentBar
@@ -70,29 +70,28 @@ struct CoachView: View {
     }
 
     /// Explicit, revocable permission for the coach to read & send the user's data. Off by default.
+    /// A frosted Charge-tinted card so it reads as part of the green Coach world, not a flat panel.
     private var consentBar: some View {
-        HStack(spacing: 10) {
-            Image(systemName: coach.dataConsent ? "lock.open.fill" : "lock.fill")
-                .foregroundStyle(coach.dataConsent ? StrandPalette.accent : StrandPalette.textTertiary)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Let the coach use my data")
-                    .font(StrandFont.subhead).foregroundStyle(StrandPalette.textPrimary)
-                Text(coach.dataConsent
-                     ? "On — your recovery, sleep, HRV and workouts are shared with the provider for tailored coaching."
-                     : "Off — the coach answers generally and sends none of your metrics.")
-                    .font(StrandFont.footnote).foregroundStyle(StrandPalette.textTertiary)
-                    .fixedSize(horizontal: false, vertical: true)
+        NoopCard(padding: 14, tint: StrandPalette.chargeColor) {
+            HStack(spacing: 10) {
+                Image(systemName: coach.dataConsent ? "lock.open.fill" : "lock.fill")
+                    .foregroundStyle(coach.dataConsent ? StrandPalette.accent : StrandPalette.textTertiary)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Let the coach use my data")
+                        .font(StrandFont.subhead).foregroundStyle(StrandPalette.textPrimary)
+                    Text(coach.dataConsent
+                         ? "On — your charge, rest, HRV and workouts are shared with the provider for tailored coaching."
+                         : "Off — the coach answers generally and sends none of your metrics.")
+                        .font(StrandFont.footnote).foregroundStyle(StrandPalette.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 8)
+                Toggle("", isOn: $coach.dataConsent)
+                    .labelsHidden().toggleStyle(.switch).tint(StrandPalette.accent)
+                    .accessibilityLabel("Let the coach use my data")
             }
-            Spacer(minLength: 8)
-            Toggle("", isOn: $coach.dataConsent)
-                .labelsHidden().toggleStyle(.switch).tint(StrandPalette.accent)
-                .accessibilityLabel("Let the coach use my data")
         }
-        .padding(12)
-        .background(StrandPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
-            .strokeBorder(StrandPalette.hairline, lineWidth: 1))
     }
 
     // MARK: - Setup (no key yet)
@@ -109,7 +108,7 @@ struct CoachView: View {
                         .foregroundStyle(StrandPalette.textPrimary)
                 }
 
-                Text("Coach uses your own API key. Pick a provider, paste a key, and choose a model. Your key is stored securely in the macOS Keychain and never leaves your Mac except as the request you make.")
+                Text("Coach uses your own API key. Pick a provider, paste a key, and choose a model. Your key is stored securely in the Keychain and never leaves \(Platform.deviceNounPhrase) except as the request you make.")
                     .font(StrandFont.subhead)
                     .foregroundStyle(StrandPalette.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -142,7 +141,7 @@ struct CoachView: View {
                                 .strokeBorder(StrandPalette.hairline, lineWidth: 1))
                             .disableAutocorrection(true)
                             .accessibilityLabel("Server URL")
-                        Text("Any OpenAI-compatible server — Ollama, LM Studio, llama.cpp, or your own gateway. Stays on your network; nothing leaves your Mac.")
+                        Text("Any OpenAI-compatible server — Ollama, LM Studio, llama.cpp, or your own gateway. Stays on your network; nothing leaves \(Platform.deviceNounPhrase).")
                             .font(StrandFont.footnote)
                             .foregroundStyle(StrandPalette.textSecondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -353,16 +352,15 @@ struct CoachView: View {
             // LLM replies arrive as Markdown (bold, lists, headings, tables) —
             // rendered with the chat-bubble-sized Strand theme. User bubbles stay
             // verbatim `Text` so typed `*`/`#` never turn into surprise formatting.
+            // The reply sits on a frosted Charge-tinted surface — a card, not a flat box.
             HStack {
                 Markdown(message.text)
                     .markdownTheme(.strand)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(StrandPalette.surfaceOverlay, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .strokeBorder(StrandPalette.hairline, lineWidth: 1))
+                    .padding(.vertical, 11)
+                    .frostedCardSurface(tint: StrandPalette.chargeColor, cornerRadius: 16)
                     .frame(maxWidth: 560, alignment: .leading)
                 Spacer(minLength: 48)
             }
@@ -373,15 +371,15 @@ struct CoachView: View {
 
     private var typingIndicator: some View {
         HStack(spacing: 8) {
-            ProgressView().controlSize(.small)
+            ProgressView().controlSize(.small).tint(StrandPalette.accent)
             Text("Coach is thinking…")
                 .font(StrandFont.subhead)
                 .foregroundStyle(StrandPalette.textSecondary)
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .background(StrandPalette.surfaceOverlay, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(.vertical, 11)
+        .frostedCardSurface(tint: StrandPalette.chargeColor, cornerRadius: 16)
         .frame(maxWidth: 320, alignment: .leading)
         .accessibilityLabel("Coach is thinking")
     }
@@ -427,6 +425,8 @@ struct CoachView: View {
         }
     }
 
+    /// The input bar — a frosted overlay surface holding the field + Send, so the composer reads as a
+    /// distinct docked surface above the canvas rather than two floating controls.
     private var composer: some View {
         HStack(alignment: .bottom, spacing: 10) {
             TextField("Ask Coach about your data…", text: $draft, axis: .vertical)
@@ -460,13 +460,17 @@ struct CoachView: View {
             .disabled(coach.sending || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             .accessibilityLabel("Send")
         }
+        .padding(8)
+        .background(StrandPalette.surfaceOverlay, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+            .strokeBorder(StrandPalette.hairline, lineWidth: 1))
     }
 
     private var privacyFootnote: some View {
         Label {
             Text(coach.provider == .custom
                  ? "Coach talks only to the server URL you set — point it at a local model (Ollama, LM Studio, llama.cpp) to keep everything on your own machine. Nothing is sent until you ask."
-                 : "This is the only feature that leaves your Mac — it sends a summary of your metrics to \(coach.provider.displayName) using your own key. Nothing is sent until you ask.")
+                 : "This is the only feature that leaves \(Platform.deviceNounPhrase) — it sends a summary of your metrics to \(coach.provider.displayName) using your own key. Nothing is sent until you ask.")
                 .font(StrandFont.footnote)
                 .foregroundStyle(StrandPalette.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)

@@ -23,8 +23,16 @@ final class WorkoutSourceTests: XCTestCase {
         XCTAssertEqual(WorkoutSource.classify("my-whoop-noop"), .detected)
         XCTAssertEqual(WorkoutSource.classify("whoop"), .whoop)
         XCTAssertEqual(WorkoutSource.classify("manual"), .manual)
+        XCTAssertEqual(WorkoutSource.classify("lifting"), .lifting)
         XCTAssertEqual(WorkoutSource.classify("apple_health"), .apple)
         XCTAssertEqual(WorkoutSource.classify("apple-health"), .apple)
+    }
+
+    func testAppleHealthSourceAcceptsCanonicalAndLegacySpellings() {
+        XCTAssertTrue(WorkoutSource.isAppleHealth("apple-health"))
+        XCTAssertTrue(WorkoutSource.isAppleHealth("apple_health"))
+        XCTAssertTrue(WorkoutSource.isAppleHealth("APPLE_HEALTH"))
+        XCTAssertFalse(WorkoutSource.isAppleHealth("whoop"))
     }
 
     func testDisplaySportRenamesDetectedToken() {

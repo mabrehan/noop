@@ -45,6 +45,7 @@ public struct OnboardingWizard: View {
 
     @State private var step: Step = .welcome
     @State private var glow = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public var body: some View {
         ZStack {
@@ -88,7 +89,8 @@ public struct OnboardingWizard: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(StrandPalette.surfaceBase.ignoresSafeArea())
         .preferredColorScheme(.dark)
-        .onAppear { glow = true }
+        // Reduce Motion: leave the ambient bloom at its resting frame (no breathing).
+        .onAppear { if !reduceMotion { glow = true } }
         // Isolated live observation — a hidden watcher slides Scan → celebration on bond
         // without subscribing the whole wizard to per-tick updates.
         .background(BondWatcher(onBonded: handleBond))
@@ -112,7 +114,7 @@ public struct OnboardingWizard: View {
             )
             .blendMode(.plusLighter)
             .opacity(glow ? 0.9 : 0.6)
-            .animation(StrandMotion.breathe, value: glow)
+            .animation(StrandMotion.breathe(reduced: reduceMotion), value: glow)
             .ignoresSafeArea()
 
             // A faint indigo wash from the top — instrument-grade depth.
@@ -263,7 +265,7 @@ private struct WelcomeStep: View {
                     .font(StrandFont.title2)
                     .foregroundStyle(StrandPalette.textSecondary)
                     .opacity(appear ? 1 : 0)
-                Text("A private window into your recovery, sleep and strain — read straight from your strap, kept only on this Mac.")
+                Text("A private window into your recovery, sleep and strain — read straight from your strap, kept only on \(Platform.deviceNounPhrase).")
                     .font(StrandFont.body)
                     .foregroundStyle(StrandPalette.textTertiary)
                     .multilineTextAlignment(.center)
@@ -299,7 +301,7 @@ private struct WhatItDoesStep: View {
         .init(icon: "lock.shield",
               tint: StrandPalette.statusPositive,
               title: "Own your data, offline",
-              body: "Everything lives on this Mac. No account, no sync, no cloud. Your thread is yours alone."),
+              body: "Everything lives on \(Platform.deviceNounPhrase). No account, no sync, no cloud. Your thread is yours alone."),
     ]
 
     var body: some View {
@@ -380,9 +382,46 @@ private struct ExpectationsStep: View {
                     .offset(y: shown ? 0 : 8)
                     .animation(StrandMotion.gentle.delay(Double(index) * 0.08), value: shown)
                 }
+
+                #if os(iOS)
+                // The iPhone-only reality: this is a sideloaded build, so set the re-sign + unlock
+                // expectation up front rather than letting it surprise people later (#222 / cert expiry).
+                expectationRow(
+                    icon: "iphone.gen3",
+                    title: "Installed outside the App Store",
+                    body: "On iPhone this is a sideloaded build. Re-sign it about every 7 days on a free Apple ID (longer on a paid account). After your phone reboots, unlock it once so NOOP can read and sync its data."
+                )
+                .opacity(shown ? 1 : 0)
+                .offset(y: shown ? 0 : 8)
+                .animation(StrandMotion.gentle.delay(Double(AppChangelog.expectations.count) * 0.08), value: shown)
+                #endif
             }
         }
         .onAppear { shown = true }
+    }
+
+    /// One expectation callout, matching the data-driven rows above so the iOS-only addition is visually
+    /// identical to the rest of the list.
+    private func expectationRow(icon: String, title: String, body: String) -> some View {
+        HStack(alignment: .top, spacing: 14) {
+            Image(systemName: icon)
+                .font(.system(size: 18, weight: .medium))
+                .foregroundStyle(StrandPalette.accent)
+                .frame(width: 26)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(StrandFont.headline)
+                    .foregroundStyle(StrandPalette.textPrimary)
+                Text(body).font(StrandFont.subhead)
+                    .foregroundStyle(StrandPalette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(14)
+        .frame(maxWidth: 520, alignment: .leading)
+        .background(StrandPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(StrandPalette.hairline))
     }
 }
 
@@ -390,9 +429,10 @@ private struct ExpectationsStep: View {
 
 private struct BluetoothStep: View {
     @State private var pulse = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         StepShell(title: "A quick word before we connect",
-                  subtitle: "macOS will ask for Bluetooth in a moment.") {
+                  subtitle: "\(Platform.deviceNoun) will ask for Bluetooth in a moment.") {
             VStack(spacing: 24) {
                 ZStack {
                     Circle()
@@ -412,7 +452,7 @@ private struct BluetoothStep: View {
                 InfoCard(
                     icon: "lock.fill",
                     tint: StrandPalette.statusPositive,
-                    title: "Nothing leaves your Mac",
+                    title: "Nothing leaves your \(Platform.deviceNoun)",
                     message: "NOOP talks to your strap directly over Bluetooth Low Energy. There's no server in the middle — the connection is local, and so is every reading it pulls in."
                 )
 
@@ -423,7 +463,7 @@ private struct BluetoothStep: View {
                     .frame(maxWidth: 460)
             }
         }
-        .onAppear { withAnimation(StrandMotion.breathe) { pulse = true } }
+        .onAppear { if !reduceMotion { withAnimation(StrandMotion.breathe) { pulse = true } } }
     }
 }
 
@@ -448,7 +488,7 @@ private struct WearStep: View {
                 VStack(spacing: 12) {
                     Checkline(text: "Wear it snug on your wrist or bicep — sensor against skin.")
                     Checkline(text: "Give it a few minutes of charge if the battery is low.")
-                    Checkline(text: "Keep it within about a metre of this Mac.")
+                    Checkline(text: "Keep it within about a metre of \(Platform.deviceNounPhrase).")
                 }
                 .frame(maxWidth: 440)
             }
@@ -566,7 +606,7 @@ private struct ScanStep: View {
                         .foregroundStyle(StrandPalette.textPrimary)
                 }
 
-                Text("WHOOP straps don't appear in macOS System Settings → Bluetooth. They advertise on a custom profile that only apps like NOOP can find — so there's nothing to pair there, and you shouldn't try.")
+                Text("WHOOP straps don't appear in your \(Platform.deviceNoun)'s Bluetooth settings. They advertise on a custom profile that only apps like NOOP can find — so there's nothing to pair there, and you shouldn't try.")
                     .font(StrandFont.subhead)
                     .foregroundStyle(StrandPalette.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -576,7 +616,7 @@ private struct ScanStep: View {
                 VStack(alignment: .leading, spacing: 10) {
                     Checkline(text: "It's charged and worn — the sensor needs skin contact to wake.")
                     Checkline(text: "It isn't held by the WHOOP phone app. Only one host at a time — close the app or turn off its Bluetooth.")
-                    Checkline(text: "It's within about a metre of this Mac.")
+                    Checkline(text: "It's within about a metre of \(Platform.deviceNounPhrase).")
                 }
 
                 Button(action: retry) {
@@ -824,11 +864,22 @@ private struct ImportStep: View {
         case appleHealth
 
         var allowedContentTypes: [UTType] {
+            // See DataSourcesView: `.folder` is a macOS-only affordance (pick an unzipped export
+            // directory). On iOS it greys out the .zip in the Files picker (issue #179), so iOS
+            // offers only the concrete file types.
             switch self {
             case .whoop:
+                #if os(macOS)
                 return [.zip, .folder]
+                #else
+                return [.zip]
+                #endif
             case .appleHealth:
+                #if os(macOS)
                 return [.zip, .xml, .folder]
+                #else
+                return [.zip, .xml]
+                #endif
             }
         }
     }
@@ -838,9 +889,10 @@ private struct ImportStep: View {
 
 private struct NotificationsStep: View {
     @State private var pulse = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         StepShell(title: "Stay in the loop",
-                  subtitle: "NOOP can tap your wrist when your Mac needs you — no glance at the screen required.") {
+                  subtitle: "NOOP can tap your wrist when your \(Platform.deviceNoun) needs you — no glance at the screen required.") {
             VStack(spacing: 24) {
                 ZStack {
                     Circle()
@@ -857,11 +909,29 @@ private struct NotificationsStep: View {
                 }
                 .frame(height: 130)
 
+                #if os(iOS)
+                // iOS gives an app no way to observe *other* apps' notifications, and the per-app picker
+                // behind it is NSWorkspace-based (macOS-only). So drop the cross-app relay claim here and
+                // keep only what iOS genuinely does: NOOP's own strain nudges + smart alarm buzz the strap
+                // directly over BLE.
                 InfoCard(
                     icon: "applewatch.radiowaves.left.and.right",
                     tint: StrandPalette.statusPositive,
                     title: "A buzz, not a banner",
-                    message: "When the Mac apps you choose send a notification, NOOP taps your strap — Slack, Calendar, Messages, whatever matters. Everything stays on this Mac."
+                    message: "NOOP taps your strap so an alert lands on your wrist instead of your screen — no need to reach for it. Everything stays on \(Platform.deviceNounPhrase)."
+                )
+
+                VStack(spacing: 12) {
+                    Checkline(text: "Strain nudges and your smart alarm tap your wrist the moment they fire.")
+                    Checkline(text: "It all stays on your strap and \(Platform.deviceNounPhrase) — no account, no cloud.")
+                }
+                .frame(maxWidth: 460)
+                #else
+                InfoCard(
+                    icon: "applewatch.radiowaves.left.and.right",
+                    tint: StrandPalette.statusPositive,
+                    title: "A buzz, not a banner",
+                    message: "When the \(Platform.deviceNoun) apps you choose send a notification, NOOP taps your strap — Slack, Calendar, Messages, whatever matters. Everything stays on \(Platform.deviceNounPhrase)."
                 )
 
                 VStack(spacing: 12) {
@@ -869,9 +939,10 @@ private struct NotificationsStep: View {
                     Checkline(text: "Strain nudges and your smart alarm tap your wrist the same way.")
                 }
                 .frame(maxWidth: 460)
+                #endif
             }
         }
-        .onAppear { withAnimation(StrandMotion.breathe) { pulse = true } }
+        .onAppear { if !reduceMotion { withAnimation(StrandMotion.breathe) { pulse = true } } }
     }
 }
 
@@ -961,6 +1032,7 @@ private struct RadarSweep: View {
     var bonded: Bool
     @State private var angle: Double = 0
     @State private var ping = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         GeometryReader { geo in
@@ -1011,7 +1083,7 @@ private struct RadarSweep: View {
         .onChange(of: active) { isActive in
             if isActive { startSweep() }
         }
-        .animation(StrandMotion.breathe, value: ping)
+        .animation(StrandMotion.breathe(reduced: reduceMotion), value: ping)
     }
 
     private func sweepWedge(size: CGFloat) -> some View {
@@ -1037,6 +1109,9 @@ private struct RadarSweep: View {
     }
 
     private func startSweep() {
+        // Reduce Motion: keep the wedge still (the static rings/crosshairs/blip
+        // still convey "searching" / "found") instead of spinning forever.
+        guard !reduceMotion else { return }
         angle = 0
         withAnimation(.linear(duration: 2.4).repeatForever(autoreverses: false)) {
             angle = 360

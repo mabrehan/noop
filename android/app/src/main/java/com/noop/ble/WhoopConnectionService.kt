@@ -5,8 +5,11 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.bluetooth.BluetoothAdapter
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
@@ -15,7 +18,12 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.noop.NoopApplication
 import com.noop.R
+import com.noop.alarm.SleepWindowWatcher
+import com.noop.alarm.SmartAlarmScheduler
+import com.noop.alarm.SmartAlarmStore
 import com.noop.analytics.IllnessWatch
+import com.noop.location.GpsSession
+import com.noop.location.LocationTracker
 import com.noop.notif.IllnessAlertNotifier
 import com.noop.ui.NoopPrefs
 import com.noop.ui.appLaunchIntent
@@ -29,6 +37,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.conflate
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
@@ -59,13 +69,61 @@ class WhoopConnectionService : Service() {
      *  connect, plus any OS restart), so we cancel the old one before launching a new one. */
     private var notifyJob: Job? = null
 
+    /** Watches [GpsSession] and runs the platform location stream while a GPS workout is active. This
+     *  is what makes route tracking survive the screen turning off (#215): the collection lives on the
+     *  always-on service, not the Activity-scoped ViewModel that Android cancels when it's cleared. */
+    private var gpsGateJob: Job? = null
+
+    /** The actual location collector, alive only while a GPS workout is in flight. Cancelled (which
+     *  removes the LocationManager updates via the stream's awaitClose) the moment the workout ends. */
+    private var gpsJob: Job? = null
+
+    /** Platform-GPS wrapper (no Google Play Services). Lazily built — the service holds a Context. */
+    private val locationTracker by lazy { LocationTracker(this) }
+
     /** Last illness-watch evaluation seen by the collector — clear→raised is the notify edge.
      *  In-memory on purpose: the persisted once-a-day gate (NoopPrefs) handles dedupe across
      *  process restarts and the AppViewModel call site. */
     private var lastIllnessAlert: String? = null
 
+    /** Smart-alarm light-sleep watcher (#207). Feeds the live HR while we're inside the wake window
+     *  and, on a lighter-phase reading, advances the GUARANTEED alarm earlier. It can only ever move
+     *  the alarm earlier within the window — the hard deadline scheduled via AlarmManager is the floor
+     *  of safety, so if BLE drops or no light sleep is found the user is still woken at the window end.
+     *  The detector is reset each time we (re)enter a window. */
+    private val sleepWatcher = SleepWindowWatcher()
+    private var inAlarmWindow = false
+
+    /** The smart-alarm HR collector, alive for the life of the service. */
+    private var alarmJob: Job? = null
+
     private val ble get() = (application as NoopApplication).ble
     private val repo get() = (application as NoopApplication).repository
+
+    /**
+     * Watches the OS Bluetooth radio so turning it off immediately tears down NOOP's orphaned GATT
+     * link (#314). Without this there is no ACTION_STATE_CHANGED listener at all, so the radio going off
+     * never reaches [WhoopBleClient] — the link stays "connected", the UI keeps showing live HR/buzz/sync
+     * that isn't real, and the next write crashes on a dead binder (iOS/macOS are immune because
+     * CoreBluetooth's send() is state-guarded). Registered while the FGS is alive (it is the long-lived
+     * owner of the connection) and unregistered in [onDestroy]. STATE_TURNING_OFF/OFF → teardown +
+     * connected=false; STATE_ON → resume the connection.
+     */
+    private val bluetoothStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+            when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                // Catch TURNING_OFF (the earliest signal) AND OFF — by TURNING_OFF the binder is already
+                // on its way down, so tearing down here pre-empts the crash window.
+                BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF -> ble.onBluetoothRadioOff()
+                BluetoothAdapter.STATE_ON -> ble.onBluetoothRadioOn()
+            }
+        }
+    }
+
+    /** True once [bluetoothStateReceiver] is registered, so repeat onStartCommands don't double-register
+     *  (which would later throw on a single unregister). */
+    private var bluetoothReceiverRegistered = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -85,6 +143,19 @@ class WhoopConnectionService : Service() {
         if (!startForegroundCompat(buildNotification(ble.state.value, null))) {
             stopSelf()
             return START_NOT_STICKY
+        }
+
+        // Listen for the OS Bluetooth radio toggling so turning it off tears the link down at once (#314).
+        // Guarded so repeat onStartCommands (every connect / OS restart) don't stack registrations.
+        if (!bluetoothReceiverRegistered) {
+            runCatching {
+                ContextCompat.registerReceiver(
+                    this,
+                    bluetoothStateReceiver,
+                    IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
+                    ContextCompat.RECEIVER_NOT_EXPORTED,
+                )
+            }.onSuccess { bluetoothReceiverRegistered = true }
         }
 
         // Keep the ongoing notification in step with the live connection state AND today's recovery
@@ -142,6 +213,67 @@ class WhoopConnectionService : Service() {
             }
         }
 
+        // Drive GPS route tracking from here so it OUTLIVES the UI (#215). While a GPS workout is
+        // active we collect the platform location stream into the process-level [GpsSession]; the
+        // ViewModel only observes that shared route. Gated on the active flag so the location radio is
+        // off (and the FGS's location type unused) outside a GPS workout. Re-`start`s land here, so we
+        // cancel + relaunch the gate, never stack collectors.
+        gpsGateJob?.cancel()
+        gpsGateJob = scope.launch {
+            GpsSession.state
+                .map { it.active }
+                .distinctUntilChanged()
+                .collect { active ->
+                    gpsJob?.cancel()
+                    gpsJob = null
+                    if (active) {
+                        // Re-post with the location service type added so background location is
+                        // permitted while tracking; on Android 14+ a service that reads location in the
+                        // background must declare the location FGS type. Reverted to connectedDevice-only
+                        // when the workout ends (active=false re-posts the base type).
+                        startForegroundCompat(buildNotification(ble.state.value, null), tracking = true)
+                        gpsJob = launch {
+                            // LocationTracker fails SAFE (no permission / no provider just ends the
+                            // stream); runCatching guards an OEM throw so it can't tear down the FGS.
+                            runCatching {
+                                locationTracker.stream().collect { pt -> GpsSession.append(pt) }
+                            }
+                        }
+                    } else {
+                        startForegroundCompat(buildNotification(ble.state.value, null), tracking = false)
+                    }
+                }
+        }
+
+        // Smart alarm light-sleep watcher (#207). While the alarm is enabled and we're inside the wake
+        // window, feed each live HR reading to the pure detector; on a lighter-phase reading, advance
+        // the GUARANTEED alarm earlier (the scheduler clamps to the window and can never move it later
+        // or cancel it — the hard deadline set via AlarmManager is independent of this collector). The
+        // FGS is the only long-lived BLE collector, so this is what lets the smart move happen with the
+        // app closed. If the service isn't running (user opted out of background) the hard deadline
+        // still fires — that's the point of the fallback.
+        alarmJob?.cancel()
+        alarmJob = scope.launch {
+            val store = SmartAlarmStore.from(this@WhoopConnectionService)
+            ble.state
+                .map { it.heartRate ?: 0 }
+                .conflate()
+                .collect { hr ->
+                    if (!store.enabled || store.scheduledDeadlineMs <= 0L) {
+                        inAlarmWindow = false
+                        return@collect
+                    }
+                    val now = System.currentTimeMillis()
+                    val inWindow = now in store.scheduledWindowStartMs until store.scheduledDeadlineMs
+                    if (inWindow && !inAlarmWindow) sleepWatcher.reset()   // fresh night
+                    inAlarmWindow = inWindow
+                    if (!inWindow) return@collect
+                    if (sleepWatcher.shouldWake(hr)) {
+                        SmartAlarmScheduler.advanceTo(this@WhoopConnectionService, store, now)
+                    }
+                }
+        }
+
         // START_NOT_STICKY: the FGS's job is to keep this process *alive* (which it does while
         // running, making OS kills unlikely). We deliberately do NOT resurrect after a kill, because
         // a fresh process has no strap/model context to reconnect with — the user reopening the app
@@ -150,18 +282,34 @@ class WhoopConnectionService : Service() {
         return START_NOT_STICKY
     }
 
-    /** Promote to the foreground. Returns false (rather than throwing) if the platform refuses. */
-    private fun startForegroundCompat(notification: Notification): Boolean = runCatching {
+    /** Promote to the foreground. Returns false (rather than throwing) if the platform refuses. When
+     *  [tracking] a GPS workout we add the location FGS type — Android 14+ requires it for a service
+     *  that reads location in the background (the manifest declares `connectedDevice|location`). */
+    private fun startForegroundCompat(notification: Notification, tracking: Boolean = false): Boolean = runCatching {
         val type =
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                val locationType = if (tracking) ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION else 0
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or locationType
             } else {
                 0
             }
         ServiceCompat.startForeground(this, NOTIF_ID, notification, type)
     }.isSuccess
 
+    /** Signature of the fields the notification actually renders (#216). The live HR stream emits ~1 Hz
+     *  but the notification no longer shows BPM, so we only re-post when one of THESE changes — turning
+     *  a per-beat wakeup into a handful of updates a day. */
+    private var lastNotificationKey: String? = null
+
     private fun postNotification(state: LiveState, recoveryPct: Double? = null) {
+        val key = listOf(
+            state.connected,
+            state.backfilling,
+            recoveryPct?.roundToInt(),
+            state.batteryPct?.roundToInt(),
+        ).joinToString("|")
+        if (key == lastNotificationKey) return
+        lastNotificationKey = key
         // Defensive: a notify() throw (OEM quirk, revoked POST_NOTIFICATIONS on some ROMs) must not
         // crash the collector and tear down the connection we exist to keep alive.
         runCatching {
@@ -171,10 +319,14 @@ class WhoopConnectionService : Service() {
     }
 
     private fun buildNotification(state: LiveState, recoveryPct: Double?): Notification {
+        // #216: deliberately NO live BPM in the title. A per-beat-changing notification forces the
+        // foreground service to re-post (and wake the device) ~once a second all day, which is a real
+        // battery cost for a number nobody reads off the lock screen. The title now reflects only the
+        // connection / sync state, which changes rarely — see postNotification's dedup.
         val title = when {
-            !state.connected -> "Reconnecting to your WHOOP…"
-            state.heartRate != null -> "${state.heartRate} bpm"
-            else -> "Connected to your WHOOP"
+            !state.connected   -> "Reconnecting to your WHOOP…"
+            state.backfilling  -> "Syncing strap history…"
+            else               -> "Connected to your WHOOP"
         }
         val detail = buildList {
             add(if (state.connected) "Streaming in the background" else "Keeping the link open")
@@ -232,6 +384,12 @@ class WhoopConnectionService : Service() {
     }
 
     override fun onDestroy() {
+        if (bluetoothReceiverRegistered) {
+            // unregisterReceiver throws if it was never registered; the flag guards that, and runCatching
+            // covers the rare case the OS already reclaimed it.
+            runCatching { unregisterReceiver(bluetoothStateReceiver) }
+            bluetoothReceiverRegistered = false
+        }
         scope.cancel()
         super.onDestroy()
     }

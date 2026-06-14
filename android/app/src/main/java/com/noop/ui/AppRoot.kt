@@ -17,6 +17,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.CompareArrows
 import androidx.compose.material.icons.automirrored.filled.TrendingUp
 import androidx.compose.material.icons.filled.Air
+import androidx.compose.material.icons.filled.Alarm
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bedtime
 import androidx.compose.material.icons.filled.Bolt
@@ -123,6 +124,7 @@ private enum class Destination(
 
     // Group: System
     Automations("automations", "Automations", Icons.Filled.Bolt),
+    SmartAlarm("smart_alarm", "Smart Alarm", Icons.Filled.Alarm),
     DataSources("data_sources", "Data Sources", Icons.Filled.Storage),
     Notifications("notifications", "Notifications", Icons.Filled.Notifications),
     Support("support", "Support", Icons.Filled.Tune),
@@ -145,14 +147,14 @@ private data class DrawerGroup(val header: String, val items: List<Destination>)
 private val drawerGroups: List<DrawerGroup> = listOf(
     DrawerGroup("Overview", listOf(Destination.Today, Destination.Intelligence)),
     DrawerGroup("Live", listOf(Destination.Live, Destination.Intervals)),
-    DrawerGroup("Recovery", listOf(Destination.Sleep, Destination.Breathe, Destination.Stress)),
+    DrawerGroup("Charge", listOf(Destination.Sleep, Destination.Breathe, Destination.Stress)),
     DrawerGroup("Activity", listOf(Destination.Workouts, Destination.Trends)),
     DrawerGroup("Insight", listOf(
         Destination.Coach, Destination.Insights, Destination.Explore, Destination.Compare,
     )),
     DrawerGroup("Health", listOf(Destination.Health, Destination.VitalSigns, Destination.AppleHealth)),
     DrawerGroup("System", listOf(
-        Destination.Automations, Destination.DataSources,
+        Destination.Automations, Destination.SmartAlarm, Destination.DataSources,
         Destination.Notifications, Destination.Support, Destination.Settings,
     )),
 )
@@ -322,18 +324,29 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
                     )
                 }
                 composable(Destination.Live.route) { LiveScreen(viewModel) }
-                composable(Destination.Sleep.route) { SleepScreen(viewModel) }
+                composable(Destination.Sleep.route) {
+                    SleepScreen(
+                        vm = viewModel,
+                        onOpenJournal = { nav.navigateTopLevel(Destination.Insights.route) },
+                    )
+                }
                 composable(Destination.Intervals.route) { IntervalsScreen(viewModel) }
                 composable(Destination.Breathe.route) { BreatheScreen(viewModel) }
                 composable(Destination.Coach.route) { CoachScreen() }
                 composable(Destination.Explore.route) { TrendsExploreScreen(viewModel) }
                 composable(Destination.Automations.route) { AutomationsScreen(viewModel) }
+                composable(Destination.SmartAlarm.route) { SmartAlarmScreen(viewModel) }
                 composable(Destination.Workouts.route) { WorkoutsScreen(viewModel) }
                 composable(Destination.Support.route) { SupportScreen() }
                 composable(Destination.Intelligence.route) { IntelligenceScreen(viewModel) }
 
                 // --- Placeholder routes (later waves fill these in) ---
-                composable(Destination.Stress.route) { StressScreen(viewModel) }
+                composable(Destination.Stress.route) {
+                    StressScreen(
+                        vm = viewModel,
+                        onBreathe = { nav.navigateTopLevel(Destination.Breathe.route) },
+                    )
+                }
                 composable(Destination.Trends.route) { TrendsScreen(viewModel) }
                 composable(Destination.Insights.route) { InsightsScreen(viewModel) }
                 composable(Destination.Compare.route) { CompareScreen(viewModel) }

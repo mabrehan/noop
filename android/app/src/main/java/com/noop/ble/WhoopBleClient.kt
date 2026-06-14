@@ -37,6 +37,7 @@ import com.noop.protocol.DeviceFamily
 import com.noop.protocol.Framing
 import com.noop.protocol.Reassembler
 import com.noop.protocol.Streams
+import com.noop.protocol.Whoop5Config
 import com.noop.protocol.extractStreams
 import com.noop.analytics.IntelligenceEngine
 import com.noop.analytics.UserProfile
@@ -85,6 +86,11 @@ data class LiveState(
     val encryptedBond: Boolean = false,
     val heartRate: Int? = null,
     val rr: List<Int> = emptyList(),
+    /** Rolling UI buffer of recent R-R intervals (capped, oldest dropped first). The standard BLE HR
+     *  notification usually carries only one or two intervals per packet, so the Live console needs a
+     *  short history to render a moving R-R strip / rolling RMSSD. Appended (never replaced) via
+     *  [withRRIntervals]; emptied by [clearedBiometrics]. Twin of macOS LiveState.rrRecent (PR#191). */
+    val rrRecent: List<Int> = emptyList(),
     val batteryPct: Double? = null,
     /** Charging flag from BATTERY_LEVEL events — wire observation: u8 bit0 (4.0 @26 / 5.0 @30,
      *  ~every 8 min on captured links). Flag only; battery % keeps its family source (#77).
@@ -123,7 +129,32 @@ data class LiveState(
      *  direct connect just re-fails. Carries an actionable forget+re-pair guide; cleared on the next
      *  successful connect. Parity with macOS LiveState.reconnectGuide (5/MG firmware reset, 2026-06). */
     val reconnectGuide: String? = null,
-)
+    /** EXPERIMENTAL R22 telemetry (#174): how many of the 15 enable_r22 SET_CONFIG flags the strap has
+     *  ACKed since the last "Send enable sequence" tap. 15 = the strap accepted the whole sequence (it
+     *  returns a COMMAND_RESPONSE per flag — hardware-confirmed). Reset per attempt + per session.
+     *  Twin of macOS LiveState.r22FlagsAccepted. */
+    val r22FlagsAccepted: Int = 0,
+    /** Count of LIVE type-0x2F deep biometric records seen this session OUTSIDE a history offload — i.e.
+     *  the R22 deep stream actually flowing in realtime. 0 with flags accepted = enable taken but no deep
+     *  data yet. Twin of macOS LiveState.deepPacketsThisSession. (#174) */
+    val deepPacketsThisSession: Int = 0,
+) {
+    /** Set the fresh-packet [rr] AND append the valid intervals onto the bounded [rrRecent] rolling
+     *  buffer (oldest fall off first). Non-positive sentinels are dropped from the rolling buffer.
+     *  Twin of macOS LiveState.setRRIntervals (PR#191). */
+    fun withRRIntervals(intervals: List<Int>, recentLimit: Int = 60): LiveState {
+        val valid = intervals.filter { it > 0 }
+        if (valid.isEmpty()) return copy(rr = intervals)
+        val merged = rrRecent + valid
+        val capped = if (merged.size > recentLimit) merged.takeLast(recentLimit) else merged
+        return copy(rr = intervals, rrRecent = capped)
+    }
+
+    /** Blank all live biometric readouts (HR + R-R + the rolling buffer) so a stale heart rate or R-R
+     *  strip can't outlive the link. Applied on disconnect alongside the charging/bond clears. Twin of
+     *  macOS LiveState.clearBiometrics (PR#191). */
+    fun clearedBiometrics(): LiveState = copy(heartRate = null, rr = emptyList(), rrRecent = emptyList())
+}
 
 /**
  * Android CoreBluetooth-equivalent engine for the WHOOP 4.0.
@@ -156,6 +187,88 @@ data class LiveState(
  *   - Every android.bluetooth call below is annotated @SuppressLint("MissingPermission"); the
  *     ViewModel/Activity owns the permission request and must not call into here until granted.
  */
+/**
+ * Thin injectable indirection over the raw [BluetoothGatt] operations the client calls.
+ *
+ * Production wires [RealGattOps] (a straight delegate to a live `BluetoothGatt`). Unit tests inject a
+ * stub whose methods throw `android.os.DeadObjectException` to exercise the crash-safety teardown
+ * (#314) WITHOUT pulling in Robolectric or a full GATT mock. The interface is deliberately minimal —
+ * only the GATT calls that can throw a `DeadObjectException` once the OS Bluetooth binder dies (the
+ * radio was turned off mid-link) are routed through it; everything else stays on the concrete handle.
+ *
+ * The boolean returns mirror `BluetoothGatt`'s own contract (true == the op was accepted by the
+ * stack). A THROW is distinct from a `false` return: `false` is a transient BUSY (retry), a throw is
+ * a dead binder (tear down). See [WhoopBleClient.safeGatt].
+ */
+interface GattOps {
+    fun writeCharacteristicCompat(
+        ch: BluetoothGattCharacteristic,
+        value: ByteArray,
+        writeType: Int,
+    ): Boolean
+
+    fun writeDescriptorCompat(
+        descriptor: BluetoothGattDescriptor,
+        value: ByteArray,
+    ): Boolean
+
+    fun readCharacteristicCompat(ch: BluetoothGattCharacteristic): Boolean
+    fun setCharacteristicNotificationCompat(ch: BluetoothGattCharacteristic, enable: Boolean): Boolean
+    fun requestMtuCompat(mtu: Int): Boolean
+    fun readRemoteRssiCompat(): Boolean
+    fun discoverServicesCompat(): Boolean
+}
+
+/**
+ * Production [GattOps]: a straight delegate to a live [BluetoothGatt]. The TIRAMISU+/legacy branch
+ * for the value-bearing write/descriptor calls lives here (one place) so the client call sites read
+ * uniformly. Permission is owned by the caller (the client is @SuppressLint("MissingPermission")).
+ */
+@SuppressLint("MissingPermission")
+class RealGattOps(private val gatt: BluetoothGatt) : GattOps {
+    override fun writeCharacteristicCompat(
+        ch: BluetoothGattCharacteristic,
+        value: ByteArray,
+        writeType: Int,
+    ): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            gatt.writeCharacteristic(ch, value, writeType) == BluetoothGatt.GATT_SUCCESS
+        } else {
+            @Suppress("DEPRECATION")
+            run {
+                ch.writeType = writeType
+                ch.value = value
+                gatt.writeCharacteristic(ch)
+            }
+        }
+
+    override fun writeDescriptorCompat(
+        descriptor: BluetoothGattDescriptor,
+        value: ByteArray,
+    ): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            gatt.writeDescriptor(descriptor, value) == BluetoothGatt.GATT_SUCCESS
+        } else {
+            @Suppress("DEPRECATION")
+            run {
+                descriptor.value = value
+                gatt.writeDescriptor(descriptor)
+            }
+        }
+
+    override fun readCharacteristicCompat(ch: BluetoothGattCharacteristic): Boolean =
+        gatt.readCharacteristic(ch)
+
+    override fun setCharacteristicNotificationCompat(
+        ch: BluetoothGattCharacteristic,
+        enable: Boolean,
+    ): Boolean = gatt.setCharacteristicNotification(ch, enable)
+
+    override fun requestMtuCompat(mtu: Int): Boolean = gatt.requestMtu(mtu)
+    override fun readRemoteRssiCompat(): Boolean = gatt.readRemoteRssi()
+    override fun discoverServicesCompat(): Boolean = gatt.discoverServices()
+}
+
 class WhoopBleClient(
     private val context: Context,
     /**
@@ -178,6 +291,13 @@ class WhoopBleClient(
      * scan. Port of the macOS `PuffinExperiment` gate. NEVER consulted for WHOOP 4.0.
      */
     private val puffinExperiment: PuffinExperiment = PuffinExperiment.from(context),
+    /**
+     * Builds the [GattOps] indirection from a live [BluetoothGatt]. Production uses [RealGattOps];
+     * unit tests inject a factory that returns a stub whose calls throw `DeadObjectException` to
+     * exercise the crash-safety teardown (#314) without Robolectric. Default keeps every existing
+     * call site unchanged.
+     */
+    private val gattOpsFactory: (BluetoothGatt) -> GattOps = ::RealGattOps,
 ) {
 
     companion object {
@@ -185,9 +305,6 @@ class WhoopBleClient(
         /** Cap on the in-app strap-log ring buffer (for the "Share strap log" diagnostics export). */
         private const val LOG_BUFFER_MAX = 2000
 
-        /** Bump whenever a historical layout is added/changed so the reject archive re-decodes once more
-         *  (#151). 2 = the WHOOP 4.0 v25 layout (v1.95). Matches the Swift BLEManager constant. */
-        private const val REJECT_REPLAY_DECODER_VERSION = 2
 
         // MARK: GATT UUIDs (authoritative, from BLEManager.swift / FINDINGS.md).
         //
@@ -227,6 +344,9 @@ class WhoopBleClient(
         private const val RECONNECT_DELAY_MS = 3_000L
         /** Give up a scan after this long with no strap found, and tell the user why. */
         private const val SCAN_TIMEOUT_MS = 20_000L
+        /** Rotate to the other WHOOP family after this long with no discovery, in case the persisted
+         *  preference went stale after an update/restore. Mirrors macOS scanFallbackDelaySeconds. (PR#195) */
+        private const val SCAN_FALLBACK_DELAY_MS = 8_000L
 
         // MARK: Live-persistence cadence (port of Swift CollectorPolicy.default).
         /** Flush the live buffer after this many frames OR [FLUSH_MAX_INTERVAL_MS], whichever first. */
@@ -252,6 +372,9 @@ class WhoopBleClient(
         private const val WHOOP5_HISTORY_RETRY_DELAY_MS = 700L
         /** Debounce between a committed backfill chunk and the on-device scoring pass it schedules. */
         private const val POST_BACKFILL_ANALYZE_DELAY_MS = 1_500L
+        /** #174: window after the last offload frame/HISTORY_COMPLETE during which a type-0x2F frame is
+         *  treated as trailing-historical, not live. Mirrors macOS deepPacketLiveCooldownSeconds (10s). */
+        private const val DEEP_PACKET_LIVE_COOLDOWN_MS = 10_000L
 
         /** ATT MTU to request on connect. The default 23 caps every notification at 20 payload bytes,
          *  so the historical offload fragments across many notifications (slow, more reassembly). 247
@@ -302,6 +425,10 @@ class WhoopBleClient(
          *  write on the same looper tick — before Android's GATT has accepted the previous one, which it
          *  then rejects. A small gap lets the stack settle and largely eliminates the rejections (#77). */
         private const val WITHOUT_RESPONSE_PACE_MS = 8L
+        /** Delay before reading link RSSI after connect — past the bond/MTU/discovery handshake so the
+         *  read can't occupy the single GATT op slot the critical setup commands need. Diagnostic only.
+         *  (PR #241, ryanbr.) */
+        private const val RSSI_READ_DELAY_MS = 3000L
 
         /**
          * True when a frame is part of the historical offload (HISTORICAL_DATA=47, EVENT=48,
@@ -338,6 +465,62 @@ class WhoopBleClient(
             connected && bonded && !backfilling
 
         /**
+         * #314: should a Throwable that escaped a raw GATT call trigger a full link teardown?
+         *
+         * Once the OS Bluetooth radio is turned off mid-link the binder dies, and `BluetoothGatt`'s
+         * write/read/descriptor/mtu/discover calls throw `android.os.DeadObjectException` (an unchecked
+         * `RuntimeException`); we also see `IllegalStateException` (adapter off) and `SecurityException`
+         * (permission revoked). ALL of these mean the link is unusable, so the honest answer is always
+         * `true` — there is no recoverable GATT throw. Kept as a pure, instance-free predicate so the
+         * catch policy in [safeGatt] is unit-testable without a live GATT stack (the actual call sites
+         * need a real binder, which the unit harness has no way to fake). The named types are documented
+         * here because they are the ones observed in #314 and the prompt's required catch set.
+         */
+        fun shouldTeardownOnGattThrow(t: Throwable): Boolean = when (t) {
+            is android.os.DeadObjectException,   // binder died — the #314 crash
+            is IllegalStateException,            // adapter/stack in a bad state
+            is SecurityException,                // BLUETOOTH_CONNECT revoked mid-link
+            -> true
+            // Any other RuntimeException out of a GATT call is equally unrecoverable: there is no path
+            // where continuing to drive a throwing GATT is correct, so tear down rather than crash.
+            else -> true
+        }
+
+        /**
+         * The LiveState the teardown path publishes after the link drops (#314). Pure model of the
+         * `connected = false` + biometrics-cleared transition so a test can assert the UI flips to
+         * disconnected without a live instance. Mirrors what `handleDisconnect` applies via
+         * `LiveState.clearedBiometrics().copy(...)`.
+         */
+        fun disconnectedLiveState(previous: LiveState): LiveState =
+            previous.clearedBiometrics().copy(
+                connected = false, bonded = false, encryptedBond = false,
+                backfilling = false, syncChunksThisSession = 0, charging = null,
+            )
+
+        /**
+         * Pure classification of a COMPLETED (HISTORY_COMPLETE) offload, extracted from exitBackfilling
+         * so it's unit-testable without a live GATT stack. Mirrors Swift
+         * `BLEManager.classifyCompletedOffload`.
+         *  - first  = bankedSensorRecords: the strap handed over real sensor records (decoded this pass
+         *    OR rows persisted) — its clock is banking to flash.
+         *  - second = bankedNothing (#77/#120/#214): the offload completed but banked NO sensor records,
+         *    in EITHER shape — console-only across ≥3 diagnostic chunks, OR a near-empty metadata-only
+         *    completion (zero rows persisted) with fewer than 3 console frames. The #214 broadening is
+         *    the `rowsPersisted == 0` arm; before it a metadata-only completion slipped through silently.
+         *    The sustained-streak gate (EmptySyncTracker) still decides whether the banner fires.
+         */
+        fun classifyCompletedOffload(
+            decodedChunks: Int,
+            consoleChunks: Int,
+            rowsPersisted: Int,
+        ): Pair<Boolean, Boolean> {
+            val bankedSensorRecords = decodedChunks > 0 || rowsPersisted > 0
+            val bankedNothing = !bankedSensorRecords && (consoleChunks >= 3 || rowsPersisted == 0)
+            return Pair(bankedSensorRecords, bankedNothing)
+        }
+
+        /**
          * Newest plausible-unix marker in a GET_DATA_RANGE response = the strap's newest stored
          * record. Mirrors Swift `BLEManager.dataRangeNewestUnix`: scan u32 LE words in the response
          * body (starts at frame[7], after [type,seq,cmd]), keep those in the unix range, return max.
@@ -369,6 +552,9 @@ class WhoopBleClient(
     private val scanner: BluetoothLeScanner? get() = adapter?.bluetoothLeScanner
 
     private var gatt: BluetoothGatt? = null
+    /** Injectable indirection over [gatt]'s raw GATT calls (see [GattOps]). Rebuilt whenever [gatt] is
+     *  (re)assigned in [connectToDevice], cleared in the teardown path alongside `gatt = null`. */
+    private var gattOps: GattOps? = null
     private var cmdCharacteristic: BluetoothGattCharacteristic? = null
 
     /** Frame reassembler for the fragmented custom notify chars (port of Reassembler). Reassigned per
@@ -445,6 +631,18 @@ class WhoopBleClient(
         }
     }
 
+    /** Fired after [SCAN_FALLBACK_DELAY_MS] of a service-filtered scan with no discovery: rotate to the
+     *  other WHOOP family in case the persisted preference is stale (after an update/restore). Cancelled
+     *  on discovery/connect. Mirrors macOS BLEManager scanFallbackWorkItem. (PR#195) */
+    private val scanFallbackRunnable = Runnable {
+        if (scanning && !_state.value.connected) {
+            val fallback = selectedModel.fallbackScanModel
+            log("No ${selectedModel.displayName} found yet — trying ${fallback.displayName}")
+            stopScan()   // clears the scanning flag + the LE scan; startScan re-arms both
+            startScan(fallback, allowFallback = true)
+        }
+    }
+
     // ====================================================================================
     // MARK: Persistence + historical offload (NEW — ports BLEManager.swift Collector/Backfiller)
     // ====================================================================================
@@ -465,14 +663,17 @@ class WhoopBleClient(
 
     init {
         // Retro-decode (#151): when the decoder gains a historical layout (WHOOP 4.0 v25), re-run every
-        // archived undecodable frame through it ONCE and insert whatever now decodes — the only path by
-        // which already-acked, strap-freed history backfills after an update. Version-gated so it runs
-        // once per decoder version; idempotent if it re-runs (offloaded rows dedupe by ts). Mirrors the
-        // Swift BLEManager gate. (This client is a process singleton, so init runs once per process.)
+        // archived undecodable frame through it and insert whatever now decodes — the only path by
+        // which already-acked, strap-freed history backfills after an update. Runs once per APP version
+        // (no manual decoder constant to forget to bump, #152); idempotent if it re-runs (offloaded rows
+        // dedupe by ts), and the gate holds on a failed insert so the records retry next launch. Mirrors
+        // the Swift BLEManager gate. (This client is a process singleton, so init runs once per process.)
         ioScope.launch {
-            val rows = rawHistoryArchive.replayIfNeeded(repository, deviceId, REJECT_REPLAY_DECODER_VERSION)
+            val rows = rawHistoryArchive.replayIfNeeded(
+                repository, deviceId, com.noop.ui.AppChangelog.CURRENT_VERSION,
+            )
             if (rows > 0) {
-                log("Backfill: retro-decoded $rows record(s) from the reject archive after a decoder update.")
+                log("Backfill: retro-decoded $rows record(s) from the reject archive after an update.")
             }
         }
     }
@@ -521,6 +722,7 @@ class WhoopBleClient(
                     heightCm = profileStore.heightCm,
                     age = profileStore.age.toDouble(),
                     sex = profileStore.sex,
+                    stepTicksPerStep = profileStore.stepTicksPerStep,
                 )
                 runCatching {
                     IntelligenceEngine.analyzeRecent(
@@ -531,6 +733,17 @@ class WhoopBleClient(
                     )
                 }.onSuccess {
                     log("Backfill: post-sync scoring pass done")
+                    // #277 diagnostic: surface the day-key the dashboard treats as "today" against the
+                    // newest banked row, so a UTC-bucket vs local-day split (rows persist but Today
+                    // freezes) shows up plainly in the shared strap log. Best-effort — a diagnostic read
+                    // must never break scoring.
+                    runCatching {
+                        val merged = repository.daysMerged(deviceId)
+                        val newest = merged.maxByOrNull { it.day }?.day ?: "—"
+                        val todayKey = com.noop.ui.logicalDayKeyNow()
+                        val present = if (merged.any { it.day == todayKey }) "present" else "MISSING"
+                        log("Backfill: ${merged.size} day(s) banked; newest=$newest, dashboard-today=$todayKey ($present)")
+                    }
                 }.onFailure {
                     // The scoring pass now hops to Dispatchers.Default; shutdown() cancels it, which is
                     // not a scoring failure — rethrow so the cancellation isn't swallowed/mis-logged. (#125)
@@ -563,6 +776,11 @@ class WhoopBleClient(
     /** Genuine offload frames seen this session — zero at timeout means the strap never answered
      *  the history request at all (5/MG retry trigger, #78 fork). Main-looper only. */
     private var offloadFramesThisSession = 0
+    /** #174 deep-packet cooldown: wall time (ms) of the most recent offload frame OR HISTORY_COMPLETE.
+     *  A type-0x2F arriving just after a backfill ends (backfilling already flipped false) is a TRAILING
+     *  historical frame, not the live R22 stream, so it must not be counted as a "live deep packet".
+     *  0 = no offload reference yet this session. Mirrors macOS BLEManager.lastOffloadFrameAt. */
+    private var lastOffloadFrameAtMs = 0L
     /** One-shot per session: SEND_HISTORICAL_DATA already fired (gate + fail-open can both call). */
     private var historicalKickSent = false
     /** 5/MG zero-frame retries used this CONNECTION (max 2 — then the 900s periodic timer owns it). */
@@ -610,8 +828,21 @@ class WhoopBleClient(
      *  and bounces a stalled link. Handler-posted on every connect handshake; cancelled in reset(). */
     private val keepAliveRunnable = Runnable { keepAliveFire() }
     private var keepAliveTick = 0
-    /** True while the Live screen wants the realtime HR stream; the keep-alive re-arms it so it can't lapse. */
+    /** True while a Live/Health screen is on-screen and wants the realtime HR stream (ref-counted in
+     *  [com.noop.ui.AppViewModel]). One of the two inputs to [wantsRealtime]. */
+    @Volatile private var screenWantsRealtime = false
+    /** True while the "Continuous HRV capture" preference wants the realtime stream held open even with
+     *  no Live screen visible, so the strap banks dense beat-to-beat R-R 24/7 (better overnight
+     *  HRV/recovery/sleep). The second input to [wantsRealtime]. Default off; set by
+     *  [setKeepStreamForData]. Mirrors the Swift `keepRealtimeForData`. */
+    @Volatile private var keepStreamForData = false
+    /** Derived want: the realtime stream should be armed while EITHER a screen wants it OR the
+     *  continuous-capture preference wants it. The keep-alive re-arms it so it can't lapse, and the
+     *  post-bond branch arms it on connect. Recomputed only inside [reconcileRealtime]. */
     @Volatile private var wantsRealtime = false
+    /** What we last told the strap (armed = TOGGLE_REALTIME_HR 1). Lets [reconcileRealtime] send the
+     *  toggle only on the false↔true edge instead of on every input change. */
+    @Volatile private var realtimeArmed = false
     /** Wall-clock of the last inbound notification — drives the keep-alive liveness watchdog. */
     @Volatile private var lastDataAtMs = 0L
     /** True once we've re-subscribed during the CURRENT quiet episode, so the keep-alive re-subscribes
@@ -634,12 +865,21 @@ class WhoopBleClient(
     private var pendingRetry: PendingWrite? = null
     private var writeRetries = 0
 
+    /** The BUSY-retry kick for [drainWriteQueue], held as a NAMED runnable (not an inline lambda) so the
+     *  teardown path can cancel a still-pending retry — otherwise a queued retry fires after the link is
+     *  dead and re-enters the now-dead write, re-throwing `DeadObjectException` (#314). */
+    private val drainWriteRetryRunnable = Runnable { drainWriteQueue() }
+
     /** Descriptor-write queue: enabling notifications is also a one-at-a-time GATT operation. */
     private val cccdQueue = ConcurrentLinkedQueue<BluetoothGattCharacteristic>()
     private var cccdInFlight = false
     /** Bounded retries for a transiently-BUSY CCCD write, so a single rejected subscribe doesn't
      *  permanently kill a stream (HR/battery/events). Reset per connection in [reset]. */
     private var cccdRetries = 0
+    /** The BUSY-retry kick for [drainCccdQueue], a NAMED runnable so teardown can cancel a pending
+     *  subscribe-retry that would otherwise re-enter a dead descriptor write (#314). It re-drains using
+     *  the CURRENT [gatt]; if the link is already torn down ([gatt] is null) the drain is a no-op. */
+    private val drainCccdRetryRunnable = Runnable { gatt?.let { drainCccdQueue(it) } }
     /** Set once startSession() has fired the first command, so it runs exactly once per connection. */
     private var sessionStarted = false
 
@@ -699,9 +939,27 @@ class WhoopBleClient(
                 return
             }
         }
-        // Filter to the strap the user picked — a single service, so a WHOOP 4.0
-        // scan never lingers on a WHOOP 5/MG wrist (or the reverse). The user
-        // chooses the model before this runs.
+        startScan(model, allowFallback = true)
+    }
+
+    /**
+     * Start a service-filtered scan for [model], re-framing for its family so a fallback rotation
+     * decodes the strap it actually finds. When [allowFallback] is true, schedule a one-shot rotation
+     * to the other WHOOP family after [SCAN_FALLBACK_DELAY_MS] of no discovery — recovers reconnect
+     * when the persisted preference is stale after an update/restore. Discovery/connect cancels both
+     * the fallback and the not-found timeout. Port of macOS BLEManager.startScan(for:allowFallback:).
+     */
+    @SuppressLint("MissingPermission")
+    private fun startScan(model: WhoopModel, allowFallback: Boolean) {
+        handler.removeCallbacks(scanFallbackRunnable)
+        selectedModel = model
+        val sc = scanner ?: run {
+            log("No BLE scanner available")
+            _state.value = _state.value.copy(scanning = false, statusNote = "Bluetooth isn't ready yet. Try again in a moment.")
+            return
+        }
+        // Filter to the strap we're targeting — a single service, so a WHOOP 4.0
+        // scan never lingers on a WHOOP 5/MG wrist (or the reverse).
         val filters = listOf(
             ScanFilter.Builder().setServiceUuid(ParcelUuid(model.service)).build(),
         )
@@ -733,6 +991,10 @@ class WhoopBleClient(
         // Stop and explain if nothing turns up in time.
         handler.removeCallbacks(scanTimeoutRunnable)
         handler.postDelayed(scanTimeoutRunnable, SCAN_TIMEOUT_MS)
+        // Before the hard timeout, try the other family once in case the family preference is stale.
+        if (allowFallback) {
+            handler.postDelayed(scanFallbackRunnable, SCAN_FALLBACK_DELAY_MS)
+        }
     }
 
     /**
@@ -745,7 +1007,63 @@ class WhoopBleClient(
         handler.removeCallbacks(scanTimeoutRunnable)
         stopScan()
         _state.value = _state.value.copy(scanning = false, statusNote = null)
-        gatt?.disconnect()   // onConnectionStateChange(DISCONNECTED) does the teardown + close.
+        // disconnect() can throw on a dead binder (radio off, #314). If it does, the OS won't deliver
+        // onConnectionStateChange(DISCONNECTED), so tear down directly instead of crashing.
+        try {
+            gatt?.disconnect()   // onConnectionStateChange(DISCONNECTED) does the teardown + close.
+        } catch (t: Throwable) {
+            log("gatt.disconnect() threw ${t.javaClass.simpleName}; tearing down directly")
+            teardownAfterGattFailure()
+        }
+    }
+
+    /**
+     * The OS Bluetooth radio was turned OFF (or is turning off). #314: turning Bluetooth off does NOT
+     * deliver onConnectionStateChange(DISCONNECTED) for our GATT, so the orphaned link lingered —
+     * gatt/cmdCharacteristic stayed non-null, state.connected stayed true, and the UI kept showing live
+     * HR/buzz/sync that wasn't real (and the next write crashed on a dead binder). Called from
+     * [WhoopConnectionService]'s ACTION_STATE_CHANGED receiver. Runs the FULL teardown synchronously on
+     * the main looper so the UI flips to disconnected immediately. Idempotent — a no-op if already down.
+     *
+     * NOTE: the auto-reconnect that [teardownAfterGattFailure] suppresses (it sets intentionalDisconnect)
+     * is exactly what we want here too: the [connect] adapter.isEnabled gate would reject a reconnect
+     * while the radio is off anyway, and [onBluetoothRadioOn] re-arms the connect when it comes back.
+     */
+    fun onBluetoothRadioOff() {
+        handler.post {
+            if (gatt == null && !_state.value.connected) {
+                log("Bluetooth radio off — already disconnected")
+                return@post
+            }
+            log("Bluetooth radio turned off — tearing down the orphaned link (#314)")
+            teardownAfterGattFailure()
+            // teardownAfterGattFailure → handleDisconnect already publishes connected=false; make the
+            // "off" reason explicit for the UI so it reads "Bluetooth is off" rather than "Reconnecting…".
+            _state.value = _state.value.copy(
+                connected = false, scanning = false,
+                statusNote = "Bluetooth is off. Turn it on to reconnect.",
+            )
+        }
+    }
+
+    /**
+     * The OS Bluetooth radio came back ON. Resume the connection the user last had: reconnect directly
+     * to the remembered strap if we have one, else re-scan for the selected family. The connect path's
+     * own adapter.isEnabled gate is now satisfied. Called from the ACTION_STATE_CHANGED receiver.
+     */
+    fun onBluetoothRadioOn() {
+        handler.post {
+            if (gatt != null || _state.value.connected) return@post   // already (re)connected
+            val dev = lastDevice
+            if (dev != null) {
+                log("Bluetooth radio back on — reconnecting directly to the last strap")
+                intentionalDisconnect = false
+                connectToDevice(dev, autoConnect = true)
+            } else {
+                log("Bluetooth radio back on — rescanning for your ${selectedModel.displayName}")
+                connect(selectedModel)
+            }
+        }
     }
 
     /**
@@ -757,7 +1075,8 @@ class WhoopBleClient(
     fun prepareForModelSwitch() {
         disconnect()
         lastDevice = null   // don't auto-reconnect to the old strap; the next connect scans for the new model
-        _state.value = _state.value.copy(connected = false, bonded = false, encryptedBond = false)
+        _state.value = _state.value.copy(connected = false, bonded = false, encryptedBond = false,
+                                         r22FlagsAccepted = 0, deepPacketsThisSession = 0)   // #174 reset per session
     }
 
     /**
@@ -811,7 +1130,14 @@ class WhoopBleClient(
                 cmd != CommandNumber.SEND_HISTORICAL_DATA && cmd != CommandNumber.HISTORICAL_DATA_RESULT &&
                 cmd != CommandNumber.SET_CLOCK && cmd != CommandNumber.GET_CLOCK &&
                 cmd != CommandNumber.GET_DATA_RANGE &&
-                cmd != CommandNumber.SET_ALARM_TIME && cmd != CommandNumber.DISABLE_ALARM) {
+                cmd != CommandNumber.SET_ALARM_TIME && cmd != CommandNumber.DISABLE_ALARM &&
+                // SET_CONFIG (the R22 deep-stream unlock) is allowed ONLY while the deep-data experiment
+                // is opted in — it writes a persistent feature flag to the strap, so it must never fire
+                // on a default install. Reversible; driven only by enableWhoop5DeepData(). (#174)
+                !(cmd == CommandNumber.SET_CONFIG && puffinExperiment.isDeepDataEnabled) &&
+                // SET_DEVICE_CONFIG (the Broadcast-HR flag) is allowed ONLY while that opt-in is on.
+                // Reversible; driven only by setBroadcastHr(). (#181)
+                !(cmd == CommandNumber.SET_DEVICE_CONFIG && puffinExperiment.broadcastHr)) {
                 log("send(${cmd.name}) skipped — no WHOOP 5/MG framing for this command yet")
                 return
             }
@@ -869,9 +1195,11 @@ class WhoopBleClient(
             send(CommandNumber.GET_BATTERY_LEVEL)
             return
         }
+        val ops = gattOps ?: return
         val batt = g.getService(BATTERY_SERVICE)?.getCharacteristic(BATTERY_CHAR)
         if (batt != null && (batt.properties and BluetoothGattCharacteristic.PROPERTY_READ) != 0) {
-            g.readCharacteristic(batt)
+            // safeGatt: a dead binder here (radio off mid-link, #314) tears down instead of crashing.
+            safeGatt("readCharacteristic(battery)") { ops.readCharacteristicCompat(batt) }
             log("Reading standard Battery Level (0x2A19)")
         } else {
             log("Battery Level read unavailable; relying on notifications")
@@ -900,7 +1228,7 @@ class WhoopBleClient(
             log("Alarm: armed 5/MG rev4 EXPERIMENTAL (epoch $epochSec)")
             return
         }
-        send(CommandNumber.SET_CLOCK, setClockPayload())
+        sendSetClockBothForms()
         val e = epochSec.toInt()
         val payload = byteArrayOf(
             0x01,
@@ -931,8 +1259,22 @@ class WhoopBleClient(
     // MARK: Scanning
     // ====================================================================================
 
+    /** Persist the WHOOP family that actually advertised so a later launch/scan starts on the right
+     *  service — what makes a one-time fallback rotation stick. Mirrors macOS
+     *  `UserDefaults.set(rawValue, forKey: "selectedWhoopModel")`. Self-contained in the shared
+     *  noop_prefs store; failures are non-fatal (the rotation still worked this session). (PR#195) */
+    private fun persistSelectedModel(model: WhoopModel) {
+        try {
+            context.getSharedPreferences("noop_prefs", Context.MODE_PRIVATE)
+                .edit().putString("noop.selectedWhoopModel", model.name).apply()
+        } catch (t: Throwable) {
+            log("Couldn't persist selected model: ${t.message}")
+        }
+    }
+
     @SuppressLint("MissingPermission")
     private fun stopScan() {
+        handler.removeCallbacks(scanFallbackRunnable)
         if (!scanning) return
         scanning = false
         try {
@@ -949,8 +1291,13 @@ class WhoopBleClient(
             val device: BluetoothDevice = result.device
             val name = result.scanRecord?.deviceName ?: device.name ?: "unknown"
             log("Discovered $name (rssi ${result.rssi}) — connecting")
-            // Found it: cancel the not-found timeout and reflect progress in the UI.
+            // Found it: cancel the not-found timeout AND the family-rotation fallback, then reflect
+            // progress in the UI. (PR#195)
             handler.removeCallbacks(scanTimeoutRunnable)
+            handler.removeCallbacks(scanFallbackRunnable)
+            // Persist the family that actually advertised so the next scan starts on the right service —
+            // this is what makes a one-time rotation stick after a stale-preference reconnect. (PR#195)
+            persistSelectedModel(selectedModel)
             _state.value = _state.value.copy(statusNote = "Found $name, connecting…")
             // Port of didDiscover: stop scanning, then connect to this peripheral.
             stopScan()
@@ -996,8 +1343,10 @@ class WhoopBleClient(
     @SuppressLint("MissingPermission")
     private fun kickServiceDiscovery(g: BluetoothGatt, reason: String) {
         if (!serviceDiscoveryKicked.compareAndSet(false, true)) return
+        val ops = gattOps ?: return
         log("Discovering services ($reason)")
-        g.discoverServices()
+        // safeGatt: discovery on a dead binder (radio off, #314) tears down rather than crashing.
+        safeGatt("discoverServices") { ops.discoverServicesCompat() }
     }
 
     @SuppressLint("MissingPermission")
@@ -1007,7 +1356,8 @@ class WhoopBleClient(
         // Remember the device so a later dropout can reconnect straight to it (#61).
         lastDevice = device
         // Close any prior/pending GATT so a direct-reconnect attempt doesn't leak the old client.
-        gatt?.close()
+        // close() can throw on a dead binder (#314); swallow it — we're replacing the handle anyway.
+        try { gatt?.close() } catch (t: Throwable) { log("prior gatt.close() threw ${t.javaClass.simpleName} (ignored)") }
         // autoConnect=false → a fast, direct connect (CoreBluetooth central.connect default), used for
         // the scan-discovered first connect. autoConnect=true → the OS reconnects whenever the bonded
         // strap is reachable WITHOUT needing an advertisement (used by the dropout auto-reconnect, #61).
@@ -1036,6 +1386,7 @@ class WhoopBleClient(
             else ->
                 device.connectGatt(context, autoConnect, gattCallback)
         }
+        gattOps = gatt?.let { gattOpsFactory(it) }
     }
 
     // ====================================================================================
@@ -1052,14 +1403,29 @@ class WhoopBleClient(
                     handler.removeCallbacks(scanTimeoutRunnable)
                     _state.value = _state.value.copy(connected = true, scanning = false, statusNote = null, encryptedBond = false, reconnectGuide = null)
                     serviceDiscoveryKicked.set(false)
+                    // Capture link signal strength (logged via onReadRemoteRssi) — the scan
+                    // "Discovered … (rssi …)" line never fires on a direct/auto-reconnect, so a weak-link
+                    // sync (drops, busy storms) is otherwise undiagnosable. DEFERRED past the connect
+                    // handshake: Android runs ONE GATT op at a time, so reading RSSI here (before
+                    // requestMtu) could make requestMtu return false → MTU skipped → offload capped. A
+                    // stray read after setup is harmless (just no RSSI line). (PR #241)
+                    // safeGatt: a late RSSI read can land just after the radio went off (#314) — guard it.
+                    handler.postDelayed({
+                        gattOps?.let { safeGatt("readRemoteRssi") { it.readRemoteRssiCompat() } }
+                    }, RSSI_READ_DELAY_MS)
                     // Request the larger MTU BEFORE discovery/subscribe so the offload isn't capped at
                     // 20-byte notifications (the official app does this in its GATT init). Discovery is
                     // gated on the result with a fallback timeout, so a stack that ignores requestMtu
                     // can't stall the connect. (PR #85)
-                    if (g.requestMtu(GATT_MTU)) {
+                    val mtuOps = gattOps
+                    val mtuOk = mtuOps != null &&
+                        safeGatt("requestMtu") { mtuOps.requestMtuCompat(GATT_MTU) }
+                    if (mtuOk) {
                         log("Connected — requesting MTU $GATT_MTU before discovery")
                         handler.postDelayed({ kickServiceDiscovery(g, "mtu timeout") }, MTU_FALLBACK_MS)
-                    } else {
+                    } else if (gatt != null) {
+                        // requestMtu returned false (stack ignored it) but the link is still alive —
+                        // discover directly. If safeGatt tore down (dead binder), gatt is null: skip.
                         kickServiceDiscovery(g, "requestMtu rejected")
                     }
                 }
@@ -1075,6 +1441,12 @@ class WhoopBleClient(
             // idempotent, so a late callback after the fallback timeout already fired is a no-op. (PR #85)
             log("MTU negotiated: $mtu (status=$status)")
             kickServiceDiscovery(g, "mtu=$mtu")
+        }
+
+        override fun onReadRemoteRssi(g: BluetoothGatt, rssi: Int, status: Int) {
+            // Signal strength at connect — diagnoses weak-link syncs (drops/busy storms/timeouts) that
+            // otherwise look mysterious in the log. Only on a clean read; a failure just stays silent.
+            if (status == BluetoothGatt.GATT_SUCCESS) log("Signal: RSSI $rssi dBm")
         }
 
         @SuppressLint("MissingPermission")
@@ -1159,7 +1531,7 @@ class WhoopBleClient(
                 // "succeed" with zero body frames. Hardware-validated ordering: CLIENT_HELLO →
                 // subscribe puffin chars → clock → history. (#78 fork)
                 drainCccdQueue(g)
-                if (wantsRealtime) send(CommandNumber.TOGGLE_REALTIME_HR, byteArrayOf(1))
+                if (wantsRealtime) { realtimeArmed = true; send(CommandNumber.TOGGLE_REALTIME_HR, byteArrayOf(1)) }
             } else if (!didBond && connectedFamily == DeviceFamily.WHOOP4) {
                 didBond = true
                 _state.value = _state.value.copy(bonded = true, encryptedBond = true)   // WHOOP4 bond is genuine (#69)
@@ -1261,6 +1633,7 @@ class WhoopBleClient(
                 // Reassemble (no-op for already-complete frames) then route each complete frame.
                 // Port of: for frame in reassembler.feed(bytes) { router.handle(frame:) }.
                 for (frame in reassembler.feed(bytes)) {
+                    noteWhoop5R22Telemetry(frame, backfilling && isOffloadFrame(frame, connectedFamily))  // #174
                     handleFrame(frame)              // UI (always) — port of router.handle(frame:)
 
                     // Capture the strap's newest stored record from a GET_DATA_RANGE reply, feeding
@@ -1303,6 +1676,48 @@ class WhoopBleClient(
     }
 
     /**
+     * EXPERIMENTAL R22 telemetry (#174) — port of macOS BLEManager.noteWhoop5R22Telemetry.
+     * (1) A COMMAND_RESPONSE (type 0x24) to a SET_CONFIG (0x78) = the strap ACKing one enable_r22 flag.
+     * (2) A type-0x2F record OUTSIDE a history offload = the R22 deep biometric stream flowing live.
+     * 5/MG puffin layout: packet_type @ byte 8, the responded-to cmd @ byte 10.
+     *
+     * #174 cooldown: when an offload ENDS, the strap can keep flushing a few trailing type-0x2F records
+     * AFTER `backfilling` has already flipped false. Those are tail-end HISTORY, not live — counting
+     * them as "live deep packets" was a false positive. So we stamp [lastOffloadFrameAtMs] on every
+     * offload frame (and at HISTORY_COMPLETE) and refuse to count a non-offload 0x2F as live within
+     * [DEEP_PACKET_LIVE_COOLDOWN_MS] of it. The flag-ACK counting (1) is unchanged.
+     */
+    private fun noteWhoop5R22Telemetry(frame: ByteArray, duringOffload: Boolean) {
+        if (frame.size <= 10) return
+        val type = frame[8].toInt() and 0xFF
+        if (type == 0x24 && (frame[10].toInt() and 0xFF) == CommandNumber.SET_CONFIG.rawValue) {
+            val n = _state.value.r22FlagsAccepted + 1
+            _state.value = _state.value.copy(r22FlagsAccepted = n)
+            val total = Whoop5Config.enableR22Sequence.size
+            if (n == total) log("Deep-data: strap ACCEPTED all $n/$total R22 flags ✓ — keep it on; watching for deep packets.")
+        }
+        if (type == 0x2F) {
+            if (duringOffload) {
+                // Trailing-history reference point: a 0x2F during the offload is banked history. Remember
+                // when it landed so the cooldown below can discount the few that dribble in after the end.
+                lastOffloadFrameAtMs = System.currentTimeMillis()
+                return
+            }
+            // Cooldown guard: a 0x2F within DEEP_PACKET_LIVE_COOLDOWN_MS of the last offload
+            // frame/HISTORY_COMPLETE is a trailing historical record, not the live R22 stream.
+            if (lastOffloadFrameAtMs != 0L &&
+                System.currentTimeMillis() - lastOffloadFrameAtMs < DEEP_PACKET_LIVE_COOLDOWN_MS
+            ) {
+                return
+            }
+            val n = _state.value.deepPacketsThisSession + 1
+            _state.value = _state.value.copy(deepPacketsThisSession = n)
+            if (n == 1) log("Deep-data: 🎯 FIRST live deep (R22, type-0x2F) packet received — please keep wearing it and share your strap log on #174.")
+            else if (n % 50 == 0) log("Deep-data: $n live deep (type-0x2F) packets this session.")
+        }
+    }
+
+    /**
      * Pure decode→state router for one COMPLETE frame.
      * Direct port of `FrameRouter.handle(frame:)`.
      */
@@ -1320,8 +1735,9 @@ class WhoopBleClient(
                 }
                 // The realtime stream usually reports rr_count=0; only update R-R when this frame
                 // actually carries intervals, so we don't wipe R-R sourced from the 0x2A37 profile.
+                // withRRIntervals also feeds the Live console's rolling rrRecent buffer.
                 intArrayValue(parsed.parsed["rr_intervals"])?.let { rr ->
-                    if (rr.isNotEmpty()) _state.value = _state.value.copy(rr = rr)
+                    if (rr.isNotEmpty()) _state.value = _state.value.withRRIntervals(rr)
                 }
             }
 
@@ -1464,8 +1880,9 @@ class WhoopBleClient(
             }
         }
 
-        // R-R: the standard profile is the reliable source — surface whenever present.
-        if (rr.isNotEmpty()) _state.value = _state.value.copy(rr = rr)
+        // R-R: the standard profile is the reliable source — surface whenever present. withRRIntervals
+        // also feeds the Live console's rolling rrRecent buffer.
+        if (rr.isNotEmpty()) _state.value = _state.value.withRRIntervals(rr)
         // HR: accept only physiologically plausible values; reject 0/garbage (off-wrist).
         if (hr in 30..220) {
             _state.value = _state.value.copy(heartRate = hr)
@@ -1508,8 +1925,12 @@ class WhoopBleClient(
      */
     private fun runConnectHandshake() {
         send(CommandNumber.GET_HELLO_HARVARD)
-        send(CommandNumber.SET_CLOCK, setClockPayload())
-        send(CommandNumber.GET_CLOCK, byteArrayOf())               // strap expects an EMPTY payload
+        sendSetClockBothForms()
+        // GET_CLOCK's payload length is firmware-specific, exactly like SET_CLOCK's: newer firmware
+        // answers the EMPTY form and ignores [0x00], while fw 41.17.x answers [0x00] and ignores the
+        // empty form (#120). Send both — the strap answers whichever its firmware accepts.
+        send(CommandNumber.GET_CLOCK, byteArrayOf())               // empty form (newer firmware)
+        send(CommandNumber.GET_CLOCK, byteArrayOf(0))              // [0x00] form (fw 41.17.x, #120)
         send(CommandNumber.SEND_R10_R11_REALTIME, byteArrayOf(0))  // stop the type-43 realtime flood
         send(CommandNumber.GET_DATA_RANGE)                          // refresh stored range
         log("Connect handshake sent (hello/set-clock/get-clock/stop-raw/get-range)")
@@ -1523,8 +1944,10 @@ class WhoopBleClient(
         startBackfillTimer()
         startKeepAlive()
         // Arm realtime HR now if a screen already wants it (Live/Health Monitor opened before the bond
-        // completed) — otherwise the stream would only start at the next keep-alive tick (issue #18).
-        if (wantsRealtime) send(CommandNumber.TOGGLE_REALTIME_HR, byteArrayOf(1))
+        // completed) OR the continuous-capture preference wants it — otherwise the stream would only
+        // start at the next keep-alive tick (issue #18). Mark it armed so reconcileRealtime() tracks the
+        // edge correctly (the strap forgot the toggle across the disconnect; reset() cleared realtimeArmed).
+        if (wantsRealtime) { realtimeArmed = true; send(CommandNumber.TOGGLE_REALTIME_HR, byteArrayOf(1)) }
     }
 
     // ====================================================================================
@@ -1567,7 +1990,14 @@ class WhoopBleClient(
                 // disconnect re-bonds and resumes streaming (the automatic version of the manual fix).
                 log("No data for ${silentMs / 1000}s — bouncing link to resume live stream")
                 intentionalDisconnect = false    // make sure the auto-reconnect fires
-                gatt?.disconnect()               // → handleDisconnect → reset() (cancels this) → reconnect
+                // disconnect() throwing on a dead binder (#314) would crash from the keep-alive timer;
+                // tear down directly so the bounce degrades to a clean disconnect.
+                try {
+                    gatt?.disconnect()           // → handleDisconnect → reset() (cancels this) → reconnect
+                } catch (t: Throwable) {
+                    log("keep-alive bounce: gatt.disconnect() threw ${t.javaClass.simpleName}; tearing down")
+                    teardownAfterGattFailure()
+                }
             } else {
                 // Recover a silently-dropped subscription once the stream has gone quiet (any family) —
                 // but only ONCE per quiet episode. Re-subscribing all notify chars every 30s tick floods
@@ -1581,7 +2011,7 @@ class WhoopBleClient(
                 // screen wants it), and poll battery (~60s) — which also keeps the link warm. A 5/MG
                 // strap rejects WHOOP4-framed commands, so we skip them and rely on re-subscribe + bounce.
                 if (connectedFamily == DeviceFamily.WHOOP4) {
-                    if (wantsRealtime) send(CommandNumber.TOGGLE_REALTIME_HR, byteArrayOf(1))
+                    if (wantsRealtime) { realtimeArmed = true; send(CommandNumber.TOGGLE_REALTIME_HR, byteArrayOf(1)) }
                     keepAliveTick += 1
                     if (keepAliveTick % 2 == 0) send(CommandNumber.GET_BATTERY_LEVEL)
                 }
@@ -1615,32 +2045,128 @@ class WhoopBleClient(
     }
 
     /**
-     * The Live screen wants realtime HR. Remember it ([wantsRealtime]) so the keep-alive keeps
-     * re-arming the stream so it can't lapse, and kick it now. Port of `BLEManager.startRealtime`.
+     * The Live screen wants realtime HR. Records the screen want and reconciles. Port of
+     * `BLEManager.startRealtime`.
      */
     fun startRealtime() {
-        wantsRealtime = true
-        // Both families arm via TOGGLE_REALTIME_HR; send() frames it correctly per family (puffin for
-        // 5/MG). The toggle only reaches a 5/MG strap once bonded — the post-bond branch arms it too.
-        if (connectedFamily == DeviceFamily.WHOOP4 || _state.value.bonded) {
-            send(CommandNumber.TOGGLE_REALTIME_HR, byteArrayOf(1))
-        }
+        screenWantsRealtime = true
+        reconcileRealtime()
     }
 
-    /** The Live screen no longer needs realtime HR; stop re-arming it. Port of `BLEManager.stopRealtime`. */
+    /** The Live screen no longer needs realtime HR; clear its want and reconcile. The stream stays armed
+     *  if the continuous-capture preference ([keepStreamForData]) still wants it. Port of
+     *  `BLEManager.stopRealtime`. */
     fun stopRealtime() {
-        wantsRealtime = false
-        if (connectedFamily == DeviceFamily.WHOOP4 || _state.value.bonded) {
-            send(CommandNumber.TOGGLE_REALTIME_HR, byteArrayOf(0))
+        screenWantsRealtime = false
+        reconcileRealtime()
+    }
+
+    /** The "Continuous HRV capture" preference flipped: hold the realtime stream open with no Live screen
+     *  visible (true) or release it (false), then reconcile. Wired from [com.noop.ui.AppViewModel] and
+     *  gated there on the background-connection preference. Mirrors the Swift `setKeepRealtimeForData`. */
+    fun setKeepStreamForData(keep: Boolean) {
+        keepStreamForData = keep
+        reconcileRealtime()
+    }
+
+    /**
+     * Single reconciler for the realtime-HR stream. The stream should be armed while EITHER a screen
+     * wants it ([screenWantsRealtime]) OR the continuous-capture preference wants it ([keepStreamForData]).
+     * We arm (TOGGLE_REALTIME_HR 1) / disarm (TOGGLE_REALTIME_HR 0) ONLY on the false↔true edge of that
+     * derived want — so a Live screen closing while the preference still wants it does NOT disarm, and
+     * turning the preference off with no screen open DOES disarm. The toggle only reaches the strap once
+     * it's a WHOOP4 (custom channels are open immediately) or a bonded 5/MG (puffin framing); otherwise
+     * the want is remembered and the post-bond branch arms it. Port of `BLEManager.reconcileRealtime`.
+     */
+    private fun reconcileRealtime() {
+        val want = screenWantsRealtime || keepStreamForData
+        wantsRealtime = want   // the keep-alive + post-bond arm-on-connect read this derived value
+        if (want == realtimeArmed) return                          // no edge — nothing to send
+        if (connectedFamily != DeviceFamily.WHOOP4 && !_state.value.bonded) return   // can't reach the strap yet
+        realtimeArmed = want
+        // Both families arm/disarm via TOGGLE_REALTIME_HR; send() frames it correctly per family (puffin
+        // for 5/MG). A screen re-entry blanks its own smoothing window in the view-model, not here.
+        send(CommandNumber.TOGGLE_REALTIME_HR, byteArrayOf(if (want) 1.toByte() else 0.toByte()))
+    }
+
+    /**
+     * EXPERIMENTAL (#181): make the strap advertise its heart rate as a standard BLE HR sensor by
+     * writing the device-config flag whoop_live_hr_in_adv_ind_pkt = "1" (on) / "0" (off) via
+     * SET_DEVICE_CONFIG (0x77). Validated on real hardware: with it on, the strap advertises 0x180D +
+     * the live HR in its manufacturer data, so a Garmin (Edge/watch), Zwift or gym HR client pairs to it
+     * directly. Reversible; opt-in. Mirrors `BLEManager.setBroadcastHr`. (Broadcast HR)
+     */
+    fun setBroadcastHr(on: Boolean) {
+        if (connectedFamily != DeviceFamily.WHOOP5) {
+            log("Broadcast HR: needs a WHOOP 5.0/MG strap — ignored."); return
         }
+        val s = _state.value
+        if (!s.connected || !s.bonded) {
+            log("Broadcast HR: connect and bond a 5/MG strap first — ignored."); return
+        }
+        val value = if (on) 0x31 else 0x30   // ASCII '1' / '0'
+        send(
+            CommandNumber.SET_DEVICE_CONFIG,
+            byteArrayOf(0x01) + Whoop5Config.deviceConfigBody("whoop_live_hr_in_adv_ind_pkt", value),
+            withResponse = true,
+        )
+        log("Broadcast HR: wrote whoop_live_hr_in_adv_ind_pkt=" + (if (on) "1" else "0"))
+    }
+
+    /**
+     * EXPERIMENTAL (#174): write the official app's `enable_r22_*` SET_CONFIG sequence to a bonded
+     * WHOOP 5/MG to switch on the deep biometric (type-0x2F "R22") streams the strap withholds from a
+     * fresh third-party connection. Exact 15-flag sequence + values built byte-for-byte by
+     * [Whoop5Config] (documented by judes.club + Asherlc/dofek). Port of `BLEManager.enableWhoop5DeepData`.
+     *
+     * Safety: only runs when the deep-data experiment is opted in AND the strap is a bonded, worn 5/MG.
+     * The R22 stream is on-wrist gated. Each flag is one SET_CONFIG write WITH RESPONSE, spaced ~80 ms.
+     * Reversible — it only changes which data the strap emits. After it runs, wear + sync and share the
+     * strap log so we can confirm the deeper records start flowing.
+     */
+    fun enableWhoop5DeepData() {
+        if (connectedFamily != DeviceFamily.WHOOP5) {
+            log("Deep-data: needs a WHOOP 5.0/MG strap — ignored."); return
+        }
+        if (!puffinExperiment.isDeepDataEnabled) {
+            log("Deep-data: the deep-data experiment is off — enable it in Settings first."); return
+        }
+        val s = _state.value
+        if (!s.connected || !s.encryptedBond) {
+            // The R22 SET_CONFIG writes go over the encrypted command channel, so the live-HR-only
+            // shortcut (bonded true, encryptedBond false on a 5/MG still owned by the official app,
+            // #69/#266) can't carry them. Require the genuine bond, or the writes silently fail (#269).
+            log("Deep-data: needs the full encrypted bond, not the live-HR-only link. Close the official WHOOP app, put the strap in pairing mode, and bond it to NOOP first — ignored."); return
+        }
+        if (!s.worn) {
+            log("Deep-data: the R22 stream is on-wrist only — put the strap ON, then try again."); return
+        }
+        _state.value = _state.value.copy(r22FlagsAccepted = 0)   // fresh attempt
+        val flags = Whoop5Config.enableR22Sequence
+        log("Deep-data: sending the ${flags.size}-flag enable_r22 sequence (experimental, reversible)…")
+        flags.forEachIndexed { i, flag ->
+            handler.postDelayed({
+                send(
+                    CommandNumber.SET_CONFIG,
+                    byteArrayOf(0x01) + Whoop5Config.payloadBody(flag.name, flag.value),
+                    withResponse = true,
+                )
+            }, 80L * i)
+        }
+        handler.postDelayed({
+            log("Deep-data: sequence sent. Keep the strap on, let it sync, then share your strap log — we're looking for new deep records (type-0x2F) to start arriving. (#174)")
+        }, 80L * flags.size + 200L)
     }
 
     /**
      * SET_CLOCK(10) payload = the strap's 8-byte form: [seconds u32 LE][subseconds u32 LE].
-     * Port of `BLEManager.setClockPayload`. A wrong-length SET_CLOCK is ack'd but NOT latched.
+     * Port of `BLEManager.setClockPayload`. The payload LENGTH is firmware-specific: newer WHOOP 4
+     * firmware latches this form, but fw 41.17.x ignores it (no COMMAND_RESPONSE, RTC unchanged) and
+     * latches only the legacy 9-byte form below. A strap that misses the set keeps an invalid RTC and
+     * stops banking sensor data to flash, surfacing as endless console-only syncs (#120). Send WHOOP 4
+     * through [sendSetClockBothForms] so either firmware latches.
      */
-    private fun setClockPayload(): ByteArray {
-        val now = (System.currentTimeMillis() / 1000L)
+    private fun setClockPayload(now: Long = System.currentTimeMillis() / 1000L): ByteArray {
         return byteArrayOf(
             (now and 0xFF).toByte(),
             ((now shr 8) and 0xFF).toByte(),
@@ -1648,6 +2174,37 @@ class WhoopBleClient(
             ((now shr 24) and 0xFF).toByte(),
             0, 0, 0, 0,
         )
+    }
+
+    /**
+     * SET_CLOCK(10) payload — the legacy 9-byte form `[seconds u32 LE][5 zero]` required by WHOOP 4
+     * fw 41.17.x, which ignores the 8-byte form. Port of `BLEManager.setClockPayloadLegacy`. On a
+     * strap whose RTC was stuck in the past, the 8-byte form drew no response while the 9-byte form was
+     * ack'd, latched, and resumed flash banking (#120). On newer firmware this form is ack'd but NOT
+     * latched, so it's a no-op there — both forms carry the same seconds.
+     */
+    private fun setClockPayloadLegacy(now: Long = System.currentTimeMillis() / 1000L): ByteArray {
+        return byteArrayOf(
+            (now and 0xFF).toByte(),
+            ((now shr 8) and 0xFF).toByte(),
+            ((now shr 16) and 0xFF).toByte(),
+            ((now shr 24) and 0xFF).toByte(),
+            0, 0, 0, 0, 0,
+        )
+    }
+
+    /**
+     * Send SET_CLOCK in every payload form the WHOOP 4 firmware family is known to accept (8-byte for
+     * newer firmware, 9-byte for 41.17.x — each a no-op on the other). Both carry the same `now`, so
+     * double-latching is harmless. WHOOP 5/MG keeps its single hardware-validated 8-byte send, so the
+     * legacy form is gated to WHOOP 4. Port of `BLEManager.sendSetClockBothForms`. (#120)
+     */
+    private fun sendSetClockBothForms(withResponse: Boolean = false) {
+        val now = System.currentTimeMillis() / 1000L
+        send(CommandNumber.SET_CLOCK, setClockPayload(now), withResponse = withResponse)
+        if (selectedModel == WhoopModel.WHOOP4) {
+            send(CommandNumber.SET_CLOCK, setClockPayloadLegacy(now), withResponse = withResponse)
+        }
     }
 
     // ====================================================================================
@@ -1668,7 +2225,8 @@ class WhoopBleClient(
             return
         }
         if (writeInFlight) return
-        val g = gatt ?: return
+        gatt ?: return
+        val ops = gattOps ?: return
         val ch = cmdCharacteristic ?: return
         // A frame rejected BUSY last tick takes priority so it keeps its place in the command sequence.
         val item = pendingRetry ?: writeQueue.poll() ?: return
@@ -1681,15 +2239,12 @@ class WhoopBleClient(
             BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
         }
 
-        val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            g.writeCharacteristic(ch, item.frame, writeType) == BluetoothGatt.GATT_SUCCESS
-        } else {
-            @Suppress("DEPRECATION")
-            run {
-                ch.writeType = writeType
-                ch.value = item.frame
-                g.writeCharacteristic(ch)
-            }
+        // safeGatt: a throw here means the binder died (radio turned off mid-link, #314) — it tears the
+        // link down and returns false. After teardown the queues are cleared and gatt is null, so the
+        // recursive re-drain below immediately no-ops; we don't fall through into a retry against a dead
+        // binder.
+        val ok = safeGatt("writeCharacteristic") {
+            ops.writeCharacteristicCompat(ch, item.frame, writeType)
         }
 
         if (!ok) {
@@ -1697,14 +2252,18 @@ class WhoopBleClient(
             // worst when the slot was freed too eagerly). Re-hold THIS frame and retry shortly instead
             // of dropping it: a dropped TOGGLE_REALTIME_HR / SET_CLOCK / offload-ack silently breaks
             // live HR, the clock, or the backfill (issue #77 — a Pixel 7 on Android 16 saw exactly this).
+            // If safeGatt already tore down (dead binder), gatt is now null — bail before scheduling a
+            // retry that would re-enter the dead write.
             writeInFlight = false
+            if (gatt == null) return
             if (writeRetries < MAX_WRITE_RETRIES) {
                 writeRetries++
                 log("writeCharacteristic busy; retry $writeRetries/$MAX_WRITE_RETRIES")
                 pendingRetry = item
                 // Escalating backoff (12, 24, … capped ~96ms) — ride out a congestion spike instead of
-                // exhausting the budget in a few tens of ms while the stack is still busy (#77).
-                handler.postDelayed({ drainWriteQueue() }, WRITE_RETRY_DELAY_MS * minOf(writeRetries, 8))
+                // exhausting the budget in a few tens of ms while the stack is still busy (#77). NAMED
+                // runnable so teardown can cancel a pending retry (#314).
+                handler.postDelayed(drainWriteRetryRunnable, WRITE_RETRY_DELAY_MS * minOf(writeRetries, 8))
             } else {
                 // Genuinely stuck after several tries — drop this one frame so it can't wedge the queue.
                 log("writeCharacteristic rejected by stack; dropping one frame (after $MAX_WRITE_RETRIES retries)")
@@ -1732,20 +2291,15 @@ class WhoopBleClient(
      */
     @SuppressLint("MissingPermission")
     private fun writeBondFrame(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
+        val ops = gattOps ?: return
         seq = (seq + 1) and 0xFF
         val bondFrame = Framing.buildCommand(CommandNumber.GET_BATTERY_LEVEL, byteArrayOf(0), seq)
         log("Bonding: confirmed write GET_BATTERY_LEVEL to 61080002")
         writeInFlight = true   // hold the slot until onCharacteristicWrite fires (with response).
-        val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            g.writeCharacteristic(ch, bondFrame, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) ==
-                BluetoothGatt.GATT_SUCCESS
-        } else {
-            @Suppress("DEPRECATION")
-            run {
-                ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                ch.value = bondFrame
-                g.writeCharacteristic(ch)
-            }
+        // safeGatt: a throw means the binder died (#314) — teardown, return false, fall into the
+        // "rejected" branch which just clears the (now-stale) in-flight slot.
+        val ok = safeGatt("writeBondFrame") {
+            ops.writeCharacteristicCompat(ch, bondFrame, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
         }
         if (!ok) {
             writeInFlight = false
@@ -1763,6 +2317,7 @@ class WhoopBleClient(
     @SuppressLint("MissingPermission")
     private fun writeClientHello(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
         val hello = DeviceFamily.WHOOP5.clientHello ?: return
+        val ops = gattOps ?: return
         // CONFIRMED (with-response) write — mirrors the macOS v1.5 fix and the hardware-verified finding
         // that the CLIENT_HELLO confirmed write triggers the strap's just-works bond. A 5/MG strap won't
         // stream HR (even over the standard 0x2A37 profile) on an UNauthenticated link, so the old
@@ -1770,16 +2325,8 @@ class WhoopBleClient(
         // Hold the slot until the ACK; the opt-in puffin probe now fires post-bond (onCharacteristicWrite).
         log("WHOOP 5/MG: writing CLIENT_HELLO to fd4b0002 with response (to trigger bonding, experimental).")
         writeInFlight = true
-        val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            g.writeCharacteristic(ch, hello, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) ==
-                BluetoothGatt.GATT_SUCCESS
-        } else {
-            @Suppress("DEPRECATION")
-            run {
-                ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                ch.value = hello
-                g.writeCharacteristic(ch)
-            }
+        val ok = safeGatt("writeClientHello") {
+            ops.writeCharacteristicCompat(ch, hello, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
         }
         if (!ok) {
             writeInFlight = false
@@ -1844,11 +2391,16 @@ class WhoopBleClient(
             startSession(g)
             return
         }
+        val ops = gattOps ?: return
         cccdInFlight = true
 
         // Tell the local stack to surface notifications, then write the CCCD so the remote starts
-        // sending them. CoreBluetooth's setNotifyValue(true) does both implicitly.
-        g.setCharacteristicNotification(ch, true)
+        // sending them. CoreBluetooth's setNotifyValue(true) does both implicitly. Both are routed
+        // through safeGatt so a dead binder (#314) tears down instead of crashing.
+        val notifyOk = safeGatt("setCharacteristicNotification") {
+            ops.setCharacteristicNotificationCompat(ch, true)
+        }
+        if (!notifyOk && gatt == null) return   // safeGatt tore down — link is gone
         val cccd = ch.getDescriptor(CCCD)
         if (cccd == null) {
             log("No CCCD on ${ch.uuid}; skipping")
@@ -1857,24 +2409,20 @@ class WhoopBleClient(
             return
         }
         val enableValue = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-        val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            g.writeDescriptor(cccd, enableValue) == BluetoothGatt.GATT_SUCCESS
-        } else {
-            @Suppress("DEPRECATION")
-            run {
-                cccd.value = enableValue
-                g.writeDescriptor(cccd)
-            }
+        val ok = safeGatt("writeDescriptor") {
+            ops.writeDescriptorCompat(cccd, enableValue)
         }
         if (!ok) {
             cccdInFlight = false
+            if (gatt == null) return   // safeGatt tore down — don't schedule a retry against a dead link
             if (cccdRetries < MAX_CCCD_RETRIES) {
                 // Transient BUSY (the stack slot hasn't freed): re-queue this subscribe and retry
-                // shortly. Order among the notify chars doesn't matter, so re-add at the tail.
+                // shortly. Order among the notify chars doesn't matter, so re-add at the tail. NAMED
+                // runnable so teardown can cancel a pending retry (#314).
                 cccdRetries++
                 log("writeDescriptor busy for ${ch.uuid}; retry $cccdRetries/$MAX_CCCD_RETRIES")
                 cccdQueue.add(ch)
-                handler.postDelayed({ drainCccdQueue(g) }, CCCD_RETRY_DELAY_MS)
+                handler.postDelayed(drainCccdRetryRunnable, CCCD_RETRY_DELAY_MS)
             } else {
                 log("writeDescriptor rejected for ${ch.uuid} (gave up after $MAX_CCCD_RETRIES retries)")
                 drainCccdQueue(g)
@@ -2000,6 +2548,8 @@ class WhoopBleClient(
             startWhoop5BackfillCapture()
         }
         if (connectedFamily == DeviceFamily.WHOOP5) {
+            // Re-apply the Broadcast-HR device-config flag if the user opted in (#181).
+            if (PuffinExperiment.from(context).broadcastHr) setBroadcastHr(true)
             // Goose parity, hardware-validated (#78 fork): query the strap's stored range first and
             // fire the transfer on its SUCCESS response (PENDING precedes it). FAIL-OPEN: real
             // hardware sometimes swallows the first GET_DATA_RANGE entirely, so a 2s fallback fires
@@ -2133,35 +2683,52 @@ class WhoopBleClient(
     private fun exitBackfilling(reason: String) {
         if (!backfilling) return
         backfilling = false
+        // #174: a backfill just ended. Start (or extend) the deep-packet cooldown from this instant so
+        // any type-0x2F records the strap flushes in the seconds after the session aren't miscounted as
+        // the live R22 stream — they're the offload's tail.
+        lastOffloadFrameAtMs = System.currentTimeMillis()
         // Record an honest sync outcome so a cloud-free user can tell sync is working (or stuck):
         // HISTORY_COMPLETE stamps lastSyncAt + clears any error; an idle-watchdog timeout surfaces a
         // non-silent error. A plain disconnect mid-sync leaves both as-is (not a failure — the next
         // connect re-offloads). The freshly-published count is preserved as the progress read. (PR #85)
         val nowSec = System.currentTimeMillis() / 1000L
-        // #77 family: a sync that COMPLETED but banked no sensor records across many console-only
-        // chunks ⇒ the strap isn't saving to flash (its RTC lost sync). Surface the actionable fix
-        // instead of a silent "synced". A caught-up strap (few/no console chunks) doesn't trip this.
-        val emptyBanking = reason == "HISTORY_COMPLETE" &&
-            decodedChunksThisSession == 0 && consoleChunksThisSession >= 3
+        // #77 / #214 family: a sync that COMPLETED but banked NO sensor records ⇒ the strap isn't
+        // saving to flash (its RTC lost sync). Surface the actionable fix instead of a silent "synced".
+        // The signal had ONE shape — console-only across ≥3 chunks — so a NEAR-EMPTY completion
+        // (metadata-only ENDs, zero rows persisted, FEWER than 3 console frames) slipped through to the
+        // silent branch (#214). Broaden it: a HISTORY_COMPLETE that decoded nothing AND persisted ZERO
+        // sensor rows is ALSO "banked nothing", regardless of console-frame count. The #126 guard is
+        // unchanged — the banner still only fires once SUSTAINED — so a genuinely caught-up strap that
+        // banked rows on an earlier cycle won't trip it.
+        val (bankedSensorRecords, bankedNothingRaw) = classifyCompletedOffload(
+            decodedChunks = decodedChunksThisSession,
+            consoleChunks = consoleChunksThisSession,
+            rowsPersisted = backfiller.sessionRowsPersisted,
+        )
+        val bankedNothing = reason == "HISTORY_COMPLETE" && bankedNothingRaw
         // #126: only escalate to the clock-lost banner once emptiness is SUSTAINED. A banking cycle (any
-        // decoded records) clears the streak, so a single transient empty cycle on a healthy strap stays
-        // silent. Track on every completed sync so banking cycles reset it.
+        // decoded records / rows persisted) clears the streak, so a single transient empty cycle on a
+        // healthy strap stays silent. Track on every completed sync so banking cycles reset it.
         val sustainedEmpty = if (reason == "HISTORY_COMPLETE")
             emptySyncTracker.recordCompletedSync(
-                bankedSensorRecords = decodedChunksThisSession > 0,
-                consoleOnly = decodedChunksThisSession == 0 && consoleChunksThisSession >= 3,
+                bankedSensorRecords = bankedSensorRecords,
+                consoleOnly = bankedNothingRaw,
             ) else false
-        if (emptyBanking) log(
-            "Backfill: completed but the strap banked no sensor history (console-only across " +
-                "$consoleChunksThisSession chunks); consecutive empty syncs = " +
-                "${emptySyncTracker.consecutiveEmptySyncs}.",
-        )
+        if (bankedNothing) {
+            val detail = if (consoleChunksThisSession >= 3)
+                "console-only across $consoleChunksThisSession chunks"
+            else "metadata-only, 0 sensor rows persisted"
+            log(
+                "Backfill: completed but the strap banked no sensor history ($detail); " +
+                    "consecutive empty syncs = ${emptySyncTracker.consecutiveEmptySyncs}.",
+            )
+        }
         _state.value = when (reason) {
             "HISTORY_COMPLETE" -> _state.value.copy(
                 backfilling = false,
                 syncChunksThisSession = ackedChunksThisSession,
                 lastSyncAt = nowSec,
-                lastSyncError = if (emptyBanking && sustainedEmpty)
+                lastSyncError = if (bankedNothing && sustainedEmpty)
                     "Synced, but your strap had no stored history to hand over — only its diagnostic output. This usually means its clock has lost sync, so it isn't saving data to flash. Fully charge it to 100%, then reconnect, and it should start banking again."
                 else null,
             )
@@ -2212,6 +2779,62 @@ class WhoopBleClient(
     }
 
     // ====================================================================================
+    // MARK: GATT crash-safety  (#314 — dead-binder guards)
+    // ====================================================================================
+
+    /**
+     * Run a raw GATT operation, swallowing the dead-binder exceptions that escape `BluetoothGatt`
+     * once the OS Bluetooth radio is turned off mid-link, and route into full teardown if one fires.
+     *
+     * The bug (#314, Pixel 7): turning Bluetooth off doesn't disconnect NOOP's `BluetoothGatt`; the
+     * next write hits a dead binder and `writeCharacteristic` throws `android.os.DeadObjectException`
+     * (an unchecked `RuntimeException`) — which the GATT layer never declared, so nothing caught it
+     * and the app crashed on the next buzz/sync. We also see `IllegalStateException` (adapter off) and
+     * `SecurityException` (permission revoked) from the same calls. On ANY of these the link is gone:
+     * tear down so the UI flips to disconnected instead of crashing.
+     *
+     * @return the block's boolean (stack-accepted) on success, or `false` if the binder was dead — a
+     *   `false` lets callers run their normal "rejected by stack" path, which after teardown is inert
+     *   (the queues are cleared and `gatt` is null, so the recursive re-drain immediately no-ops).
+     */
+    private fun safeGatt(reason: String, block: () -> Boolean): Boolean =
+        try {
+            block()
+        } catch (t: Throwable) {
+            // DeadObjectException / IllegalStateException / SecurityException all mean the link is
+            // unusable. Catching Throwable here is deliberate: any GATT call that throws AT ALL once
+            // the binder is dead must not crash the app — there's no recovery, only teardown. The
+            // policy (always tear down) is single-sourced in shouldTeardownOnGattThrow so it's testable.
+            if (shouldTeardownOnGattThrow(t)) {
+                log("GATT op '$reason' failed (${t.javaClass.simpleName}); tearing down link")
+                teardownAfterGattFailure()
+            }
+            false
+        }
+
+    /**
+     * Full teardown after a raw GATT call threw because the binder died (#314). Mirrors the
+     * intentional-disconnect teardown but is reached from the catch path, so it must do everything
+     * [handleDisconnect]+[reset] do AND cancel the two BUSY-retry kicks — a still-pending
+     * [drainWriteRetryRunnable]/[drainCccdRetryRunnable] would otherwise fire after the link is dead
+     * and re-enter the dead write, throwing again. Marks the disconnect intentional so no auto-rescan
+     * loops against a powered-off radio (the adapter.isEnabled gate already suppresses connect, but
+     * suppressing the rescan keeps the log clean and avoids a tight retry loop).
+     */
+    private fun teardownAfterGattFailure() {
+        // Cancel any scheduled BUSY-retry kicks BEFORE handleDisconnect/reset clears the queues, so a
+        // retry can't re-enter drainWriteQueue/drainCccdQueue against the dead binder.
+        handler.removeCallbacks(drainWriteRetryRunnable)
+        handler.removeCallbacks(drainCccdRetryRunnable)
+        intentionalDisconnect = true   // don't auto-rescan against a dead/off radio
+        // reset() (inside handleDisconnect) clears writeInFlight + the write/cccd queues + pendingRetry
+        // and cancels the keep-alive/backfill timers; handleDisconnect publishes connected=false and
+        // closes + nulls gatt. Also drop the GattOps wrapper so a late call can't reach the dead gatt.
+        handleDisconnect(BluetoothGatt.GATT_FAILURE)
+        gattOps = null
+    }
+
+    // ====================================================================================
     // MARK: Disconnect / teardown  (port of didDisconnectPeripheral)
     // ====================================================================================
 
@@ -2228,16 +2851,22 @@ class WhoopBleClient(
         ioScope.launch { flushLive(); flushStandardHr() }
 
         // Reset all per-connection state and clear UI flags (incl. the syncing pill — a dropped link
-        // mid-offload must not leave "Syncing strap history…" stuck on, #77).
-        _state.value = _state.value.copy(
+        // mid-offload must not leave "Syncing strap history…" stuck on, #77). clearedBiometrics() also
+        // blanks HR / R-R / the rolling buffer so a stale heart rate or R-R strip can't outlive the link
+        // (parity with macOS LiveState.clearBiometrics — PR#191; the Android client previously cleared
+        // `charging` but left heartRate/rr stale).
+        _state.value = _state.value.clearedBiometrics().copy(
             connected = false, bonded = false, encryptedBond = false,
             backfilling = false, syncChunksThisSession = 0,
             charging = null,   // a stale charging flag must not outlive the link
         )
         reset()
 
-        gatt?.close()
+        // close() can itself throw DeadObjectException on a dead binder — teardown must NEVER throw,
+        // or the catch in safeGatt re-raises and we're back to the #314 crash. Swallow it.
+        try { gatt?.close() } catch (t: Throwable) { log("gatt.close() threw ${t.javaClass.simpleName} during teardown (ignored)") }
         gatt = null
+        gattOps = null
         cmdCharacteristic = null
 
         if (!intentionalDisconnect) {
@@ -2297,10 +2926,19 @@ class WhoopBleClient(
         writeInFlight = false
         pendingRetry = null
         writeRetries = 0
+        // Cancel any scheduled BUSY-retry kicks so a queued retry can't fire after teardown and
+        // re-enter a dead write/descriptor (#314).
+        handler.removeCallbacks(drainWriteRetryRunnable)
+        handler.removeCallbacks(drainCccdRetryRunnable)
         resubscribedSinceData = false
         cccdInFlight = false
         cccdRetries = 0
         sessionStarted = false
+        // The strap forgets the realtime-HR toggle across a disconnect; the post-bond branch re-arms it
+        // from [wantsRealtime]. Clear only the "what we last sent" flag — the screen/preference WANTS
+        // ([screenWantsRealtime]/[keepStreamForData]/[wantsRealtime]) are intent and must survive a
+        // reconnect so the stream comes back automatically.
+        realtimeArmed = false
 
         // Reset offload state so the next connect starts a fresh session (port of the backfill
         // flag resets in didDisconnectPeripheral). Timers are handler-posted, so cancel them here.
@@ -2310,6 +2948,7 @@ class WhoopBleClient(
         backfillFrameQueue.clear()
         strapNewestTs = null
         offloadFramesThisSession = 0
+        lastOffloadFrameAtMs = 0L   // #174: don't carry a stale cooldown reference into the next session
         historicalKickSent = false
         whoop5HistoryAttempts = 0
         // A mid-offload link drop must still flush the capture file (summary already logged or not —

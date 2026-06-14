@@ -117,6 +117,38 @@ object SleepStager {
     /** Consecutive sleep epochs required to declare onset. */
     const val onsetPersistEpochs: Int = 3
 
+    // ── Sparse-gravity robustness (#308) ──────────────────────────────────────
+    //
+    // On an un-unlocked WHOOP 5.0 the strap backfills mostly v18/v26 records where gravity is
+    // sparse/clumped (~25% coverage), so the gravity-only Stage-0 spine fragments the night at
+    // every >maxGapMin gravity gap and detectSleep drops every <minSleepMin fragment — collapsing
+    // a ~6 h night to ~1 h. The fix derives the in-bed spine from a sustained low-HR stretch and
+    // uses gravity stillness only to REFINE it, but is GATED ENTIRELY behind a "gravity is sparse"
+    // condition so dense WHOOP-4.0 nights stay BYTE-IDENTICAL (a 4.0 regression is unacceptable).
+    // Mirrors Swift.
+
+    /**
+     * Gravity is "sparse" when its timespan covers less than this fraction of the HR-sample
+     * timespan. A dense 4.0 night has gravity spanning the whole HR window (≈1.0) and never trips
+     * this; a 5.0 backfill clumps gravity into a fraction of the night.
+     */
+    const val sparseGravitySpanFrac: Double = 0.5
+
+    /**
+     * When sparse, HR drives the in-bed spine: an HR sample is "sleep-band" when its bpm ≤
+     * baseline × this. Reuses the overnight HR-confirmation multiplier so the band is the same one
+     * detectSleep already trusts to confirm a run.
+     */
+    const val hrSleepBandMult: Double = hrSleepBaselineMult
+
+    /**
+     * When sparse, two adjacent sleep runs separated ONLY by a gravity gap up to this many minutes
+     * are merged if the intervening HR stays in the sleep band — so a real night is not shredded
+     * into sub-minSleepMin fragments by gravity dropouts. Sized at the daytime-nap floor (a real
+     * continuous night never has a true >90 min wake bridge mid-sleep).
+     */
+    const val sparseBridgeGapMin: Int = 90
+
     // ── Stage 1–3 constants (sleep_features.py) ──────────────────────────────
 
     const val epochS: Double = 30.0
@@ -139,6 +171,20 @@ object SleepStager {
     const val smoothEpochs: Int = 5
     const val noREMAfterOnsetMin: Double = 15.0
     const val deepFirstFraction: Double = 1.0 / 3.0
+
+    /**
+     * Fragment-merge threshold (#274). A staged run shorter than this is "noise": the
+     * WHOOP 5/MG banks sparse motion, so the stager emits lots of sub-minute stage flecks
+     * and the hypnogram reads choppier than WHOOP's. mergeFragments (a DISPLAY/scoring
+     * smoothing applied AFTER staging, never to the underlying detection) absorbs runs
+     * below this into their neighbours. 3 min is conservative — long enough to clear the
+     * fleck noise, short enough to leave a genuine stage transition (a real deep or REM
+     * block runs many minutes) untouched. Mirrors Swift.
+     */
+    const val fragmentMergeMin: Double = 3.0
+
+    /** fragmentMergeMin expressed in 30 s epochs (6). A run with < this many epochs merges. */
+    val fragmentMergeEpochs: Int = (fragmentMergeMin * 60.0 / epochS).roundToInt()
 
     /** te Lindert 30 s Cole–Kripke weights [A₋₄..A₊₂]. SI = 0.001·Σ wᵢ·Aᵢ; sleep iff SI<1. */
     val ckWeights: List<Double> = listOf(106.0, 54.0, 58.0, 76.0, 230.0, 74.0, 67.0)
@@ -193,6 +239,54 @@ object SleepStager {
         return maxOf(minWindowSamples, (stillWindowMin * 60 / interval).toInt())
     }
 
+    // ── Sparse-gravity gate (#308) ─────────────────────────────────────────────
+
+    /**
+     * Median spacing between consecutive timestamps with NO upper cap (unlike medianIntervalS,
+     * which restricts to <300 s to infer a sample rate). Used to detect clumped/sparse gravity
+     * where the dropouts themselves are the signal. 0 for <2 samples.
+     */
+    internal fun medianGapS(times: List<Long>): Double {
+        if (times.size < 2) return 0.0
+        val gaps = ArrayList<Double>(times.size)
+        for (i in 0 until times.size - 1) {
+            val g = (times[i + 1] - times[i]).toDouble()
+            if (g > 0) gaps.add(g)
+        }
+        if (gaps.isEmpty()) return 0.0
+        gaps.sort()
+        return gaps[gaps.size / 2]
+    }
+
+    /**
+     * True when gravity is too sparse for the gravity-only spine to be trusted across gaps: the
+     * gravity timespan covers < sparseGravitySpanFrac of the HR-sample timespan, OR the median
+     * gravity inter-sample gap exceeds maxGapMin. Requires a real HR span to compare against — with
+     * no/degenerate HR the dense path is kept (false), so a 4.0 with absent HR is never reclassified
+     * as sparse.
+     */
+    internal fun isGravitySparse(grav: List<GravitySample>, hr: List<HrSample>): Boolean {
+        if (grav.size < 2 || hr.size < 2) return false
+        val hrSpan = (hr[hr.size - 1].ts - hr[0].ts).toDouble()
+        if (hrSpan <= 0) return false
+        val gravSpan = (grav[grav.size - 1].ts - grav[0].ts).toDouble()
+        if (gravSpan < sparseGravitySpanFrac * hrSpan) return true
+        return medianGapS(grav.map { it.ts }) > (maxGapMin * 60).toDouble()
+    }
+
+    /**
+     * True when HR stays in the sleep band (≤ baseline × hrSleepBandMult) across (a, b], used to
+     * decide whether a pure gravity gap is a real wake or just a dropout. With no baseline or no HR
+     * in the interval, the answer is false (cannot vouch for the gap → treat as a real break).
+     */
+    internal fun hrSleepBandAcross(a: Long, b: Long, hr: List<HrSample>, baseline: Double?): Boolean {
+        if (baseline == null) return false
+        val seg = hr.filter { it.ts > a && it.ts <= b }
+        if (seg.isEmpty()) return false
+        val meanHR = seg.sumOf { it.bpm }.toDouble() / seg.size.toDouble()
+        return meanHR <= baseline * hrSleepBandMult
+    }
+
     /** Per-record sleep flags from a rolling fraction of "still" samples. */
     internal fun classifyStill(grav: List<GravitySample>, deltas: List<Double>): List<Boolean> {
         val n = grav.size
@@ -222,8 +316,16 @@ object SleepStager {
     /**
      * Collapse per-record flags into contiguous runs, breaking on class change
      * or a gap > maxGapMin minutes.
+     *
+     * When [sparse] (gravity is too clumped to bridge gaps — #308), a PURE gravity data-gap (no
+     * contrary motion) does NOT close a SLEEP run while HR stays in the sleep band across the gap:
+     * the strap simply banked no motion there, not a wake. A class change always still closes the
+     * run, and the dense path ([sparse] == false) is byte-identical to the original. Mirrors Swift.
      */
-    internal fun buildRuns(grav: List<GravitySample>, flags: List<Boolean>): List<Period> {
+    internal fun buildRuns(
+        grav: List<GravitySample>, flags: List<Boolean>,
+        sparse: Boolean = false, hr: List<HrSample> = emptyList(), baseline: Double? = null,
+    ): List<Period> {
         val n = grav.size
         if (n == 0) return emptyList()
         val times = grav.map { it.ts }
@@ -237,7 +339,14 @@ object SleepStager {
                 close = true
             } else {
                 val classChanged = flags[i] != flags[runStart]
-                val gapExceeded = (times[i] - times[i - 1]) > maxGapS
+                var gapExceeded = (times[i] - times[i - 1]) > maxGapS
+                // Sparse override: a pure gravity gap (no class change) does not break a sleep run
+                // when HR stays in the sleep band across it — the gap is a dropout, not a wake.
+                if (sparse && gapExceeded && !classChanged && flags[runStart] &&
+                    hrSleepBandAcross(times[i - 1], times[i], hr, baseline)
+                ) {
+                    gapExceeded = false
+                }
                 close = classChanged || gapExceeded
             }
             if (close) {
@@ -294,6 +403,34 @@ object SleepStager {
             }
         }
         return merged
+    }
+
+    /**
+     * Sparse-gravity bridge (#308): merge two adjacent SLEEP runs separated ONLY by a gap up to
+     * sparseBridgeGapMin minutes when the intervening HR stays in the sleep band — so a real night
+     * fragmented by gravity dropouts is re-stitched into one continuous in-bed span BEFORE the
+     * minSleepMin gate drops the pieces. Active runs and over-threshold gaps are left untouched; the
+     * span between two bridged sleep runs (an "active"/gap run, if present) is absorbed. A no-op when
+     * [sparse] == false, so the dense 4.0 path is unchanged. Mirrors Swift.
+     */
+    internal fun bridgeSparseSleep(
+        periods: List<Period>, sparse: Boolean, hr: List<HrSample>, baseline: Double?,
+    ): List<Period> {
+        if (!sparse || periods.isEmpty()) return periods
+        val bridgeGapS = (sparseBridgeGapMin * 60).toLong()
+        val out = ArrayList<Period>()
+        for (p in periods) {
+            val last = out.lastOrNull()
+            if (last != null && last.stage == "sleep" && p.stage == "sleep") {
+                val gap = p.start - last.end
+                if (gap in 0..bridgeGapS && hrSleepBandAcross(last.end, p.start, hr, baseline)) {
+                    out[out.size - 1] = Period(stage = "sleep", start = last.start, end = p.end)
+                    continue
+                }
+            }
+            out.add(p)
+        }
+        return out
     }
 
     // ── HR refinement ────────────────────────────────────────────────────────
@@ -373,12 +510,20 @@ object SleepStager {
         val rrS = rr.sortedBy { it.ts }
         val respS = resp.sortedBy { it.ts }
 
+        val baseline = hrBaseline(hrS)
+        // Sparse-gravity gate (#308): an un-unlocked WHOOP 5.0 backfills mostly v18/v26 records
+        // where gravity is clumped (~25% coverage), so the gravity-only spine fragments the night.
+        // ONLY when sparse do the three robustness branches engage; a dense 4.0 night is `false`
+        // here and follows the exact original path (byte-identical).
+        val sparse = isGravitySparse(grav, hrS)
+
         val deltas = gravityDeltas(grav)
         val flags = classifyStill(grav, deltas)
-        var runs = buildRuns(grav, flags)
+        var runs = buildRuns(grav, flags, sparse = sparse, hr = hrS, baseline = baseline)
         runs = mergePeriods(runs)
+        // Re-stitch sleep runs fragmented by pure gravity dropouts (sparse only) before minSleepMin.
+        runs = bridgeSparseSleep(runs, sparse = sparse, hr = hrS, baseline = baseline)
 
-        val baseline = hrBaseline(hrS)
         val minSleepS = (minSleepMin * 60).toLong()
 
         val sessions = ArrayList<DetectedSleep>()
@@ -477,6 +622,11 @@ object SleepStager {
         labels = smoothLabels(labels)
         labels = reimposePhysiology(labels, features = feats,
             onsetIdx = onsetIdx, finalWakeIdx = finalWakeIdx)
+        // Conservative fragment merge (#274): absorb sub-3-min stage flecks (the WHOOP 5/MG
+        // sparse-motion artefact) so the hypnogram stops reading choppier than WHOOP's,
+        // without erasing genuine multi-minute transitions. Display/scoring only — the
+        // per-epoch detection above is unchanged.
+        labels = mergeFragments(labels)
 
         // Pre-onset and post-final-wake epochs are not sleep → force wake.
         val mutLabels = labels.toMutableList()
@@ -1107,6 +1257,110 @@ object SleepStager {
         return out
     }
 
+    /**
+     * Sleep-depth rank, lighter → deeper: wake 0, light 1, rem 2, deep 3. Used by
+     * mergeFragments to bias an ambiguous merge toward the LIGHTER stage so smoothing
+     * can never inflate deep/REM. Unknown labels rank lightest (0) — they never win deep.
+     */
+    internal fun stageDepthRank(stage: String): Int = when (stage) {
+        "light" -> 1
+        "rem" -> 2
+        "deep" -> 3
+        else -> 0 // "wake" and any unexpected label
+    }
+
+    /** A contiguous run of one stage spanning [len] epochs. */
+    private data class StageRun(val stage: String, var len: Int)
+
+    /**
+     * Display/scoring smoothing of the staged label sequence (#274). Absorbs sub-threshold
+     * "noise" runs WITHOUT erasing real transitions — applied AFTER staging, it never
+     * touches the underlying per-epoch detection.
+     *
+     * Per run shorter than [thresholdEpochs]:
+     *   • bridged by two SAME-stage neighbours → absorbed into them (the fleck was a blip
+     *     inside one continuous stage);
+     *   • between DIFFERENT stages → relabelled to the dominant (longer) neighbour. On a tie
+     *     — or when the longer neighbour is the deeper one and the shorter is lighter and of
+     *     comparable length — it biases toward the LIGHTER neighbour so a stray fleck can
+     *     never inflate deep/REM (the least-reliable, most-overcountable classes).
+     *
+     * Single left-to-right pass over runs, mirroring mergePeriods' control flow so the
+     * Swift and Kotlin ports stay byte-identical. A run already ≥ threshold is a real
+     * transition and is always preserved.
+     */
+    internal fun mergeFragments(labels: List<String>, thresholdEpochs: Int = fragmentMergeEpochs): List<String> {
+        val n = labels.size
+        if (n == 0 || thresholdEpochs <= 1) return labels
+
+        // Collapse the per-epoch labels into contiguous runs of (stage, length).
+        val runs = ArrayList<StageRun>()
+        for (s in labels) {
+            val last = runs.lastOrNull()
+            if (last != null && last.stage == s) last.len += 1
+            else runs.add(StageRun(s, 1))
+        }
+        if (runs.size < 2) return labels
+
+        val merged = ArrayList<StageRun>()
+        var i = 0
+        while (i < runs.size) {
+            val current = runs[i]
+            if (current.len >= thresholdEpochs) {
+                merged.add(StageRun(current.stage, current.len))
+                i += 1
+                continue
+            }
+
+            val hasPrev = merged.isNotEmpty()
+            val hasNext = i + 1 < runs.size
+
+            if (hasPrev && hasNext && merged[merged.size - 1].stage == runs[i + 1].stage) {
+                // Same-stage bridge: absorb the fleck and the next run into the previous one.
+                merged[merged.size - 1].len += current.len + runs[i + 1].len
+                i += 2
+            } else if (hasPrev && hasNext) {
+                // Between two DIFFERENT stages: relabel to the dominant neighbour, biasing
+                // toward the lighter stage when the two neighbours are tied in length.
+                val prev = merged[merged.size - 1]
+                val next = runs[i + 1]
+                val winner: String = when {
+                    prev.len > next.len -> prev.stage
+                    next.len > prev.len -> next.stage
+                    // Tie → lighter (smaller depth rank) wins; never inflate deep/REM.
+                    else -> if (stageDepthRank(prev.stage) <= stageDepthRank(next.stage)) prev.stage else next.stage
+                }
+                if (winner == prev.stage) {
+                    merged[merged.size - 1].len += current.len
+                    i += 1
+                } else {
+                    // Becomes part of the NEXT run: extend next, drop current.
+                    runs[i + 1] = StageRun(next.stage, next.len + current.len)
+                    i += 1
+                }
+            } else if (hasNext) {
+                // No previous run (leading fleck): fold forward into the next run.
+                runs[i + 1] = StageRun(runs[i + 1].stage, runs[i + 1].len + current.len)
+                i += 1
+            } else if (hasPrev) {
+                // No next run (trailing fleck): fold back into the previous run.
+                merged[merged.size - 1].len += current.len
+                i += 1
+            } else {
+                // Single sub-threshold run with no neighbours — nothing to merge into.
+                merged.add(StageRun(current.stage, current.len))
+                i += 1
+            }
+        }
+
+        // Re-expand the runs back into a per-epoch label sequence of the same length.
+        val out = ArrayList<String>(n)
+        for (r in merged) {
+            for (k in 0 until r.len) out.add(r.stage)
+        }
+        return out
+    }
+
     // ── Per-session HR / HRV ─────────────────────────────────────────────────
 
     /** Lowest 5-min rolling-mean HR during the session (bpm), or null. */
@@ -1139,9 +1393,13 @@ object SleepStager {
         var t = start
         while (t < end) {
             val bucket = seg.filter { it.ts >= t && it.ts < t + windowS }.map { it.rrMs.toDouble() }
-            val filtered = HrvAnalyzer.rangeFilter(bucket)
-            if (filtered.size >= 2) {
-                val r = HrvAnalyzer.rmssdRaw(filtered)
+            // Full clean (range + Malik ectopic rejection), not just range — matches the
+            // analyze() pipeline. The 0x2A37 RR on a WHOOP 5/MG is PPG-derived and noisier
+            // than a 4.0's; rMSSD is built from SUCCESSIVE differences, so an un-rejected
+            // jitter spike inflates the session HRV. Ectopic rejection drops those (#262/#235).
+            val cleaned = HrvAnalyzer.cleanRR(bucket)
+            if (cleaned.size >= 2) {
+                val r = HrvAnalyzer.rmssdRaw(cleaned)
                 if (r != null) vals.add(r)
             }
             t += windowS

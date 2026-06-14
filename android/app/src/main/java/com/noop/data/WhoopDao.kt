@@ -61,6 +61,10 @@ interface WhoopDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertGravity(rows: List<GravitySample>): List<Long>
 
+    /** PPG-derived HR from the v26 optical waveform. Idempotent by (deviceId, ts). (#156) */
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertPpgHr(rows: List<PpgHrSample>): List<Long>
+
     // MARK: - Server-derived caches (latest value wins)
 
     @Upsert
@@ -68,6 +72,11 @@ interface WhoopDao {
 
     @Upsert
     suspend fun upsertSleepSessions(rows: List<SleepSession>)
+
+    /** Remove one sleep session by its full primary key (deviceId, startTs) — used by the
+     *  bed/wake-time edit, which deletes then re-inserts because startTs is part of the PK. */
+    @Query("DELETE FROM sleepSession WHERE deviceId = :deviceId AND startTs = :startTs")
+    suspend fun deleteSleepSession(deviceId: String, startTs: Long)
 
     @Upsert
     suspend fun upsertMetricSeries(rows: List<MetricSeriesRow>)
@@ -83,21 +92,58 @@ interface WhoopDao {
 
     // MARK: - Range reads (ORDER BY ts ASC, inclusive [from, to], limited)
 
+    /** COALESCE union (#172/#219 parity with Swift's hrSamples): the measured `hrSample` is
+     *  authoritative; the v26 PPG-derived `ppgHrSample` fills ONLY seconds the strap never reported a
+     *  bpm for (anti-join), so a PPG-only WHOOP 5 night still clears the scoring gate and is scorable —
+     *  exactly as `hrBuckets` already coalesces for charts. PPG rows carry synced = 0. */
+    @Query(
+        "SELECT deviceId, ts, bpm, synced FROM (" +
+            "SELECT deviceId, ts, bpm, synced FROM hrSample " +
+            "WHERE deviceId = :deviceId AND ts >= :from AND ts <= :to " +
+            "UNION ALL " +
+            "SELECT p.deviceId AS deviceId, p.ts AS ts, p.bpm AS bpm, 0 AS synced FROM ppgHrSample p " +
+            "WHERE p.deviceId = :deviceId AND p.ts >= :from AND p.ts <= :to " +
+            "AND NOT EXISTS (SELECT 1 FROM hrSample h WHERE h.deviceId = p.deviceId AND h.ts = p.ts)" +
+            ") ORDER BY ts ASC LIMIT :limit"
+    )
+    suspend fun hrSamples(deviceId: String, from: Long, to: Long, limit: Int): List<HrSample>
+
+    /** RAW measured HR only — the `hrSample` table with NO v26 PPG-derived union (cf. [hrSamples]).
+     *  Backs the raw-sensor diagnostic export, which emits measured HR and PPG-derived HR as two
+     *  distinct streams so they're never conflated. Range read, ts asc, row-limited. */
     @Query(
         "SELECT * FROM hrSample WHERE deviceId = :deviceId AND ts >= :from AND ts <= :to " +
             "ORDER BY ts ASC LIMIT :limit"
     )
-    suspend fun hrSamples(deviceId: String, from: Long, to: Long, limit: Int): List<HrSample>
+    suspend fun rawHrSamples(deviceId: String, from: Long, to: Long, limit: Int): List<HrSample>
 
     /** Downsampled HR for charting: mean bpm per [bucketSeconds]-wide bucket over [from, to],
      *  keyed by the bucket start (floor(ts/bucket)*bucket). Aggregated in SQL so a 24h window
-     *  returns ~(to-from)/bucketSeconds rows, not every ~1 Hz sample. Mirrors macOS hrBuckets. */
+     *  returns ~(to-from)/bucketSeconds rows, not every ~1 Hz sample. Mirrors macOS hrBuckets.
+     *
+     *  COALESCE union (#156): the real sensor `hrSample` is authoritative; the v26 PPG-derived
+     *  `ppgHrSample` only contributes seconds the strap NEVER reported a bpm for (WHERE NOT EXISTS),
+     *  so derived HR fills gaps without ever overriding or double-counting a true HR sample. The two
+     *  selects are UNION ALL'd into one bpm stream, then bucket-averaged exactly as before. Matches
+     *  the Swift hrBuckets COALESCE union. */
     @Query(
-        "SELECT (ts / :bucketSeconds) * :bucketSeconds AS bucket, AVG(bpm) AS avgBpm FROM hrSample " +
+        "SELECT (ts / :bucketSeconds) * :bucketSeconds AS bucket, AVG(bpm) AS avgBpm FROM (" +
+            "SELECT ts, bpm FROM hrSample " +
             "WHERE deviceId = :deviceId AND ts >= :from AND ts <= :to " +
-            "GROUP BY ts / :bucketSeconds ORDER BY bucket ASC"
+            "UNION ALL " +
+            "SELECT p.ts AS ts, p.bpm AS bpm FROM ppgHrSample p " +
+            "WHERE p.deviceId = :deviceId AND p.ts >= :from AND p.ts <= :to " +
+            "AND NOT EXISTS (SELECT 1 FROM hrSample h WHERE h.deviceId = p.deviceId AND h.ts = p.ts)" +
+            ") GROUP BY ts / :bucketSeconds ORDER BY bucket ASC"
     )
     suspend fun hrBuckets(deviceId: String, from: Long, to: Long, bucketSeconds: Long): List<HrBucket>
+
+    /** Raw v26 PPG-derived HR samples in [from, to] (ascending). (#156) */
+    @Query(
+        "SELECT * FROM ppgHrSample WHERE deviceId = :deviceId AND ts >= :from AND ts <= :to " +
+            "ORDER BY ts ASC LIMIT :limit"
+    )
+    suspend fun ppgHrSamples(deviceId: String, from: Long, to: Long, limit: Int): List<PpgHrSample>
 
     /** Aggregate HR over a window (one indexed (deviceId,ts) range scan — no row materialisation,
      *  no [hrSamples] LIMIT truncation). Backs the imported-workout HR fallback (#77). */
@@ -166,6 +212,16 @@ interface WhoopDao {
             "ORDER BY day ASC"
     )
     suspend fun dailyMetricsRange(deviceId: String, from: String, to: String): List<DailyMetric>
+
+    /**
+     * Delete a source's cached daily rows whose day-key is in [from, to] (inclusive, yyyy-MM-dd
+     * lexicographic = chronological). The #277 local-day re-bucketing migration uses this to drop the
+     * computed ("-noop") UTC-keyed rows across the recompute window before re-upserting the LOCAL-keyed
+     * rows, so a UTC/local duplicate day can't linger. Source-scoped, so imported "my-whoop" rows are
+     * never touched. Mirrors WhoopStore MetricsCache.deleteDailyMetrics.
+     */
+    @Query("DELETE FROM dailyMetric WHERE deviceId = :deviceId AND day >= :from AND day <= :to")
+    suspend fun deleteDailyMetricsInRange(deviceId: String, from: String, to: String)
 
     /** All cached daily metrics for a device, oldest first. Convenience for analytics windows. */
     @Query("SELECT * FROM dailyMetric WHERE deviceId = :deviceId ORDER BY day ASC")
@@ -274,8 +330,16 @@ interface WhoopDao {
 
     // MARK: - Frontier / stats (Reads.swift)
 
-    /** Max HR sample ts for a device, or null if none — the biometric data frontier. */
-    @Query("SELECT MAX(ts) FROM hrSample WHERE deviceId = :deviceId")
+    /** Max HR sample ts for a device, or null if none — the biometric data frontier.
+     *  COALESCEs measured `hrSample` with the v26 PPG-derived `ppgHrSample` (#156) so a PPG-only
+     *  offload (a v26 WHOOP 5 night with no measured HR) still advances the frontier, matching the
+     *  Swift reader (Reads.swift latestHrSampleTs). Both persist on the same per-second ts grid. */
+    @Query(
+        "SELECT MAX(ts) FROM (" +
+            "SELECT ts FROM hrSample WHERE deviceId = :deviceId " +
+            "UNION ALL " +
+            "SELECT ts FROM ppgHrSample WHERE deviceId = :deviceId)",
+    )
     suspend fun latestHrSampleTs(deviceId: String): Long?
 
     @Query("SELECT COUNT(*) FROM hrSample") suspend fun countHr(): Int

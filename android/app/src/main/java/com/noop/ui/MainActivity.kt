@@ -139,6 +139,16 @@ object NoopPrefs {
     /** "Keep connected in the background" — drives [com.noop.ble.WhoopConnectionService]. Default on. */
     const val KEY_BACKGROUND_CONNECTION = "noop.backgroundConnection"
 
+    /** "Continuous HRV capture" — when on (AND background connection is on), NOOP holds the dense
+     *  realtime HR stream armed even with no Live screen open, so the strap banks beat-to-beat R-R 24/7
+     *  for far better overnight HRV/recovery/sleep. Uses more battery (continuous HR streaming). Default
+     *  OFF. Drives [com.noop.ble.WhoopBleClient.setKeepStreamForData] via [AppViewModel]. */
+    const val KEY_CONTINUOUS_HRV = "noop.continuousHrv"
+
+    /** The calendar day (yyyy-MM-dd) on which the morning-journal nudge was last shown — keeps the
+     *  Sleep screen's "Good morning" sheet to at most once per day. */
+    const val KEY_LAST_JOURNAL_PROMPT = "noop.lastJournalPromptDay"
+
     /** "Debug logging" — when on, the strap log is also written to logcat (`adb`). Default OFF so a
      *  normal user never emits the connection log to the system log; the in-app ring buffer (and the
      *  "Share strap log" export) work regardless. See [com.noop.ble.WhoopBleClient.debugLogcat]. */
@@ -153,6 +163,15 @@ object NoopPrefs {
 
     fun setBackgroundConnection(context: Context, enabled: Boolean) {
         of(context).edit().putBoolean(KEY_BACKGROUND_CONNECTION, enabled).apply()
+    }
+
+    /** Whether NOOP keeps the dense realtime HR stream armed 24/7 for continuous HRV capture. Default
+     *  false. Only takes effect while [backgroundConnection] is also on. */
+    fun continuousHrv(context: Context): Boolean =
+        of(context).getBoolean(KEY_CONTINUOUS_HRV, false)
+
+    fun setContinuousHrv(context: Context, enabled: Boolean) {
+        of(context).edit().putBoolean(KEY_CONTINUOUS_HRV, enabled).apply()
     }
 
     /** Whether the strap log is mirrored to logcat. Default false (normal users don't log to adb). */
@@ -256,6 +275,17 @@ object NoopPrefs {
 
     fun setIllnessLastNotifiedDay(context: Context, day: String) {
         of(context).edit().putString(KEY_ILLNESS_LAST_NOTIFIED_DAY, day).apply()
+    }
+
+    /** Whether the one-shot #313 full-history Effort rescore has run. Set true once it completes so the
+     *  on-upgrade pass that regenerates deep-history strain on the 0–100 axis never re-runs. */
+    const val KEY_EFFORT_RESCORE_DONE = "noop.effortRescore.v313.done"
+
+    fun effortRescoreDone(context: Context): Boolean =
+        of(context).getBoolean(KEY_EFFORT_RESCORE_DONE, false)
+
+    fun setEffortRescoreDone(context: Context) {
+        of(context).edit().putBoolean(KEY_EFFORT_RESCORE_DONE, true).apply()
     }
 
     /** The last strap we bonded to (address + model), persisted so NOOP can reconnect to it directly on

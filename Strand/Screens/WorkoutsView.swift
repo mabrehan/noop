@@ -24,10 +24,16 @@ struct WorkoutsView: View {
     @AppStorage(UnitPrefs.systemKey) private var unitSystemRaw = UnitSystem.metric.rawValue
     private var unitSystem: UnitSystem { UnitSystem(rawValue: unitSystemRaw) ?? .metric }
 
+    // Effort display scale (#268) — drives the effort hero's read-out. Display-only.
+    @AppStorage(UnitPrefs.effortScaleKey) private var effortScaleRaw = EffortScale.hundred.rawValue
+    private var effortScale: EffortScale { UnitPrefs.resolveEffortScale(effortScaleRaw) }
+
     /// All loaded sessions, newest first. Seedable for previews.
     @State private var allRows: [WorkoutRow]
     @State private var loaded: Bool
+    @State private var seededInitialRange = false
     @State private var range: Range = .all
+    private let usesPreviewRows: Bool
 
     /// The add/edit sheet target: `.some(nil)` = add a new workout, `.some(row)` = edit `row`,
     /// `nil` = sheet closed. Wrapped in Identifiable so `.sheet(item:)` can drive presentation.
@@ -42,10 +48,12 @@ struct WorkoutsView: View {
     init(previewRows: [WorkoutRow]? = nil) {
         _allRows = State(initialValue: previewRows ?? [])
         _loaded = State(initialValue: previewRows != nil)
+        usesPreviewRows = previewRows != nil
     }
 
     var body: some View {
-        ScreenScaffold(title: "Workouts", subtitle: "Every session, threaded together.") {
+        ScreenScaffold(title: "Workouts", subtitle: "Every session, threaded together.",
+                       onRefresh: { await repo.refresh() }) {
             if allRows.isEmpty {
                 VStack(alignment: .leading, spacing: 16) {
                     ComingSoon(what: loaded
@@ -66,24 +74,32 @@ struct WorkoutsView: View {
                 let zonesSummary = WorkoutZones.summary(from: windowRows)
 
                 rangeBar(rows: windowRows, effectiveRange: resolved)
+                effortHero(rows: windowRows, effectiveRange: resolved, groups: groups)
                 summarySection(rows: windowRows, effectiveRange: resolved, groups: groups)
-                breakdownSection(groups: groups)
+                breakdownSection(groups: groups, rows: windowRows)
                 if let z = zonesSummary {
                     zonesSection(z, totalSessions: windowRows.count)
                 }
                 sessionsSection(rows: windowRows)
             }
         }
-        .task {
-            guard !loaded else { return }
+        .task(id: repo.refreshSeq) {
+            guard !usesPreviewRows else { return }
             let r = await repo.workoutRows()
             allRows = r
+            let wasLoaded = loaded
             loaded = true
-            range = defaultRange(for: r)
+            if !wasLoaded {
+                range = defaultRange(for: r)
+                seededInitialRange = true
+            }
         }
         .onAppear {
             // Preview-seeded rows skip `.task`; still choose a range that has data.
-            if loaded { range = defaultRange(for: allRows) }
+            if loaded && !seededInitialRange {
+                range = defaultRange(for: allRows)
+                seededInitialRange = true
+            }
         }
         .sheet(item: $sheet) { target in
             ManualWorkoutSheet(editing: target.editing) { row, replacing in
@@ -199,6 +215,90 @@ struct WorkoutsView: View {
         return .all
     }
 
+    // MARK: - Effort hero (weekly effort over a scenic Effort backdrop)
+
+    /// A Bevel hero for the windowed range: the typical session Effort on the shared layered StrainGauge,
+    /// floated over an Effort-tinted scenic backdrop, with the session count + total time alongside. The
+    /// gauge reads the AVERAGE per-session strain (the stored 0–100 Effort axis mapped to the gauge's
+    /// 0–21 span, exactly like the Today effort hero); the headline number is shown on the user's scale.
+    @ViewBuilder
+    private func effortHero(rows: [WorkoutRow], effectiveRange: Range, groups: [SportGroup]) -> some View {
+        let strains = rows.compactMap(\.strain)
+        let avgStrain = strains.isEmpty ? 0 : strains.reduce(0, +) / Double(strains.count)
+        let totalTimeH = rows.compactMap(\.durationS).reduce(0, +) / 3600.0
+        ZStack {
+            ScenicHeroBackground(domain: .effort)
+                .clipShape(RoundedRectangle(cornerRadius: NoopMetrics.cardRadius, style: .continuous))
+            NoopCard(padding: 20, tint: StrandPalette.effortColor) {
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .center, spacing: 24) {
+                        effortHeroGauge(avgStrain: avgStrain, hasData: !strains.isEmpty)
+                        effortHeroStats(rows: rows, effectiveRange: effectiveRange,
+                                        groups: groups, totalTimeH: totalTimeH)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    VStack(alignment: .center, spacing: 16) {
+                        effortHeroGauge(avgStrain: avgStrain, hasData: !strains.isEmpty)
+                        effortHeroStats(rows: rows, effectiveRange: effectiveRange,
+                                        groups: groups, totalTimeH: totalTimeH)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func effortHeroGauge(avgStrain: Double, hasData: Bool) -> some View {
+        VStack(spacing: 8) {
+            Text("TYPICAL EFFORT")
+                .font(StrandFont.overline).tracking(StrandFont.overlineTracking)
+                .foregroundStyle(StrandPalette.effortColor)
+            StrainGauge(
+                strain: UnitFormatter.effortValue(avgStrain, scale: effortScale),
+                outOf: effortScale == .whoop ? 21 : 100,
+                diameter: 168, lineWidth: 15,
+                showsLabel: hasData, showsHover: false,
+                valueFormat: { _ in UnitFormatter.effortDisplay(avgStrain, scale: effortScale) }
+            )
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    @ViewBuilder
+    private func effortHeroStats(rows: [WorkoutRow], effectiveRange: Range,
+                                 groups: [SportGroup], totalTimeH: Double) -> some View {
+        let modal = modalSport(from: groups)
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Effort this \(effectiveRange.heroWord)")
+                .font(StrandFont.headline)
+                .foregroundStyle(StrandPalette.textPrimary)
+            HStack(spacing: NoopMetrics.gap) {
+                heroStat("Sessions", "\(rows.count)", tint: StrandPalette.effortColor)
+                heroStat("Active", oneDecimal(totalTimeH) + "h", tint: StrandPalette.textPrimary)
+                heroStat("Top sport", modal.count > 0 ? "\(modal.count)×" : "—",
+                         tint: StrandPalette.effortBright)
+            }
+            Text(modal.count > 0
+                 ? "Mostly \(WorkoutSource.displaySport(modal.sport)) — \(effectiveRange.caption)."
+                 : "Logged sessions across \(effectiveRange.caption).")
+                .font(StrandFont.footnote)
+                .foregroundStyle(StrandPalette.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func heroStat(_ title: String, _ value: String, tint: Color) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title.uppercased())
+                .font(StrandFont.overline).tracking(StrandFont.overlineTracking)
+                .foregroundStyle(StrandPalette.textSecondary)
+            Text(value).font(StrandFont.number(20))
+                .foregroundStyle(tint).lineLimit(1).minimumScaleFactor(0.6)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     // MARK: - Summary tiles (uniform 104pt StatTiles)
 
     private func summarySection(rows: [WorkoutRow], effectiveRange: Range, groups: [SportGroup]) -> some View {
@@ -212,7 +312,7 @@ struct WorkoutsView: View {
             StatTile(label: "Total Workouts",
                      value: "\(totalCount)",
                      caption: effectiveRange.caption,
-                     accent: StrandPalette.accent)
+                     accent: StrandPalette.effortColor)
             StatTile(label: "Total Time",
                      value: oneDecimal(totalTimeH) + "h",
                      caption: "active",
@@ -234,55 +334,85 @@ struct WorkoutsView: View {
 
     // MARK: - Activity breakdown (per-sport NoopCards, identical layout)
 
-    private func breakdownSection(groups: [SportGroup]) -> some View {
+    private func breakdownSection(groups: [SportGroup], rows: [WorkoutRow]) -> some View {
         VStack(alignment: .leading, spacing: NoopMetrics.gap) {
             SectionHeader("Activity Breakdown",
                           overline: "By sport",
                           trailing: "\(groups.count) sport\(groups.count == 1 ? "" : "s")")
             LazyVGrid(columns: breakdownColumns, alignment: .leading, spacing: NoopMetrics.gap) {
                 ForEach(groups) { g in
-                    sportCard(g)
+                    // This sport's own sessions, so the card can carry an HR-zone mini-bar.
+                    sportCard(g, zones: WorkoutZones.summary(from: rows.filter { $0.sport == g.sport }))
                 }
             }
         }
     }
 
-    private func sportCard(_ g: SportGroup) -> some View {
-        NoopCard {
+    private func sportCard(_ g: SportGroup, zones: WorkoutZones.Summary?) -> some View {
+        // Frosted Effort-tinted card with the sport glyph in the Effort world, an HR-zone mini-bar when
+        // the sessions carry imported zones, and the bright "now" end-cap on its busiest zone.
+        NoopCard(tint: StrandPalette.effortColor) {
             VStack(alignment: .leading, spacing: 12) {
                 // Identical header for every card.
                 HStack(spacing: 10) {
                     Image(systemName: sportIcon(g.sport))
                         .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(StrandPalette.accent)
+                        .foregroundStyle(StrandPalette.effortColor)
                         .frame(width: 22, alignment: .center)
-                    Text(g.sport)
+                    Text(WorkoutSource.displaySport(g.sport))
                         .font(StrandFont.headline)
                         .foregroundStyle(StrandPalette.textPrimary)
                         .lineLimit(1)
                     Spacer(minLength: 0)
                     Text("\(g.count)")
                         .font(StrandFont.number(15))
-                        .foregroundStyle(StrandPalette.textSecondary)
+                        .foregroundStyle(StrandPalette.effortBright)
                 }
+                if let zones { zoneMiniBar(zones) }
                 Divider().overlay(StrandPalette.hairline)
                 // Identical 4-up stat strip for every card.
                 HStack(spacing: 0) {
                     miniStat("SESSIONS", "\(g.count)")
                     miniStat("TIME", oneDecimal(g.totalTimeH) + "h")
-                    miniStat("KCAL", grouped(g.totalKcal))
+                    miniStat("KCAL", grouped(g.totalKcal), tint: StrandPalette.metricAmber)
                     miniStat("AVG/SESS", "\(Int(g.avgTimePerSessionMin.rounded()))m")
                 }
             }
         }
     }
 
-    private func miniStat(_ label: String, _ value: String) -> some View {
+    /// A slim proportional HR-zone bar for one sport's sessions — the zone colours, with the busiest
+    /// zone carrying a bright "now" end-cap glow so the card reads as a Bevel chart, not a flat strip.
+    private func zoneMiniBar(_ z: WorkoutZones.Summary) -> some View {
+        let busiest = z.minutes.indices.max(by: { z.minutes[$0] < z.minutes[$1] }) ?? 0
+        return GeometryReader { geo in
+            HStack(spacing: 2) {
+                ForEach(0..<5, id: \.self) { i in
+                    RoundedRectangle(cornerRadius: 2, style: .continuous)
+                        .fill(StrandPalette.hrZoneColor(i + 1))
+                        .frame(width: max(0, CGFloat(z.minutes[i] / max(z.totalMinutes, 0.001)) * geo.size.width))
+                        .overlay {
+                            if i == busiest {
+                                RoundedRectangle(cornerRadius: 2, style: .continuous)
+                                    .stroke(StrandPalette.hrZoneColor(i + 1).opacity(0.9), lineWidth: 1)
+                                    .shadow(color: StrandPalette.hrZoneColor(i + 1).opacity(0.7), radius: 4)
+                            }
+                        }
+                }
+            }
+        }
+        .frame(height: 8)
+        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Heart-rate zone split: " + (1...5).map { "zone \($0) \(Int((z.minutes[$0 - 1] / max(z.totalMinutes, 0.001) * 100).rounded())) percent" }.joined(separator: ", "))
+    }
+
+    private func miniStat(_ label: String, _ value: String, tint: Color = StrandPalette.textPrimary) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(label).strandOverline()
             Text(value)
                 .font(StrandFont.number(15))
-                .foregroundStyle(StrandPalette.textPrimary)
+                .foregroundStyle(tint)
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
         }
@@ -296,15 +426,24 @@ struct WorkoutsView: View {
             SectionHeader("HR Zones",
                           overline: "Whoop import",
                           trailing: "\(z.sessionsWithZones) of \(totalSessions) session\(totalSessions == 1 ? "" : "s")")
-            NoopCard {
+            NoopCard(tint: StrandPalette.effortColor) {
                 VStack(alignment: .leading, spacing: 12) {
-                    // Proportional stacked bar — same construction as SleepView's stage bar.
+                    // Proportional stacked bar — same construction as SleepView's stage bar, with the
+                    // busiest zone carrying a bright glowing end-cap so it reads as a Bevel chart.
+                    let busiest = z.minutes.indices.max(by: { z.minutes[$0] < z.minutes[$1] }) ?? 0
                     GeometryReader { geo in
                         HStack(spacing: 2) {
                             ForEach(0..<5, id: \.self) { i in
                                 Rectangle()
                                     .fill(StrandPalette.hrZoneColor(i + 1))
                                     .frame(width: max(0, CGFloat(z.minutes[i] / z.totalMinutes) * geo.size.width))
+                                    .overlay {
+                                        if i == busiest {
+                                            Rectangle()
+                                                .stroke(StrandPalette.hrZoneColor(i + 1), lineWidth: 1.5)
+                                                .shadow(color: StrandPalette.hrZoneColor(i + 1).opacity(0.7), radius: 6)
+                                        }
+                                    }
                             }
                         }
                     }
@@ -353,18 +492,40 @@ struct WorkoutsView: View {
                           overline: "Log",
                           trailing: "\(rows.count) total")
             NoopCard(padding: 0) {
-                LazyVStack(spacing: 0) {
-                    sessionHeaderRow
-                    Divider().overlay(StrandPalette.hairline)
-                    ForEach(Array(rows.enumerated()), id: \.offset) { idx, row in
-                        sessionRow(row)
-                            .background(idx % 2 == 1
-                                        ? StrandPalette.surfaceInset.opacity(0.4)
-                                        : Color.clear)
-                        if idx != rows.count - 1 {
-                            Divider().overlay(StrandPalette.hairline.opacity(0.5))
-                        }
-                    }
+                // The fixed-width columns total ≈612pt — wider than an iPhone — so on iOS the table
+                // scrolls horizontally instead of clipping the SPORT / DIST / SOURCE columns (#183).
+                // macOS windows are wide enough to show it all, so they keep the full-width layout.
+                #if os(iOS)
+                ScrollView(.horizontal, showsIndicators: true) {
+                    sessionsTable(rows: rows)
+                }
+                #else
+                sessionsTable(rows: rows)
+                #endif
+            }
+            #if os(iOS)
+            // The per-row actions live in a long-press context menu, which isn't discoverable on
+            // iPhone without a nudge (#183).
+            Text("Press and hold a workout to re-label, edit or delete it.")
+                .font(StrandFont.caption)
+                .foregroundStyle(StrandPalette.textTertiary)
+                .padding(.horizontal, 4)
+            #endif
+        }
+    }
+
+    @ViewBuilder
+    private func sessionsTable(rows: [WorkoutRow]) -> some View {
+        LazyVStack(spacing: 0) {
+            sessionHeaderRow
+            Divider().overlay(StrandPalette.hairline)
+            ForEach(Array(rows.enumerated()), id: \.offset) { idx, row in
+                sessionRow(row)
+                    .background(idx % 2 == 1
+                                ? StrandPalette.surfaceInset.opacity(0.4)
+                                : Color.clear)
+                if idx != rows.count - 1 {
+                    Divider().overlay(StrandPalette.hairline.opacity(0.5))
                 }
             }
         }
@@ -396,7 +557,7 @@ struct WorkoutsView: View {
                 Text(dateLabel(row.startTs))
                     .font(StrandFont.subhead)
                     .foregroundStyle(StrandPalette.textPrimary)
-                Text(timeLabel(row.startTs))
+                Text(timeRangeLabel(row.startTs, row.endTs))
                     .font(StrandFont.footnote)
                     .foregroundStyle(StrandPalette.textTertiary)
             }
@@ -455,7 +616,7 @@ struct WorkoutsView: View {
             Button("Edit…") { editWorkout(row) }
             Divider()
             Button("Delete", role: .destructive) { delete(row) }
-        case .whoop, .apple:
+        case .whoop, .apple, .lifting:
             // Imported history is read-only; offer a copy-to-manual edit path that doesn't touch it.
             Button("Duplicate as manual…") { editWorkout(asManualCopy(row)) }
         }
@@ -487,6 +648,7 @@ struct WorkoutsView: View {
             case .apple:    return ("Apple", StrandPalette.metricCyan, "Source Apple Health")
             case .detected: return ("Detected", StrandPalette.metricPurple, "Source on-device detected")
             case .manual:   return ("Manual", StrandPalette.statusWarning, "Source manual entry")
+            case .lifting:  return ("Lifting", StrandPalette.zone2, "Source imported lifting log")
             }
         }()
         // String interpolation lifts the computed label into a LocalizedStringKey (SourceBadge's type).
@@ -559,6 +721,16 @@ struct WorkoutsView: View {
             case .all:     return "all time"
             }
         }
+        /// A short noun for the effort hero's "Effort this …" headline.
+        var heroWord: String {
+            switch self {
+            case .week:    return "week"
+            case .month:   return "month"
+            case .quarter: return "quarter"
+            case .year:    return "year"
+            case .all:     return "log"
+            }
+        }
         /// Trailing-window length in days, or nil for "all".
         var days: Int? {
             switch self {
@@ -601,6 +773,11 @@ struct WorkoutsView: View {
         Self.timeFmt.string(from: Date(timeIntervalSince1970: TimeInterval(ts)))
     }
 
+    /// "HH:mm–HH:mm" when the row carries a real end, start-only otherwise (#157).
+    private func timeRangeLabel(_ start: Int, _ end: Int) -> String {
+        end > start ? "\(timeLabel(start))–\(timeLabel(end))" : timeLabel(start)
+    }
+
     private func durationLabel(_ s: Double?) -> String {
         guard let s, s > 0 else { return "–" }
         let total = Int(s.rounded())
@@ -629,35 +806,9 @@ struct WorkoutsView: View {
 
     // MARK: - Sport icons
 
-    private func sportIcon(_ sport: String) -> String {
-        let s = sport.lowercased()
-        switch true {
-        case s.contains("run"):                         return "figure.run"
-        case s.contains("walk") || s.contains("hike"):  return "figure.walk"
-        case s.contains("cycl") || s.contains("bike") || s.contains("ride"):
-                                                         return "figure.outdoor.cycle"
-        case s.contains("swim"):                        return "figure.pool.swim"
-        case s.contains("row"):                         return "figure.rower"
-        case s.contains("yoga"):                        return "figure.yoga"
-        case s.contains("strength") || s.contains("weight") || s.contains("lift"):
-                                                         return "dumbbell.fill"
-        case s.contains("box"):                         return "figure.boxing"
-        case s.contains("hiit") || s.contains("functional"):
-                                                         return "figure.highintensity.intervaltraining"
-        case s.contains("elliptical"):                  return "figure.elliptical"
-        case s.contains("ski"):                         return "figure.skiing.downhill"
-        case s.contains("tennis"):                      return "figure.tennis"
-        case s.contains("golf"):                        return "figure.golf"
-        case s.contains("soccer") || s.contains("football"):
-                                                         return "figure.soccer"
-        case s.contains("basketball"):                  return "figure.basketball"
-        case s.contains("dance"):                       return "figure.dance"
-        case s.contains("climb"):                       return "figure.climbing"
-        case s.contains("pilates"):                     return "figure.pilates"
-        case s.contains("meditat"):                     return "figure.mind.and.body"
-        default:                                        return "figure.mixed.cardio"
-        }
-    }
+    // Sport → SF Symbol now lives in StrandDesign (`sportSymbol`) so the Today HR
+    // overview annotates workouts with the same icons. Thin forwarder keeps call sites.
+    private func sportIcon(_ sport: String) -> String { sportSymbol(sport) }
 
     // MARK: - Row + column metrics (uniform)
 

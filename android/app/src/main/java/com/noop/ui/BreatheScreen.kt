@@ -13,10 +13,12 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Air
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
@@ -29,6 +31,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableDoubleStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -38,6 +41,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -46,6 +50,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import java.util.Locale
+import kotlin.math.roundToInt
 
 // MARK: - Pace presets (ported from BreathingView.Pace)
 
@@ -87,6 +92,37 @@ fun BreatheScreen(viewModel: AppViewModel) {
     var rmssd by remember { mutableStateOf<Double?>(null) }
     val rrWindow = 30
 
+    // Pre/post outcome capture: the baseline locks at start (or to the first rolling
+    // value inside the session's first ~60s); mean/peak stream while running. The last
+    // completed outcome persists via NoopPrefs (display-only — no Room table).
+    val context = LocalContext.current
+    var baselineRmssd by remember { mutableStateOf<Double?>(null) }
+    var sessionRmssdSum by remember { mutableDoubleStateOf(0.0) }
+    var sessionRmssdCount by remember { mutableIntStateOf(0) }
+    var sessionRmssdPeak by remember { mutableDoubleStateOf(0.0) }
+    var endedOutcome by remember { mutableStateOf<String?>(null) }
+    // SharedPreferences isn't reactive: read once, mirror writes into this state.
+    var lastStoredOutcome by remember {
+        mutableStateOf(NoopPrefs.of(context).getString(KEY_BREATHE_LAST_OUTCOME, "").orEmpty())
+    }
+
+    // Bank the just-ended session's outcome (mirrors BreathingView.captureOutcome):
+    // null below the 2-minute floor; "—" stays display-only, never persisted.
+    fun endSession() {
+        val core = breatheOutcomeCore(
+            baseline = baselineRmssd,
+            sum = sessionRmssdSum,
+            count = sessionRmssdCount,
+            peak = sessionRmssdPeak,
+            seconds = sessionSeconds,
+        )
+        endedOutcome = core
+        if (core != null && core != "—") {
+            lastStoredOutcome = core
+            NoopPrefs.of(context).edit().putString(KEY_BREATHE_LAST_OUTCOME, core).apply()
+        }
+    }
+
     // Orb expansion 0..1; driven by an eased animation per breath phase.
     val orbTarget = if (running && phase == Phase.Inhale) 1f else 0f
     val phaseDurationMs = ((if (phase == Phase.Inhale) pace.inhale else pace.exhale) * 1000).toInt()
@@ -106,7 +142,17 @@ fun BreatheScreen(viewModel: AppViewModel) {
                 if (rr.isEmpty()) return@collect
                 val merged = (rrBuffer.value + rr).takeLast(rrWindow)
                 rrBuffer.value = merged
-                rmssd = if (merged.size >= 2) Hrv.rmssd(merged) else null
+                val r = if (merged.size >= 2) Hrv.rmssd(merged) else null
+                rmssd = r
+                // Outcome capture: while running, lock the baseline (first value
+                // inside ~60s when none was available at start) and stream the
+                // session mean/peak.
+                if (running && r != null) {
+                    if (baselineRmssd == null && sessionSeconds <= 60) baselineRmssd = r
+                    sessionRmssdSum += r
+                    sessionRmssdCount += 1
+                    if (r > sessionRmssdPeak) sessionRmssdPeak = r
+                }
             }
     }
 
@@ -136,7 +182,13 @@ fun BreatheScreen(viewModel: AppViewModel) {
         }
     }
 
-    DisposableEffect(Unit) { onDispose { running = false } }
+    DisposableEffect(Unit) {
+        onDispose {
+            // Leaving mid-session still banks the outcome (mirrors macOS onDisappear → stop()).
+            if (running) endSession()
+            running = false
+        }
+    }
 
     ScreenScaffold(
         title = "Breathe",
@@ -162,7 +214,7 @@ fun BreatheScreen(viewModel: AppViewModel) {
         }
 
         // The orb card.
-        NoopCard(padding = 24.dp) {
+        NoopCard(padding = 24.dp, tint = Palette.restColor) {
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(18.dp),
@@ -176,12 +228,27 @@ fun BreatheScreen(viewModel: AppViewModel) {
                     )
                 }
 
-                BreathingOrb(progress = orbProgress, bpm = bpm, modifier = Modifier.height(280.dp))
+                // The breathing orb is the immersive hero: it floats over a calm Rest-world
+                // starfield, the scenic bloom deepening as the orb expands so the field breathes.
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(300.dp)
+                        .clip(RoundedCornerShape(Metrics.cardRadius)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    ScenicHeroBackground(
+                        modifier = Modifier.matchParentSize(),
+                        domain = DomainTheme.Rest,
+                        starCount = 56,
+                    )
+                    BreathingOrb(progress = orbProgress, bpm = bpm, modifier = Modifier.height(280.dp))
+                }
 
                 Text(
                     text = if (running) phaseWord(phase) else pace.tagline,
                     style = NoopType.subhead,
-                    color = if (running) Palette.accent else Palette.textSecondary,
+                    color = if (running) Palette.restBright else Palette.textSecondary,
                 )
 
                 SegmentedPillControl(
@@ -197,8 +264,21 @@ fun BreatheScreen(viewModel: AppViewModel) {
         Row(horizontalArrangement = Arrangement.spacedBy(Metrics.gap), modifier = Modifier.fillMaxWidth()) {
             Button(
                 onClick = {
-                    running = !running
-                    if (running) { sessionSeconds = 0; breathCount = 0 }
+                    if (running) {
+                        running = false
+                        endSession()
+                    } else {
+                        sessionSeconds = 0
+                        breathCount = 0
+                        endedOutcome = null
+                        // Baseline: prefer the pre-session rolling value; otherwise the
+                        // R-R collector locks the first value inside the first ~60s.
+                        baselineRmssd = rmssd
+                        sessionRmssdSum = 0.0
+                        sessionRmssdCount = 0
+                        sessionRmssdPeak = 0.0
+                        running = true
+                    }
                 },
                 modifier = Modifier.weight(1f),
                 colors = ButtonDefaults.buttonColors(
@@ -221,6 +301,45 @@ fun BreatheScreen(viewModel: AppViewModel) {
             ) {
                 Icon(Icons.Filled.GraphicEq, contentDescription = null, modifier = Modifier.padding(end = 6.dp))
                 Text("Test buzz", style = NoopType.body)
+            }
+        }
+
+        // Calm one-line outcome — fresh after a finished session, persisted on re-entry.
+        // Hidden while running and when there is nothing honest to show.
+        val outcomeLine = when {
+            running -> null
+            endedOutcome == "—" -> "RMSSD — · not enough R-R data"
+            endedOutcome != null -> "RMSSD $endedOutcome"
+            lastStoredOutcome.isNotEmpty() -> "Last session: $lastStoredOutcome"
+            else -> null
+        }
+        if (outcomeLine != null) {
+            // The session's HRV outcome as a frosted Rest-tinted card with a TrendChip for the
+            // vs-start RMSSD change. Presentation-only — the same outcome String + chip source.
+            val chipSource = endedOutcome ?: lastStoredOutcome.takeIf { it.isNotEmpty() }
+            val trend = chipSource?.takeIf { it != "—" }?.let { leadingSignedPercent(it) }
+            NoopCard(padding = 14.dp, tint = Palette.restColor) {
+                Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Filled.Air,
+                        contentDescription = null,
+                        tint = Palette.restBright,
+                        modifier = Modifier.size(16.dp).padding(end = 8.dp),
+                    )
+                    Text(
+                        outcomeLine,
+                        style = NoopType.footnote,
+                        color = Palette.textSecondary,
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (trend != null) {
+                        val sign = if (trend >= 0) "+" else "−"
+                        TrendChip(
+                            text = "$sign${kotlin.math.abs(trend)}% HRV",
+                            color = if (trend >= 0) Palette.statusPositive else Palette.textTertiary,
+                        )
+                    }
+                }
             }
         }
 
@@ -277,9 +396,9 @@ private fun BreathingOrb(progress: Float, bpm: Int?, modifier: Modifier = Modifi
                 .fillMaxWidth()
                 .aspectRatio(1f)
                 .clip(CircleShape)
-                .border(1.dp, Palette.hairline, CircleShape),
+                .border(1.dp, Palette.restColor.copy(alpha = 0.28f), CircleShape),
         )
-        // Outer halo.
+        // Outer halo — a Rest-world bloom that brightens as the orb expands.
         Box(
             modifier = Modifier
                 .fillMaxWidth(scale * 1.35f)
@@ -287,11 +406,11 @@ private fun BreathingOrb(progress: Float, bpm: Int?, modifier: Modifier = Modifi
                 .clip(CircleShape)
                 .background(
                     Brush.radialGradient(
-                        colors = listOf(Palette.accent.copy(alpha = 0.22f), Color.Transparent),
+                        colors = listOf(Palette.restBright.copy(alpha = 0.30f), Color.Transparent),
                     ),
                 ),
         )
-        // Orb body — soft accent gradient.
+        // Orb body — soft indigo→periwinkle Rest gradient.
         Box(
             modifier = Modifier
                 .fillMaxWidth(scale)
@@ -300,13 +419,13 @@ private fun BreathingOrb(progress: Float, bpm: Int?, modifier: Modifier = Modifi
                 .background(
                     Brush.radialGradient(
                         colors = listOf(
-                            Palette.accentHover.copy(alpha = 0.85f),
-                            Palette.accent.copy(alpha = 0.55f),
-                            Palette.accentMuted.copy(alpha = 0.85f),
+                            Palette.restBright.copy(alpha = 0.90f),
+                            Palette.restColor.copy(alpha = 0.62f),
+                            Palette.restDeep.copy(alpha = 0.85f),
                         ),
                     ),
                 )
-                .border(1.dp, Palette.accent.copy(alpha = 0.45f), CircleShape),
+                .border(1.dp, Palette.restBright.copy(alpha = 0.50f), CircleShape),
             contentAlignment = Alignment.Center,
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -392,6 +511,44 @@ private fun coherenceState(rmssd: Double?): Pair<String, StrandTone> = when {
     rmssd < 45 -> "Settling" to StrandTone.Neutral
     rmssd < 80 -> "Coherent" to StrandTone.Positive
     else -> "Deep calm" to StrandTone.Positive
+}
+
+// MARK: - Session outcome
+
+/** NoopPrefs key for the last completed session's outcome core (mirrors macOS
+ *  `@AppStorage("breathe.lastOutcome")`). Display-only persistence — no Room table. */
+private const val KEY_BREATHE_LAST_OUTCOME = "breathe.lastOutcome"
+
+/**
+ * End-of-session outcome core: "+18% vs start · peak 64 ms" — the session MEAN
+ * rolling RMSSD vs the start baseline. Null below the 2-minute floor (abandoned —
+ * show nothing); "—" when the session ran long enough but there was no usable
+ * baseline or no R-R data (never invent a number). Mirrors
+ * BreathingView.captureOutcome case-for-case.
+ */
+internal fun breatheOutcomeCore(
+    baseline: Double?,
+    sum: Double,
+    count: Int,
+    peak: Double,
+    seconds: Int,
+): String? {
+    if (seconds < 120) return null
+    if (baseline == null || baseline <= 0 || count == 0) return "—"
+    val mean = sum / count
+    val pct = ((mean - baseline) / baseline * 100).roundToInt()
+    return String.format(Locale.US, "%+d%% vs start · peak %.0f ms", pct, peak)
+}
+
+/**
+ * Parse a leading "+18%"/"-7%" from an outcome core, returning the integer percent — the signed
+ * RMSSD-vs-start change shown as a TrendChip. Null when no signed % leads (abandoned / "—" line).
+ * Display-only: it reads the same String the outcome line already shows, never new data.
+ */
+internal fun leadingSignedPercent(s: String): Int? {
+    val pct = s.indexOf('%')
+    if (pct <= 0) return null
+    return s.substring(0, pct).replace("+", "").trim().toIntOrNull()
 }
 
 // MARK: - Haptic hint

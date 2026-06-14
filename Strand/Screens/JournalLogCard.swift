@@ -18,7 +18,7 @@ struct JournalLogCard: View {
     let importedQuestions: [String]
     /// question → answeredYes for the selected day, native rows only (drives the chip state).
     let answers: [String: Bool]
-    @Binding var dayOffset: Int            // 0 = today, 1 = yesterday
+    @Binding var dayOffset: Int            // -1 = tomorrow, 0 = today, 1 = yesterday
     let onChanged: () -> Void              // parent re-runs load() after a write
 
     @State private var customDraft = ""
@@ -39,14 +39,17 @@ struct JournalLogCard: View {
                     pillButton("Done", selected: true) { editing = false }
                 } else {
                     pillButton("Edit", selected: false) { editing = true }
+                    dayPill("Tomorrow", offset: -1)
                     dayPill("Today", offset: 0)
                     dayPill("Yesterday", offset: 1)
                 }
             }
-            NoopCard {
+            NoopCard(tint: StrandPalette.restColor) {
                 VStack(alignment: .leading, spacing: 10) {
                     Text(editing
                          ? "Remove a question to tidy your list. Custom questions are deleted; the built-in ones are hidden and can be restored below."
+                         : dayOffset == -1
+                         ? "Logging ahead for tomorrow: today's activities inform tomorrow's recovery, just as yesterday's are reflected in today's. Tomorrow's answers line up with tomorrow's morning."
                          : "Answers are about the night and day leading into this morning — the same attribution a WHOOP export uses, so logged and imported days line up.")
                         .font(StrandFont.footnote)
                         .foregroundStyle(StrandPalette.textTertiary)
@@ -144,9 +147,9 @@ struct JournalLogCard: View {
                 .foregroundStyle(selected ? StrandPalette.surfaceBase : StrandPalette.textSecondary)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 5)
-                .background(selected ? StrandPalette.accent : StrandPalette.surfaceInset,
+                .background(selected ? StrandPalette.restColor : StrandPalette.surfaceInset,
                             in: Capsule())
-                .overlay(Capsule().stroke(selected ? StrandPalette.accent : StrandPalette.hairline,
+                .overlay(Capsule().stroke(selected ? StrandPalette.restColor : StrandPalette.hairline,
                                           lineWidth: 1))
         }
         .buttonStyle(.plain)

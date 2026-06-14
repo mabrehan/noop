@@ -33,6 +33,32 @@ final class IntelligenceEngine: ObservableObject {
         self.repo = repo; self.profile = profile; self.deviceId = deviceId
     }
 
+    /// UserDefaults flag guarding the one-shot #313 full-history Effort rescore (below). Set once the
+    /// pass completes so it never re-runs.
+    static let effortRescoreFlagKey = "intelligence.effortRescore.v313.done"
+
+    /// One-shot, on-upgrade FULL-history Effort rescore (#313 PART B). The Effort hero gauge + numbers
+    /// moved from the old 0–21 axis to NOOP's own 0–100 axis. On-device computed rows since v2.6.1
+    /// already store 0–100, but rows the engine computed on an OLDER build (capped at `maxDays` per run,
+    /// so deep history was never revisited) may still hold 0–21 strain.
+    ///
+    /// The SAFE fix is to recompute strain FROM SOURCE for every day with raw HR — those regenerate at
+    /// 0–100 with NO double-rescale risk — rather than a blind `strain*21→100` multiply that would
+    /// double-rescale the large population already on 0–100 (→ ~0–476). We do that by running the normal
+    /// `analyzeRecent` once with the `maxDays` cap lifted to the full history, then persist a flag so it
+    /// runs exactly once. IMPORTED rows are never rewritten here (the engine only ever writes under the
+    /// "-noop" computed source) — those are handled by re-import. A day already on 0–100 is recomputed
+    /// from the same raw HR and lands on 0–100 again: UNCHANGED axis (verified by test).
+    func runEffortRescoreIfNeeded(historyDays: Int = 4000) async {
+        guard !UserDefaults.standard.bool(forKey: Self.effortRescoreFlagKey) else { return }
+        await analyzeRecent(maxDays: historyDays)
+        // Only mark done if the pass actually completed (wasn't skipped because another tick held the
+        // `computing` lock). `computing` is false here once analyzeRecent's `defer` has run; a skipped
+        // call returns with `note` unset by it. Use the lock state: if a concurrent run was in progress
+        // the flag stays unset so the next launch retries — cheap, and correctness over a one-time cost.
+        if !computing { UserDefaults.standard.set(true, forKey: Self.effortRescoreFlagKey) }
+    }
+
     /// Compute on-device scores for each of the last `maxDays` that actually has raw HR data.
     /// Personal baselines (HRV / resting HR) are folded from the imported history, so even the first
     /// live night can be scored against your norm.
@@ -48,7 +74,8 @@ final class IntelligenceEngine: ObservableObject {
         defer { computing = false }
 
         let up = UserProfile(weightKg: profile.weightKg, heightCm: profile.heightCm,
-                             age: Double(profile.age), sex: profile.sex)
+                             age: Double(profile.age), sex: profile.sex,
+                             stepTicksPerStep: profile.stepTicksPerStep)
 
         let maxHR = profile.hrMaxOverride > 0 ? Double(profile.hrMaxOverride) : nil
         let now = Int(Date().timeIntervalSince1970)
@@ -81,9 +108,14 @@ final class IntelligenceEngine: ObservableObject {
         var nightlyRespByDay: [String: Double?] = [:]
         var nightlySkinByDay: [String: Double?] = [:]
 
+        // Floor `now` to LOCAL midnight (#277) so each `dayStart` lands on a local-day boundary and the
+        // day keys are LOCAL calendar days, consistent with the dashboard's local "today" lookup. A
+        // west-of-UTC user's evening crosses midnight UTC; bucketing by UTC put it in the next UTC day,
+        // which the local read never found (Toronto/UTC-4 report).
+        let nowLocalMidnight = Self.midnightLocal(now, offsetSec: tzOffset)
         for offset in 0..<maxDays {
-            let dayStart = now - offset * 86_400
-            let day = AnalyticsEngine.dayString(dayStart)
+            let dayStart = nowLocalMidnight - offset * 86_400
+            let day = AnalyticsEngine.dayString(dayStart, offsetSec: tzOffset)
             // Read a generous window around the night that ends on `day`; the stager finds the span.
             let from = dayStart - 30 * 3_600
             let to = dayStart + 12 * 3_600
@@ -97,12 +129,13 @@ final class IntelligenceEngine: ObservableObject {
             let skin = (try? await store.skinTempSamples(deviceId: deviceId, from: from, to: to, limit: 200_000)) ?? []
 
             // Calendar-day window for the ADDITIVE daily totals (steps + calories). The night window
-            // above is anchored to the current UTC time-of-day and ends at dayStart+12h, so for a PAST
+            // above is anchored to the current time-of-day and ends at dayStart+12h, so for a PAST
             // day whose late hours sit after that bound those hours are never read and the totals
-            // undercount. Read exactly [midnightUtc(day), midnightUtc(day)+86400) and hand it to
-            // analyzeDay's dayHr/daySteps, which use it ONLY for those totals. (floorMod so the
-            // midnight floor is correct for any sign; the store range is inclusive, so end at -1 s.)
-            let dayMid = dayStart - ((dayStart % 86_400) + 86_400) % 86_400
+            // undercount. Read exactly [localMidnight(day), localMidnight(day)+86400) and hand it to
+            // analyzeDay's dayHr/daySteps, which use it ONLY for those totals. `dayStart` is already a
+            // LOCAL midnight; midnightLocal is idempotent on it (the store range is inclusive, so end
+            // at -1 s). (#277 — local-day bucketing.)
+            let dayMid = Self.midnightLocal(dayStart, offsetSec: tzOffset)
             let dayEnd = dayMid + 86_400 - 1
             let dayHr = (try? await store.hrSamples(deviceId: deviceId, from: dayMid, to: dayEnd, limit: 200_000)) ?? []
             let daySteps = (try? await store.stepSamples(deviceId: deviceId, from: dayMid, to: dayEnd, limit: 200_000)) ?? []
@@ -150,11 +183,15 @@ final class IntelligenceEngine: ObservableObject {
         // baseline object is present — a CALIBRATING (<4-night) baseline would let one noisy
         // RSA night move recovery (mirrors the skin-temp use-site gate; honest cold-start).
         let respFold = Baselines.foldHistory(respSeq, cfg: respCfg)
+        // Skin-temp gated the same way for consistency: its only use-site re-checks `.usable`
+        // (AnalyticsEngine's skinTempDevC guard) so this is belt-and-suspenders, but it stops a
+        // future use-site from trusting a CALIBRATING baseline. (PR #97 review.)
+        let skinFold = Baselines.foldHistory(skinSeq, cfg: skinCfg)
         let baselines2 = AnalyticsEngine.ProfileBaselines(
             hrv: Baselines.foldHistory(hrvSeq, cfg: hrvCfg),
             restingHR: Baselines.foldHistory(rhrSeq, cfg: rhrCfg),
             resp: respFold.usable ? respFold : nil,
-            skinTemp: Baselines.foldHistory(skinSeq, cfg: skinCfg))
+            skinTemp: skinFold.usable ? skinFold : nil)
 
         // Real (non-detected) workouts in the scored window, used to de-duplicate detected bouts so a
         // user who BOTH has real sessions AND wears the strap doesn't see the same session twice (the
@@ -176,6 +213,9 @@ final class IntelligenceEngine: ObservableObject {
         var dailies: [DailyMetric] = []
         var cachedSleep: [CachedSleepSession] = []
         var workoutRows: [WorkoutRow] = []
+        // Rest composite (0–100) per computed night, persisted as the `sleep_performance` metric
+        // series so the dashboard's Rest score reflects the new composite, not raw efficiency.
+        var restPoints: [MetricPoint] = []
         for night in scoredNights {
             let recovery = recomputeRecovery(night.daily, baselines2)
             let skinDev = recomputeSkinTempDev(night.nightlySkin, baselines2.skinTemp)
@@ -183,6 +223,9 @@ final class IntelligenceEngine: ObservableObject {
                                 sleepMin: night.daily.totalSleepMin, hrv: night.daily.avgHrv,
                                 rhr: night.daily.restingHr))
             dailies.append(night.daily.with(recovery: recovery, skinTempDevC: skinDev))
+            if let rest = AnalyticsEngine.Rest.composite(daily: night.daily) {
+                restPoints.append(MetricPoint(day: night.daily.day, key: "sleep_performance", value: rest))
+            }
             cachedSleep.append(contentsOf: night.cachedSleep)
             // Persist the detected workouts the pipeline already computes (previously discarded).
             // Skip any bout overlapping a real imported workout so import+wear users don't
@@ -198,11 +241,25 @@ final class IntelligenceEngine: ObservableObject {
             }
         }
 
+        // #277 migration: the loop now keys days by the LOCAL calendar day. A prior run (before this
+        // fix) wrote the SAME period under UTC-day keys, so without a cleanup an off-by-one UTC row and
+        // the new local row would coexist as duplicate days. Delete the COMPUTED ("-noop") daily rows
+        // across the recompute window [oldest enumerated local day, newest] BEFORE re-upserting, then
+        // re-insert the local-keyed rows. Scoped to the computed source only — imported "my-whoop" rows
+        // are never touched (a BLE-only WHOOP 4.0 user has no import fallback). Rows older than the
+        // window keep their old keys (cosmetic off-by-one, acceptable). yyyy-MM-dd sorts
+        // chronologically, so the string range IS a date range.
+        let oldestDay = AnalyticsEngine.dayString(nowLocalMidnight - (maxDays - 1) * 86_400,
+                                                  offsetSec: tzOffset)
+        let newestDay = AnalyticsEngine.dayString(nowLocalMidnight, offsetSec: tzOffset)
+        _ = try? await store.deleteDailyMetrics(deviceId: computedId, from: oldestDay, to: newestDay)
+
         // Persist the computed scores under a dedicated "-noop" source so the WHOLE dashboard
         // (Today / Recovery / Strain / Sleep / Trends), not just this screen, reads them. The
         // Repository merges these UNDER any imported "my-whoop" rows, so a real WHOOP import
         // always wins; this only fills the days the strap collected but no import covered.
         if !dailies.isEmpty { _ = try? await store.upsertDailyMetrics(dailies, deviceId: computedId) }
+        if !restPoints.isEmpty { _ = try? await store.upsertMetricSeries(restPoints, deviceId: computedId) }
         if !cachedSleep.isEmpty { _ = try? await store.upsertSleepSessions(cachedSleep, deviceId: computedId) }
         // Make re-detection idempotent across runs: clear the prior computed detected workouts in the
         // scored window (a bout's startTs can drift as more HR arrives, which would otherwise orphan
@@ -218,7 +275,7 @@ final class IntelligenceEngine: ObservableObject {
 
         results = out
         note = out.isEmpty
-            ? "No scored nights yet. Wear the strap with NOOP connected overnight and the engine will score your recovery, strain and sleep itself, no WHOOP cloud required."
+            ? "No scored nights yet. Wear the strap with NOOP connected overnight and the engine will score your charge, effort and rest itself, no WHOOP cloud required."
             : nil
 
         // Reload the dashboard caches so the freshly computed scores show up immediately.
@@ -260,9 +317,14 @@ final class IntelligenceEngine: ObservableObject {
     /// recovery call + Android IntelligenceEngine.recomputeRecovery. (#78)
     private func recomputeRecovery(_ daily: DailyMetric, _ baselines: AnalyticsEngine.ProfileBaselines) -> Double? {
         guard let hrvVal = daily.avgHrv, let rhrVal = daily.restingHr, let hrvBase = baselines.hrv else { return nil }
+        // Charge enrichment: feed the Rest COMPOSITE (÷100) as the sleep-quality term instead of raw
+        // efficiency, and fold in the night's skin-temp deviation. Both come from the persisted daily
+        // fields (the raw streams are gone in pass 2). (Charge/Effort/Rest scoring redesign.)
+        let restQuality = AnalyticsEngine.Rest.composite(daily: daily).map { $0 / 100.0 } ?? daily.efficiency
         return RecoveryScorer.recovery(hrv: hrvVal, rhr: Double(rhrVal), resp: daily.respRateBpm,
                                        hrvBaseline: hrvBase, rhrBaseline: baselines.restingHR,
-                                       respBaseline: baselines.resp, sleepPerf: daily.efficiency)
+                                       respBaseline: baselines.resp, sleepPerf: restQuality,
+                                       skinTempDev: daily.skinTempDevC)
     }
 
     /// Re-derive the skin-temperature deviation (°C) for a night against the freshly-seeded personal
@@ -272,6 +334,27 @@ final class IntelligenceEngine: ObservableObject {
     private func recomputeSkinTempDev(_ nightly: Double?, _ base: BaselineState?) -> Double? {
         guard let v = nightly, let b = base, b.usable else { return nil }
         return (Baselines.deviation(v, state: b).delta * 100.0).rounded() / 100.0
+    }
+
+    /// Floor a unix-seconds timestamp to 00:00:00 of its UTC calendar day. Mirrors the Android
+    /// IntelligenceEngine.midnightUtc; the floorMod form is correct for any sign.
+    nonisolated static func midnightUtc(_ ts: Int) -> Int { ts - floorMod(ts, 86_400) }
+
+    /// Floor a unix-seconds timestamp to 00:00:00 of its LOCAL calendar day (#277). `offsetSec` is
+    /// seconds EAST of UTC. Shift into local time, floor to the local day, shift back:
+    /// `ts - floorMod(ts + offsetSec, 86400)`. floorMod keeps the floor correct for negative offsets
+    /// and negative timestamps. `offsetSec == 0` reduces exactly to `midnightUtc`. Mirrors the
+    /// Android IntelligenceEngine.midnightLocal byte-for-byte.
+    nonisolated static func midnightLocal(_ ts: Int, offsetSec: Int) -> Int {
+        ts - floorMod(ts + offsetSec, 86_400)
+    }
+
+    /// Euclidean modulo (result has the sign of the divisor) — matches Kotlin/Java Math.floorMod, so
+    /// the LOCAL-midnight floor is identical across platforms for any sign of ts/offset. Swift's `%`
+    /// is a remainder (sign of the dividend), which would mis-floor negative inputs.
+    nonisolated private static func floorMod(_ a: Int, _ b: Int) -> Int {
+        let r = a % b
+        return (r != 0 && (r < 0) != (b < 0)) ? r + b : r
     }
 }
 

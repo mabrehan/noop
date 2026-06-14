@@ -37,6 +37,23 @@ struct IntervalTimerView: View {
     @State private var running: Bool = false
     @State private var elapsed: Int = 0             // total elapsed seconds across the session
 
+    /// Draw-in fraction for the hero progress gauge — eased toward `intervalProgress` so the ring
+    /// fills smoothly each tick (the BevelGauge owns its own bloom; the caller owns this animation).
+    @State private var animatedProgress: Double = 0
+
+    // MARK: iPhone haptics (iOS only)
+    //
+    // The strap buzz (`buzz`) only fires when a strap is bonded; on iPhone the device in
+    // the user's hand has a Taptic Engine, so we mirror every transition cue with native
+    // haptics that fire regardless of bond state. A monotonically-bumped Int token drives a
+    // single `.sensoryFeedback`, so even a repeated cue (the 3-2-1 tick three seconds running)
+    // re-fires because the trigger value always changes.
+    #if os(iOS)
+    private enum HapticCue { case work, rest, tick, done }
+    @State private var lastHaptic: HapticCue = .work
+    @State private var hapticTick: Int = 0
+    #endif
+
     // 1Hz tick.
     private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -63,11 +80,25 @@ struct IntervalTimerView: View {
         return workSeconds * rounds + restSeconds * max(0, rounds - 1)
     }
 
+    /// The active phase's colour world: WORK lives in the Effort (amber) world, REST in the Rest
+    /// (periwinkle) world, DONE in positive green. Drives the gauge stroke, glow and read-out.
     private var phaseColor: Color {
         switch phase {
-        case .work: return StrandPalette.accent
-        case .rest: return StrandPalette.metricCyan
+        case .work: return StrandPalette.effortColor
+        case .rest: return StrandPalette.restColor
         case .done: return StrandPalette.statusPositive
+        }
+    }
+
+    /// Deep→bright ramp for the active phase, fed to the progress `BevelGauge`'s arc.
+    private var phaseStops: [Gradient.Stop] {
+        switch phase {
+        case .work: return [.init(color: StrandPalette.effortDeep, location: 0),
+                            .init(color: StrandPalette.effortBright, location: 1)]
+        case .rest: return [.init(color: StrandPalette.restDeep, location: 0),
+                            .init(color: StrandPalette.restBright, location: 1)]
+        case .done: return [.init(color: StrandPalette.statusPositive.opacity(0.6), location: 0),
+                            .init(color: StrandPalette.statusPositive, location: 1)]
         }
     }
 
@@ -101,6 +132,24 @@ struct IntervalTimerView: View {
             if !running { resetToStart() }
         }
         .onAppear { if remaining == 0 { resetToStart() } }
+        // Keep the screen awake while a session runs (no-op on macOS). One onChange covers
+        // every running→false transition — manual pause, auto-finish, and reset — and the
+        // onDisappear is a safety net so navigating away mid-run never leaves the idle timer
+        // disabled app-wide.
+        .onChange(of: running) { ScreenIdle.keepAwake($0) }
+        .onDisappear { ScreenIdle.keepAwake(false) }
+        #if os(iOS)
+        // iPhone haptics: one modifier emits a different feel per cue, re-firing on every
+        // token bump. Fires regardless of strap bond so the timer is fully usable unstrapped.
+        .sensoryFeedback(trigger: hapticTick) { _, _ in
+            switch lastHaptic {
+            case .work: return .impact(weight: .heavy)      // strong cue into WORK
+            case .rest: return .impact(weight: .light)      // soft cue into REST
+            case .tick: return .selection                   // 3-2-1 countdown tick
+            case .done: return .success                     // session complete
+            }
+        }
+        #endif
     }
 
     // MARK: Status row
@@ -123,83 +172,86 @@ struct IntervalTimerView: View {
         }
     }
 
-    // MARK: Stage card — the big glanceable face
+    // MARK: Stage card — the immersive hero face over a scenic Effort backdrop
 
+    /// The running timer is the hero: a layered-ring `BevelGauge` of the phase progress, glowing in
+    /// the active phase's world (WORK → effort amber, REST → rest periwinkle), floated on a frosted
+    /// Effort-tinted card over a scenic starfield. The countdown is the gauge's centred numeral.
     private var stageCard: some View {
-        StrandCard(padding: 24) {
-            VStack(spacing: 18) {
-                // Phase + round line
-                HStack(alignment: .firstTextBaseline) {
-                    Text(phase.label)
-                        .font(StrandFont.number(34, weight: .heavy))
-                        .tracking(2)
-                        .foregroundStyle(phaseColor)
-                        .shadow(color: phaseColor.opacity(0.4), radius: 12)
-                    Spacer()
-                    HStack(spacing: 6) {
-                        Text("ROUND").strandOverline()
-                        Text("\(min(currentRound, rounds))")
-                            .font(StrandFont.number(20))
-                            .foregroundStyle(StrandPalette.textPrimary)
-                        Text("/ \(rounds)")
-                            .font(StrandFont.number(20))
-                            .foregroundStyle(StrandPalette.textTertiary)
+        ZStack {
+            ScenicHeroBackground(domain: .effort)
+                .clipShape(RoundedRectangle(cornerRadius: NoopMetrics.cardRadius, style: .continuous))
+            StrandCard(padding: 24, tint: phaseColor) {
+                VStack(spacing: 18) {
+                    // Phase chip + round chip line — both frosted.
+                    HStack {
+                        phaseChip
+                        Spacer()
+                        roundChip
                     }
-                }
 
-                // The ring + countdown
-                ZStack {
-                    intervalRing
-                    VStack(spacing: 2) {
-                        Text(isFinished ? "✓" : "\(remaining)")
-                            .font(StrandFont.number(96, weight: .bold))
-                            .foregroundStyle(isFinished ? StrandPalette.statusPositive : StrandPalette.textPrimary)
-                            .contentTransition(.numericText())
-                            .animation(.snappy, value: remaining)
-                            .monospacedDigit()
-                        Text(isFinished ? "SESSION DONE" : "SECONDS")
+                    // The hero progress gauge with the countdown at its centre.
+                    BevelGauge(
+                        fraction: isFinished ? 1 : intervalProgress,
+                        stops: phaseStops,
+                        tipColor: phaseColor,
+                        numberText: isFinished ? "✓" : "\(remaining)",
+                        captionText: isFinished ? "SESSION DONE" : "SECONDS",
+                        stateText: nil,
+                        diameter: 240,
+                        lineWidth: 18,
+                        showsLabel: true,
+                        animatedFraction: isFinished ? 1 : animatedProgress
+                    )
+                    .frame(maxWidth: .infinity)
+                    .animation(.snappy, value: remaining)
+
+                    controls
+
+                    if !live.bonded {
+                        Label("Bond your strap on the Live screen to feel the transitions hands-free.",
+                              systemImage: "wave.3.right")
                             .font(StrandFont.footnote)
-                            .tracking(1.2)
                             .foregroundStyle(StrandPalette.textTertiary)
+                            .frame(maxWidth: .infinity, alignment: .center)
                     }
-                }
-                .frame(height: 260)
-                .frame(maxWidth: .infinity)
-
-                controls
-
-                if !live.bonded {
-                    Label("Bond your strap on the Live screen to feel the transitions hands-free.",
-                          systemImage: "wave.3.right")
-                        .font(StrandFont.footnote)
-                        .foregroundStyle(StrandPalette.textTertiary)
-                        .frame(maxWidth: .infinity, alignment: .center)
                 }
             }
         }
+        // Drive the gauge's draw-in toward the live interval progress, eased per tick.
+        .onChange(of: intervalProgress) { newValue in
+            withAnimation(.linear(duration: 0.9)) { animatedProgress = newValue }
+        }
+        .onAppear { animatedProgress = intervalProgress }
     }
 
-    private var intervalRing: some View {
-        ZStack {
-            Circle()
-                .stroke(StrandPalette.surfaceInset, lineWidth: 18)
-            Circle()
-                .stroke(StrandPalette.hairline, lineWidth: 1)
-                .padding(8)
-            Circle()
-                .trim(from: 0, to: isFinished ? 1 : intervalProgress)
-                .stroke(
-                    AngularGradient(
-                        gradient: Gradient(colors: [phaseColor.opacity(0.6), phaseColor]),
-                        center: .center
-                    ),
-                    style: StrokeStyle(lineWidth: 18, lineCap: .round)
-                )
-                .rotationEffect(.degrees(-90))
-                .shadow(color: phaseColor.opacity(0.5), radius: 8)
-                .animation(.linear(duration: 0.9), value: intervalProgress)
+    /// Frosted phase pill (WORK / REST / DONE) tinted to the active world.
+    private var phaseChip: some View {
+        Text(phase.label)
+            .font(StrandFont.rounded(15, weight: .heavy))
+            .tracking(2)
+            .foregroundStyle(phaseColor)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(phaseColor.opacity(0.16), in: Capsule(style: .continuous))
+            .overlay(Capsule(style: .continuous).strokeBorder(phaseColor.opacity(0.35), lineWidth: 1))
+    }
+
+    /// Frosted round chip — "ROUND n / N".
+    private var roundChip: some View {
+        HStack(spacing: 6) {
+            Text("ROUND").strandOverline()
+            Text("\(min(currentRound, rounds))")
+                .font(StrandFont.number(18))
+                .foregroundStyle(StrandPalette.textPrimary)
+            Text("/ \(rounds)")
+                .font(StrandFont.number(18))
+                .foregroundStyle(StrandPalette.textTertiary)
         }
-        .frame(width: 240, height: 240)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(StrandPalette.surfaceInset, in: Capsule(style: .continuous))
+        .overlay(Capsule(style: .continuous).strokeBorder(StrandPalette.hairline, lineWidth: 1))
     }
 
     private var controls: some View {
@@ -244,13 +296,14 @@ struct IntervalTimerView: View {
                         .foregroundStyle(StrandPalette.textPrimary)
                 }
 
-                // Slim total-session progress bar
+                // Slim total-session progress bar — filled with the Effort world gradient.
                 GeometryReader { geo in
                     ZStack(alignment: .leading) {
                         Capsule()
                             .fill(StrandPalette.surfaceInset)
                         Capsule()
-                            .fill(StrandPalette.accent)
+                            .fill(LinearGradient(gradient: StrandPalette.effortGradient,
+                                                 startPoint: .leading, endPoint: .trailing))
                             .frame(width: geo.size.width * sessionProgress)
                             .animation(.linear(duration: 0.9), value: sessionProgress)
                     }
@@ -258,8 +311,8 @@ struct IntervalTimerView: View {
                 .frame(height: 8)
 
                 HStack(spacing: 0) {
-                    overviewStat("Work", "\(workSeconds)s", StrandPalette.accent)
-                    overviewStat("Rest", "\(restSeconds)s", StrandPalette.metricCyan)
+                    overviewStat("Work", "\(workSeconds)s", StrandPalette.effortColor)
+                    overviewStat("Rest", "\(restSeconds)s", StrandPalette.restColor)
                     overviewStat("Rounds", "\(rounds)", StrandPalette.textPrimary)
                     overviewStat("Remaining", timeString(max(0, totalPlanned - elapsed)), StrandPalette.textSecondary)
                 }
@@ -287,10 +340,10 @@ struct IntervalTimerView: View {
             VStack(alignment: .leading, spacing: 14) {
                 Text("Configure").strandOverline()
                 configStepper(title: "Work", unit: "sec", value: $workSeconds,
-                              range: 5...600, step: 5, tint: StrandPalette.accent)
+                              range: 5...600, step: 5, tint: StrandPalette.effortColor)
                 Divider().overlay(StrandPalette.hairline)
                 configStepper(title: "Rest", unit: "sec", value: $restSeconds,
-                              range: 5...600, step: 5, tint: StrandPalette.metricCyan)
+                              range: 5...600, step: 5, tint: StrandPalette.restColor)
                 Divider().overlay(StrandPalette.hairline)
                 configStepper(title: "Rounds", unit: nil, value: $rounds,
                               range: 1...30, step: 1, tint: StrandPalette.textPrimary)
@@ -332,6 +385,9 @@ struct IntervalTimerView: View {
         // Optional 3-2-1 countdown tick on the last seconds of the current phase.
         if remaining <= 3 && remaining >= 1 {
             buzz(loops: 1)
+            #if os(iOS)
+            haptic(.tick)
+            #endif
         }
 
         if remaining > 1 {
@@ -356,6 +412,9 @@ struct IntervalTimerView: View {
                 phase = .rest
                 remaining = max(1, restSeconds)
                 buzz(loops: 1)              // short cue into rest
+                #if os(iOS)
+                haptic(.rest)
+                #endif
             }
         case .rest:
             // Rest done → next round's work.
@@ -363,6 +422,9 @@ struct IntervalTimerView: View {
             phase = .work
             remaining = max(1, workSeconds)
             buzz(loops: 3)                  // strong cue into work
+            #if os(iOS)
+            haptic(.work)
+            #endif
         case .done:
             break
         }
@@ -375,6 +437,9 @@ struct IntervalTimerView: View {
             running = false
         }
         buzz(loops: 5)                      // long completion cue
+        #if os(iOS)
+        haptic(.done)
+        #endif
     }
 
     private func toggleRunning() {
@@ -386,7 +451,12 @@ struct IntervalTimerView: View {
             let startingFresh = (phase == .work && currentRound == 1
                                  && remaining == max(1, workSeconds) && elapsed == 0)
             running = true
-            if startingFresh { buzz(loops: 3) }
+            if startingFresh {
+                buzz(loops: 3)
+                #if os(iOS)
+                haptic(.work)
+                #endif
+            }
         }
     }
 
@@ -409,6 +479,16 @@ struct IntervalTimerView: View {
         guard live.bonded else { return }
         model.buzz(loops: loops)
     }
+
+    #if os(iOS)
+    /// Fire an iPhone haptic cue. Additive to `buzz` and unguarded by bond state, so the
+    /// timer gives tactile feedback even with no strap. Bumping the token re-triggers
+    /// `.sensoryFeedback` even when the same cue repeats.
+    private func haptic(_ cue: HapticCue) {
+        lastHaptic = cue
+        hapticTick &+= 1
+    }
+    #endif
 
     // MARK: Formatting
 

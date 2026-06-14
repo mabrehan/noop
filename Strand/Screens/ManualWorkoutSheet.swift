@@ -28,6 +28,11 @@ struct ManualWorkoutSheet: View {
     @State private var avgHrText: String
     @State private var kcalText: String
 
+    /// Focus for the numeric (Avg HR / Calories) fields so the keyboard Done button can resign them —
+    /// the decimal pad has no return key. iOS-only effect; the enum keeps both platforms compiling.
+    private enum NumberField: Hashable { case avgHr, calories }
+    @FocusState private var focusedField: NumberField?
+
     init(editing: WorkoutRow? = nil,
          onSave: @escaping (_ row: WorkoutRow, _ replacing: WorkoutRow?) -> Void) {
         self.editing = editing
@@ -65,19 +70,19 @@ struct ManualWorkoutSheet: View {
                     HStack(spacing: 12) {
                         Stepper(value: $durationMin, in: 1...(24 * 60), step: 5) {
                             Text(durationLabel)
-                                .font(StrandFont.bodyNumber)
-                                .foregroundStyle(StrandPalette.textPrimary)
+                                .font(StrandFont.number(16))
+                                .foregroundStyle(StrandPalette.effortBright)
                         }
                         .accessibilityLabel("Duration in minutes")
                     }
                 }
                 HStack(spacing: 14) {
                     field("Avg HR") {
-                        numberInput("optional", text: $avgHrText, unit: "bpm")
+                        numberInput("optional", text: $avgHrText, unit: "bpm", field: .avgHr)
                             .accessibilityLabel("Average heart rate in beats per minute, optional")
                     }
                     field("Calories") {
-                        numberInput("optional", text: $kcalText, unit: "kcal")
+                        numberInput("optional", text: $kcalText, unit: "kcal", field: .calories)
                             .accessibilityLabel("Calories in kilocalories, optional")
                     }
                 }
@@ -86,22 +91,45 @@ struct ManualWorkoutSheet: View {
             footer
         }
         .padding(24)
+        // A fixed 420pt is right for the free-floating macOS sheet, but on iPhone it's wider than
+        // the screen, so the Avg HR/Calories row, the Start DatePicker and the footer ran off the
+        // right edge (#185, same fix as WhatsNewView/ScoringGuideView). iOS fills the presented
+        // sheet's width and sizes to content height instead.
+        #if os(macOS)
         .frame(width: 420)
+        #else
+        .frame(maxWidth: .infinity)
+        // A short 5-field form → open at .medium with .large a drag away; the grabber also gives the
+        // top dismiss affordance the sheet otherwise lacks (only a bottom Cancel).
+        .noopSheetPresentation(largeFirst: false)
+        #endif
         .background(StrandPalette.surfaceOverlay)
+        // Lets the user dismiss the decimal pad (which has no return key) and reach Cancel/Add. No-op on macOS.
+        .keyboardDoneToolbar($focusedField)
     }
 
     // MARK: - Sections
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(editing == nil ? "Add Workout" : "Edit Workout")
-                .font(StrandFont.title2)
-                .foregroundStyle(StrandPalette.textPrimary)
-            Text(editing == nil
-                 ? "Log a session you tracked elsewhere."
-                 : "Adjust this session's details.")
-                .font(StrandFont.subhead)
-                .foregroundStyle(StrandPalette.textSecondary)
+        HStack(alignment: .top, spacing: 12) {
+            // A small Effort-world glyph so the sheet reads as part of the workouts (amber) world.
+            Image(systemName: "figure.run")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(StrandPalette.effortColor)
+                .frame(width: 30, height: 30)
+                .background(StrandPalette.effortColor.opacity(0.14), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(editing == nil ? "Add Workout" : "Edit Workout")
+                    .font(StrandFont.title2)
+                    .foregroundStyle(StrandPalette.textPrimary)
+                Text(editing == nil
+                     ? "Log a session you tracked elsewhere."
+                     : "Adjust this session's details.")
+                    .font(StrandFont.subhead)
+                    .foregroundStyle(StrandPalette.textSecondary)
+            }
+            Spacer(minLength: 0)
         }
     }
 
@@ -128,15 +156,22 @@ struct ManualWorkoutSheet: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func numberInput(_ placeholder: String, text: Binding<String>, unit: String) -> some View {
+    private func numberInput(_ placeholder: String, text: Binding<String>, unit: String, field: NumberField) -> some View {
         HStack(spacing: 6) {
             TextField(placeholder, text: text)
                 .textFieldStyle(.plain)
                 .font(StrandFont.bodyNumber)
                 .foregroundStyle(StrandPalette.textPrimary)
+                // Numeric entry → decimal pad on iOS (digits + "."), not the QWERTY default; no-op on macOS.
+                .numericKeyboard()
+                .focused($focusedField, equals: field)
             Text(unit).font(StrandFont.footnote).foregroundStyle(StrandPalette.textTertiary)
         }
         .padding(.horizontal, 12).padding(.vertical, 9)
+        // Fill the field column so the Avg HR / Calories boxes share an identical width — left to
+        // their intrinsic size the two boxes rendered unequal (the "bpm"/"kcal" units differ in
+        // length), so the side-by-side row read as lopsided (#234).
+        .frame(maxWidth: .infinity)
         .background(StrandPalette.surfaceInset, in: inputShape)
         .overlay(inputShape.strokeBorder(StrandPalette.hairline, lineWidth: 1))
     }

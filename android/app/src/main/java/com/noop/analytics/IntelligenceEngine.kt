@@ -1,6 +1,7 @@
 package com.noop.analytics
 
 import com.noop.data.DailyMetric
+import com.noop.data.MetricSeriesRow
 import com.noop.data.SleepSession
 import com.noop.data.WhoopRepository
 import com.noop.data.WorkoutRow
@@ -87,6 +88,48 @@ object IntelligenceEngine {
         analyzeRecentOnCpu(repo, profile, maxDays, importedDeviceId, maxHROverride, nowSeconds)
     }
 
+    /** History span for the one-shot Effort rescore — large enough to cover any real wear history,
+     *  matching the Swift `historyDays` default. */
+    const val EFFORT_RESCORE_HISTORY_DAYS: Int = 4000
+
+    /**
+     * One-shot, on-upgrade FULL-history Effort rescore (#313 PART B). The Effort hero gauge + numbers
+     * moved from the old 0–21 axis to NOOP's own 0–100 axis. On-device computed rows since v2.6.0 already
+     * store 0–100, but rows the engine computed on an OLDER build (capped at [maxDays] per run, so deep
+     * history was never revisited) may still hold 0–21 strain.
+     *
+     * The SAFE fix is to recompute strain FROM SOURCE for every day with raw HR — those regenerate at
+     * 0–100 with NO double-rescale risk — rather than a blind `strain*100/21` multiply that would
+     * double-rescale the large population already on 0–100 (→ ~0–476). We do that by running the normal
+     * [analyzeRecent] once with the [maxDays] cap lifted to the full history, then persist a flag (via the
+     * injected [flagGet]/[flagSet]) so it runs exactly once. IMPORTED rows are never rewritten here (the
+     * engine only ever writes under the "-noop" computed source) — those are handled by re-import. A day
+     * already on 0–100 is recomputed from the same raw HR and lands on 0–100 again: UNCHANGED axis.
+     *
+     * The flag get/set are passed in so this stays a pure-JVM analytics object (no Android Context). The
+     * caller (AppViewModel) wires them to [com.noop.ui.NoopPrefs]. Mirrors Swift
+     * IntelligenceEngine.runEffortRescoreIfNeeded.
+     */
+    suspend fun runEffortRescoreIfNeeded(
+        repo: WhoopRepository,
+        profile: UserProfile = UserProfile(),
+        importedDeviceId: String = "my-whoop",
+        maxHROverride: Double? = null,
+        flagGet: () -> Boolean,
+        flagSet: () -> Unit,
+        historyDays: Int = EFFORT_RESCORE_HISTORY_DAYS,
+    ) {
+        if (flagGet()) return
+        analyzeRecent(
+            repo = repo,
+            profile = profile,
+            maxDays = historyDays,
+            importedDeviceId = importedDeviceId,
+            maxHROverride = maxHROverride,
+        )
+        flagSet()
+    }
+
     private suspend fun analyzeRecentOnCpu(
         repo: WhoopRepository,
         profile: UserProfile = UserProfile(),
@@ -139,9 +182,14 @@ object IntelligenceEngine {
         // resp baseline the recovery composite's wResp=0.05 term scores against.
         val nightlyRespByDay = LinkedHashMap<String, Double?>()
 
+        // Floor `now` to LOCAL midnight (#277) so each `dayStart` lands on a local-day boundary and the
+        // day keys are LOCAL calendar days, consistent with the dashboard's local "today" lookup. A
+        // west-of-UTC user's evening crosses midnight UTC; bucketing by UTC put it in the next UTC day,
+        // which the local read never found (Toronto/UTC-4 report).
+        val nowLocalMidnight = midnightLocal(nowSeconds, tzOffsetSeconds)
         for (offset in 0 until maxDays) {
-            val dayStart = nowSeconds - offset * SECONDS_PER_DAY
-            val day = AnalyticsEngine.dayString(dayStart)
+            val dayStart = nowLocalMidnight - offset * SECONDS_PER_DAY
+            val day = AnalyticsEngine.dayString(dayStart, tzOffsetSeconds)
             // Read a generous window around the night that ends on `day`; the stager finds
             // the span. (30 h before, 12 h after — matches the Swift window.)
             val from = dayStart - 30 * 3_600L
@@ -156,13 +204,14 @@ object IntelligenceEngine {
             val skin = repo.skinTempSamples(importedDeviceId, from, to, STREAM_LIMIT)
 
             // Calendar-day window for the ADDITIVE daily totals (steps + calories). The night window
-            // above is anchored to the current UTC time-of-day and ends at dayStart+12h, so for a PAST
+            // above is anchored to the current time-of-day and ends at dayStart+12h, so for a PAST
             // day whose late hours sit after that bound those hours are never read and the totals
-            // undercount. Read exactly [midnightUtc(day), midnightUtc(day)+86400) and hand it to
+            // undercount. Read exactly [localMidnight(day), localMidnight(day)+86400) and hand it to
             // analyzeDay's dayHr/daySteps, which use it ONLY for those totals. Same STREAM_LIMIT; the
             // MIN_HR_SAMPLES gate above stays on the night window so empty days are still skipped.
-            // (the DAO range is inclusive, so end at +86400-1s; analyzeDay also filters to the day.)
-            val dayMidnight = midnightUtc(dayStart)
+            // `dayStart` is already a LOCAL midnight; midnightLocal is idempotent on it (the DAO range
+            // is inclusive, so end at +86400-1s; analyzeDay also filters to the day). (#277)
+            val dayMidnight = midnightLocal(dayStart, tzOffsetSeconds)
             val dayEnd = dayMidnight + SECONDS_PER_DAY - 1
             val dayHr = repo.hrSamples(importedDeviceId, dayMidnight, dayEnd, STREAM_LIMIT)
             val daySteps = repo.stepSamples(importedDeviceId, dayMidnight, dayEnd, STREAM_LIMIT)
@@ -231,8 +280,11 @@ object IntelligenceEngine {
         val respBase2 = Baselines.foldHistory(respSeq, respCfg).takeIf { it.usable }
         // Skin-temp baseline is on-device-only (imported rows carry skinTempDevC, not the raw mean),
         // so fold purely over the pass-1 nightly means in chronological order. (PR #85)
+        // Gated on `usable` for consistency with the resp baseline above AND the Swift reference
+        // (IntelligenceEngine.swift:162 `skinFold.usable ? skinFold : nil`) — the use-site re-checks
+        // `usable` too, so this is belt-and-suspenders, but it keeps the platforms byte-aligned.
         val skinSeq = nightlySkinByDay.entries.sortedBy { it.key }.map { it.value }
-        val skinBase2 = Baselines.foldHistory(skinSeq, skinCfg)
+        val skinBase2 = Baselines.foldHistory(skinSeq, skinCfg).takeIf { it.usable }
         val baselines2 = ProfileBaselines(
             hrv = hrvBase2, restingHR = rhrBase2, resp = respBase2, skinTemp = skinBase2,
         )
@@ -257,10 +309,16 @@ object IntelligenceEngine {
         val dailies = ArrayList<DailyMetric>()
         val sleepRows = ArrayList<SleepSession>()
         val workoutRows = ArrayList<WorkoutRow>()
+        // Rest composite (0–100) per night → persisted as the sleep_performance metric series so the
+        // dashboard Rest score reflects the new composite, not raw efficiency. Swift parity.
+        val restRows = ArrayList<MetricSeriesRow>()
 
         for (res in scoredNights) {
             val recovery = recomputeRecovery(res.daily, baselines2)
             val skinTempDevC = recomputeSkinTempDev(res.nightlySkinTempC, baselines2.skinTemp)
+            RestScorer.restFromDaily(res.daily)?.let { rest ->
+                restRows.add(MetricSeriesRow(deviceId = computedId, day = res.daily.day, key = "sleep_performance", value = rest))
+            }
 
             out.add(
                 Computed(
@@ -310,11 +368,26 @@ object IntelligenceEngine {
             }
         }
 
+        // #277 migration: the loop now keys days by the LOCAL calendar day. A prior run (before this
+        // fix) wrote the SAME period under UTC-day keys, so without a cleanup an off-by-one UTC row and
+        // the new local row would coexist as duplicate days. Delete the COMPUTED ("-noop") daily rows
+        // across the recompute window [oldest enumerated local day, newest] BEFORE re-upserting, then
+        // re-insert the local-keyed rows. Scoped to the computed source only — imported "my-whoop" rows
+        // are never touched (a BLE-only WHOOP 4.0 user has no import fallback). Rows older than the
+        // window keep their old keys (cosmetic off-by-one, acceptable). yyyy-MM-dd sorts
+        // chronologically, so the string range IS a date range.
+        val oldestDay = AnalyticsEngine.dayString(
+            nowLocalMidnight - (maxDays - 1) * SECONDS_PER_DAY, tzOffsetSeconds,
+        )
+        val newestDay = AnalyticsEngine.dayString(nowLocalMidnight, tzOffsetSeconds)
+        repo.deleteComputedDailyInRange(computedId, oldestDay, newestDay)
+
         // Persist the computed scores under the dedicated "-noop" source so the WHOLE
         // dashboard (Today / Recovery / Strain / Sleep / Trends) reads them. The repository
         // merges these UNDER any imported "my-whoop" rows, so a real WHOOP import always wins;
         // this only fills the days the strap collected but no import covered.
         if (dailies.isNotEmpty()) repo.upsertDailyMetrics(dailies)
+        if (restRows.isNotEmpty()) repo.upsertMetricSeries(restRows)
         if (sleepRows.isNotEmpty()) repo.upsertSleepSessions(sleepRows)
         // Make re-detection idempotent across runs: clear the prior computed detected workouts
         // in the scored window (a bout's startTs can drift as more HR arrives, which would
@@ -370,6 +443,10 @@ object IntelligenceEngine {
         val hrvVal = daily.avgHrv ?: return null
         val rhrVal = daily.restingHr ?: return null
         val hrvBase = baselines.hrv ?: return null
+        // Charge enrichment: feed the Rest COMPOSITE (÷100) as the sleep-quality term instead of raw
+        // efficiency, and fold in the night's skin-temp deviation (both from persisted daily fields).
+        // Mirrors the Swift recomputeRecovery. (Charge/Effort/Rest scoring redesign.)
+        val restQuality = RestScorer.restFromDaily(daily)?.let { it / 100.0 } ?: daily.efficiency
         return RecoveryScorer.recovery(
             hrv = hrvVal,
             rhr = rhrVal.toDouble(),
@@ -377,7 +454,8 @@ object IntelligenceEngine {
             hrvBaseline = hrvBase,
             rhrBaseline = baselines.restingHR,
             respBaseline = baselines.resp,
-            sleepPerf = daily.efficiency,
+            sleepPerf = restQuality,
+            skinTempDev = daily.skinTempDevC,
         )
     }
 
@@ -390,7 +468,12 @@ object IntelligenceEngine {
     private fun recomputeSkinTempDev(nightly: Double?, base: BaselineState?): Double? {
         val v = nightly ?: return null
         val b = base?.takeIf { it.usable } ?: return null
-        return Math.round(Baselines.deviation(v, b).delta * 100.0) / 100.0
+        // Round HALF-AWAY-FROM-ZERO to 2 dp to match Swift's Double.rounded()
+        // (IntelligenceEngine.swift:291). Math.round() is half-UP and would diverge on negative
+        // .5 ties (e.g. −2.5 → −2 here vs Swift's −3). (Cross-platform parity.)
+        val scaled = Baselines.deviation(v, b).delta * 100.0
+        val r = if (scaled >= 0) Math.floor(scaled + 0.5) else Math.ceil(scaled - 0.5)
+        return r / 100.0
     }
 
     /**
@@ -398,4 +481,14 @@ object IntelligenceEngine {
      * uses UTC, so UTC midnight = ts - floorMod(ts, 86400). floorMod is correct for any sign.
      */
     internal fun midnightUtc(ts: Long): Long = ts - Math.floorMod(ts, SECONDS_PER_DAY)
+
+    /**
+     * Floor a unix-seconds timestamp to 00:00:00 of its LOCAL calendar day (#277). [offsetSec] is
+     * seconds EAST of UTC. Shift into local time, floor to the local day, shift back:
+     * `ts - floorMod(ts + offsetSec, 86400)`. Math.floorMod keeps the floor correct for negative
+     * offsets and negative timestamps. [offsetSec] == 0 reduces exactly to [midnightUtc]. Mirrors the
+     * Swift IntelligenceEngine.midnightLocal byte-for-byte.
+     */
+    internal fun midnightLocal(ts: Long, offsetSec: Long): Long =
+        ts - Math.floorMod(ts + offsetSec, SECONDS_PER_DAY)
 }

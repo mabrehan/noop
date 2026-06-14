@@ -1,0 +1,383 @@
+{
+  "name": "NOOP",
+  "subtitle": "A standalone WHOOP app — your strap, your device, fully offline.",
+  "description": "An AltStore / SideStore source for NOOP, the independent open-source WHOOP companion. Add this source to get one-tap updates for the sideloaded iOS build.\n\nNOOP is not affiliated with WHOOP. It reads a strap you own, directly over Bluetooth, on your own device — no WHOOP app, no subscription, no cloud.",
+  "iconURL": "https://raw.githubusercontent.com/NoopApp/noop/main/Strand/Resources/Assets.xcassets/AppIcon.appiconset/icon_512x512.png",
+  "website": "https://github.com/NoopApp/noop",
+  "tintColor": "44E2B0",
+  "apps": [
+    {
+      "name": "NOOP",
+      "bundleIdentifier": "com.noopapp.noop",
+      "developerName": "NoopApp",
+      "subtitle": "Read your own WHOOP strap, fully offline.",
+      "localizedDescription": "NOOP talks to a WHOOP 4.0 / 5.0 / MG strap you own directly over Bluetooth — no WHOOP app, no subscription, no cloud. Live heart rate, history sync, and NOOP's own Charge / Effort / Rest scores, all computed on-device and stored only on your iPhone.\n\nIndependent and experimental; not affiliated with WHOOP. Source: https://github.com/NoopApp/noop",
+      "iconURL": "https://raw.githubusercontent.com/NoopApp/noop/main/Strand/Resources/Assets.xcassets/AppIcon.appiconset/icon_512x512.png",
+      "tintColor": "44E2B0",
+      "category": "healthcare-fitness",
+      "screenshotURLs": [],
+      "versions": [
+        {
+          "version": "2.18.2",
+          "buildVersion": "71",
+          "date": "2026-06-14",
+          "localizedDescription": "Times follow your 12-/24-hour setting",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.18.2/NOOP-v2.18.2-ios.ipa",
+          "size": 6594449,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.18.1",
+          "buildVersion": "70",
+          "date": "2026-06-14",
+          "localizedDescription": "Toggle the live-HR Dynamic Island",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.18.1/NOOP-v2.18.1-ios.ipa",
+          "size": 6594761,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.18.0",
+          "buildVersion": "69",
+          "date": "2026-06-14",
+          "localizedDescription": "Export raw sensor data (CSV)",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.18.0/NOOP-v2.18.0-ios.ipa",
+          "size": 6594330,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.17.1",
+          "buildVersion": "68",
+          "date": "2026-06-14",
+          "localizedDescription": "Charge calibrating state for new straps",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.17.1/NOOP-v2.17.1-ios.ipa",
+          "size": 6576895,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.17.0",
+          "buildVersion": "67",
+          "date": "2026-06-14",
+          "localizedDescription": "iPhone polish + accessibility",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.17.0/NOOP-v2.17.0-ios.ipa",
+          "size": 6576252,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.16.1",
+          "buildVersion": "66",
+          "date": "2026-06-14",
+          "localizedDescription": "Today tiles no longer truncate (Android)",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.16.1/NOOP-v2.16.1-ios.ipa",
+          "size": 6518751,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.16.0",
+          "buildVersion": "65",
+          "date": "2026-06-14",
+          "localizedDescription": "A round of look-and-feel polish",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.16.0/NOOP-v2.16.0-ios.ipa",
+          "size": 6518589,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.15.3",
+          "buildVersion": "64",
+          "date": "2026-06-14",
+          "localizedDescription": "Android GPS route distance fix",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.15.3/NOOP-v2.15.3-ios.ipa",
+          "size": 6496729,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.15.2",
+          "buildVersion": "63",
+          "date": "2026-06-14",
+          "localizedDescription": "Today header date fix (west of UTC)",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.15.2/NOOP-v2.15.2-ios.ipa",
+          "size": 6496475,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.15.1",
+          "buildVersion": "62",
+          "date": "2026-06-14",
+          "localizedDescription": "Last Workouts tile fix",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.15.1/NOOP-v2.15.1-ios.ipa",
+          "size": 6495501,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.15.0",
+          "buildVersion": "61",
+          "date": "2026-06-14",
+          "localizedDescription": "A beautiful new look on every screen, plus four fixes",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.15.0/NOOP-v2.15.0-ios.ipa",
+          "size": 6496522,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.14.1",
+          "buildVersion": "60",
+          "date": "2026-06-14",
+          "localizedDescription": "Workouts stay whole + delete a sleep session",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.14.1/NOOP-v2.14.1-ios.ipa",
+          "size": 6361864,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.14.0",
+          "buildVersion": "59",
+          "date": "2026-06-14",
+          "localizedDescription": "A beautiful new look: a premium dark redesign with layered ring gauges, frosted cards and per-domain colour worlds, across Mac, iPhone and Android.",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.14.0/NOOP-v2.14.0-ios.ipa",
+          "size": 6360171,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.13.0",
+          "buildVersion": "58",
+          "date": "2026-06-14",
+          "localizedDescription": "Big iPhone update: WHOOP-style Today chart, two-way Apple Health, full accessibility pass, pull-to-refresh, Siri shortcuts, iPad layout — plus sleep times and the Overview chart on Mac & Android. 19 community PRs reimplemented.",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.13.0/NOOP-v2.13.0-ios.ipa",
+          "size": 6307974,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.12.0",
+          "buildVersion": "57",
+          "date": "2026-06-14",
+          "localizedDescription": "Continuous HRV capture (opt-in): keep the dense R-R stream armed in the background for far sharper overnight HRV, recovery and sleep — especially WHOOP 5.0/MG. Off by default. Thanks @Extazian (#278).",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.12.0/NOOP-v2.12.0-ios.ipa",
+          "size": 6110517,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.11.1",
+          "buildVersion": "56",
+          "date": "2026-06-14",
+          "localizedDescription": "Fix: daily metrics now bucket by your local timezone instead of UTC, so the dashboard no longer freezes partway through the day for non-UTC users (#277).",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.11.1/NOOP-v2.11.1-ios.ipa",
+          "size": 6107605,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.11.0",
+          "buildVersion": "55",
+          "date": "2026-06-13",
+          "localizedDescription": "Smart wake alarm, live workout mode, editable Today, Effort 0-21 toggle, smoother hypnogram, and Hevy/Liftosaur lifting import.",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.11.0/NOOP-v2.11.0-ios.ipa",
+          "size": 6107528,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.10.0",
+          "buildVersion": "54",
+          "date": "2026-06-13",
+          "localizedDescription": "Sleep-debt ledger, daytime stress timeline, recovery forecast, day-by-day Today navigation, battery+streak strip, and a smoother Live tab.",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.10.0/NOOP-v2.10.0-ios.ipa",
+          "size": 6008653,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.9.0",
+          "buildVersion": "53",
+          "date": "2026-06-13",
+          "localizedDescription": "Background GPS tracking, in-app sleep-time editing, log-for-tomorrow, Rest-score tile, vital provenance, and a read-only local MCP package.",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.9.0/NOOP-v2.9.0-ios.ipa",
+          "size": 5909650,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.8.9",
+          "buildVersion": "52",
+          "date": "2026-06-13",
+          "localizedDescription": "Fixes the Android Insights-tab crash; more accurate HRV; Mac connection-status + WHOOP 5/MG R22 bond + sport-picker fixes.",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.8.9/NOOP-v2.8.9-ios.ipa",
+          "size": 5890155,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.8.8",
+          "buildVersion": "51",
+          "date": "2026-06-13",
+          "localizedDescription": "Strap-log diagnostics: historical layout version + connect RSSI.",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.8.8/NOOP-v2.8.8-ios.ipa",
+          "size": 5879063,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.8.7",
+          "buildVersion": "50",
+          "date": "2026-06-13",
+          "localizedDescription": "Readiness evidence + Health Connect distance + iOS Explore navigation fixes.",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.8.7/NOOP-v2.8.7-ios.ipa",
+          "size": 5877629,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.8.6",
+          "buildVersion": "49",
+          "date": "2026-06-13",
+          "localizedDescription": "iPhone diagnostics + expectations, clearer labels, journal fix, v26 HR notch.",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.8.6/NOOP-v2.8.6-ios.ipa",
+          "size": 5872479,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.8.5",
+          "buildVersion": "48",
+          "date": "2026-06-13",
+          "localizedDescription": "iPhone import fix (#179) + store self-heal after cross-platform restore (#222).",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.8.5/NOOP-v2.8.5-ios.ipa",
+          "size": 5842715,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.8.4",
+          "buildVersion": "47",
+          "date": "2026-06-13",
+          "localizedDescription": "In-app 'How your scores work' guide for Charge/Effort/Rest.",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.8.4/NOOP-v2.8.4-ios.ipa",
+          "size": 5838754,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.8.3",
+          "buildVersion": "46",
+          "date": "2026-06-13",
+          "localizedDescription": "iOS fix: imported data + strap sync no longer stuck on locked-device data protection (#222).",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.8.3/NOOP-v2.8.3-ios.ipa",
+          "size": 5779986,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.8.2",
+          "buildVersion": "45",
+          "date": "2026-06-13",
+          "localizedDescription": "Cross-platform parity: Android scoring now matches macOS & iOS (#219).",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.8.2/NOOP-v2.8.2-ios.ipa",
+          "size": 5776857,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.8.1",
+          "buildVersion": "44",
+          "date": "2026-06-13",
+          "localizedDescription": "Battery + responsiveness: sync backoff, instant post-sync scoring, lighter notification.",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.8.1/NOOP-v2.8.1-ios.ipa",
+          "size": 5778200,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.8.0",
+          "buildVersion": "43",
+          "date": "2026-06-13",
+          "localizedDescription": "New: Week in review, live body console, live HR time axis, fresher charts.",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.8.0/NOOP-v2.8.0-ios.ipa",
+          "size": 5778201,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.7.0",
+          "buildVersion": "42",
+          "date": "2026-06-13",
+          "localizedDescription": "Big fix wave: clock/reconnect/local-LLM/Explore/weight + more.",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.7.0/NOOP-v2.7.0-ios.ipa",
+          "size": 5583696,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.6.10",
+          "buildVersion": "41",
+          "date": "2026-06-12",
+          "localizedDescription": "5/MG deep-data: live R22 flag-accept + deep-packet confirmation.",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.6.10/NOOP-v2.6.10-ios.ipa",
+          "size": 5574022,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.6.9",
+          "buildVersion": "40",
+          "date": "2026-06-12",
+          "localizedDescription": "What's New screen fits iPhone; Today's Synthesis cards align.",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.6.9/NOOP-v2.6.9-ios.ipa",
+          "size": 5570768,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.6.8",
+          "buildVersion": "39",
+          "date": "2026-06-12",
+          "localizedDescription": "iPhone import now handles iCloud + large export files.",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.6.8/NOOP-v2.6.8-ios.ipa",
+          "size": 5570192,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.6.7",
+          "buildVersion": "38",
+          "date": "2026-06-12",
+          "localizedDescription": "More-tab icons no longer flicker green to blue.",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.6.7/NOOP-v2.6.7-ios.ipa",
+          "size": 5563111,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.6.6",
+          "buildVersion": "37",
+          "date": "2026-06-12",
+          "localizedDescription": "iPhone Workouts table now fits the screen (scrolls sideways).",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.6.6/NOOP-v2.6.6-ios.ipa",
+          "size": 5563120,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.6.5",
+          "buildVersion": "36",
+          "date": "2026-06-12",
+          "localizedDescription": "Broadcast heart rate to Garmin/Zwift/gym (WHOOP 5.0/MG, opt-in).",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.6.5/NOOP-v2.6.5-ios.ipa",
+          "size": 5562685,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.6.4",
+          "buildVersion": "35",
+          "date": "2026-06-12",
+          "localizedDescription": "Workout names now read as proper words; Intelligence Rest duration fixed.",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.6.4/NOOP-v2.6.4-ios.ipa",
+          "size": 5560368,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "2.6.3",
+          "buildVersion": "34",
+          "date": "2026-06-12",
+          "localizedDescription": "Universal Mac build (Intel + Apple Silicon); iPhone import .zip fix; AltStore source added.",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.6.3/NOOP-v2.6.3-ios.ipa",
+          "size": 5557963,
+          "minOSVersion": "17.0"
+        }
+      ],
+      "appPermissions": {
+        "entitlements": [
+          "com.apple.developer.healthkit"
+        ],
+        "privacy": {
+          "NSBluetoothAlwaysUsageDescription": "NOOP connects directly to your WHOOP strap over Bluetooth to read heart rate, R-R intervals, battery, and sensor data locally on your iPhone. Nothing leaves your device.",
+          "NSHealthShareUsageDescription": "NOOP reads your own Apple Health data on-device to compute recovery, strain, and sleep. Nothing leaves your device.",
+          "NSHealthUpdateUsageDescription": "NOOP writes the metrics it computes from your strap back into Apple Health, on-device and only when you allow it."
+        }
+      },
+      "version": "2.18.2",
+      "buildVersion": "71",
+      "versionDate": "2026-06-14",
+      "versionDescription": "Times follow your 12-/24-hour setting",
+      "downloadURL": "https://github.com/NoopApp/noop/releases/download/v2.18.2/NOOP-v2.18.2-ios.ipa",
+      "size": 6594449,
+      "minOSVersion": "17.0"
+    }
+  ],
+  "news": []
+}

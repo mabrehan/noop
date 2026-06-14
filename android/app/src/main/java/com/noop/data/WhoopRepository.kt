@@ -23,11 +23,13 @@ data class StreamBatch(
     val resp: List<RespRow> = emptyList(),
     val gravity: List<GravityRow> = emptyList(),
     val steps: List<StepRow> = emptyList(),
+    /** HR derived from the WHOOP 5/MG v26 optical PPG waveform (autocorrelation). (#156) */
+    val ppgHr: List<PpgHrRow> = emptyList(),
 ) {
     val isEmpty: Boolean
         get() = hr.isEmpty() && rr.isEmpty() && events.isEmpty() && battery.isEmpty() &&
             spo2.isEmpty() && skinTemp.isEmpty() && resp.isEmpty() && gravity.isEmpty() &&
-            steps.isEmpty()
+            steps.isEmpty() && ppgHr.isEmpty()
 }
 
 // Device-agnostic decoded rows (deviceId attached when inserted). Mirror Streams.swift shapes.
@@ -43,6 +45,8 @@ data class SkinTempRow(val ts: Long, val raw: Int)
 data class StepRow(val ts: Long, val counter: Int)
 data class RespRow(val ts: Long, val raw: Int)
 data class GravityRow(val ts: Long, val x: Double, val y: Double, val z: Double)
+/** HR derived from the v26 PPG waveform: [ts] window-centre sec, [bpm], [conf] in 0…1. (#156) */
+data class PpgHrRow(val ts: Long, val bpm: Int, val conf: Double)
 
 /** Count of rows ACTUALLY inserted per stream (mirrors WhoopStore.insert return tuple). */
 data class InsertCounts(
@@ -56,6 +60,27 @@ data class InsertCounts(
     val resp: Int = 0,
     val gravity: Int = 0,
 )
+
+/**
+ * A compact snapshot of how much history each source holds, for the Data Sources "Freshness
+ * Pipeline" card (PR#196). Counts only — no per-day rows leave the read. Port of macOS
+ * RepositoryFreshness.
+ */
+data class DataFreshness(
+    val importedDays: Int = 0,
+    val computedDays: Int = 0,
+    val appleDays: Int = 0,
+    val importedSleeps: Int = 0,
+    val computedSleeps: Int = 0,
+    val earliestDay: String? = null,
+    val latestDay: String? = null,
+) {
+    val hasAnyHistory: Boolean get() = importedDays > 0 || computedDays > 0 || appleDays > 0
+
+    companion object {
+        val EMPTY = DataFreshness()
+    }
+}
 
 /**
  * Repository over [WhoopDatabase] / [WhoopDao]. The single seam the rest of the app uses
@@ -112,10 +137,14 @@ class WhoopRepository(private val dao: WhoopDao) {
             dao.insertResp(streams.resp.map { RespSample(deviceId, it.ts, it.raw) })
         val gravIds = if (streams.gravity.isEmpty()) emptyList() else
             dao.insertGravity(streams.gravity.map { GravitySample(deviceId, it.ts, it.x, it.y, it.z) })
+        // v26 PPG-derived HR (#156). Idempotent by (deviceId, ts); counted into InsertCounts.hr so the
+        // backfill "persisted N" summary reflects HR recovered from the optical waveform too.
+        val ppgHrIds = if (streams.ppgHr.isEmpty()) emptyList() else
+            dao.insertPpgHr(streams.ppgHr.map { PpgHrSample(deviceId, it.ts, it.bpm, it.conf) })
 
         // OnConflictStrategy.IGNORE returns -1 for skipped (already-present) rows; count the inserts.
         return InsertCounts(
-            hr = hrIds.countInserted(),
+            hr = hrIds.countInserted() + ppgHrIds.countInserted(),
             rr = rrIds.countInserted(),
             events = evIds.countInserted(),
             battery = batIds.countInserted(),
@@ -131,6 +160,26 @@ class WhoopRepository(private val dao: WhoopDao) {
 
     suspend fun upsertDailyMetrics(days: List<DailyMetric>) = dao.upsertDailyMetrics(days)
     suspend fun upsertSleepSessions(sessions: List<SleepSession>) = dao.upsertSleepSessions(sessions)
+
+    /** Delete the computed source's cached daily rows whose day-key is in [from, to] (inclusive,
+     *  yyyy-MM-dd). The #277 local-day re-bucketing migration clears the computed UTC-keyed rows over
+     *  the recompute window before re-upserting LOCAL-keyed rows. Imported rows are never touched. */
+    suspend fun deleteComputedDailyInRange(deviceId: String, from: String, to: String) =
+        dao.deleteDailyMetricsInRange(deviceId, from, to)
+
+    /** Adjust the start/end of an existing sleep session. startTs is part of the primary key, so
+     *  this deletes the old row and re-inserts a copy at the new window — every other field
+     *  (efficiency, restingHr, avgHrv, stagesJSON) is preserved via [SleepSession.copy]. */
+    suspend fun updateSleepSessionTimes(session: SleepSession, newStartTs: Long, newEndTs: Long) {
+        dao.deleteSleepSession(session.deviceId, session.startTs)
+        dao.upsertSleepSessions(listOf(session.copy(startTs = newStartTs, endTs = newEndTs)))
+    }
+
+    /** Remove a sleep session entirely — the delete half of [updateSleepSessionTimes] with no
+     *  re-insert. (deviceId, startTs) is the primary key, so it uniquely identifies the row, letting
+     *  the user clear a misread or spurious night so the day recomputes without it (#281). */
+    suspend fun deleteSleepSession(session: SleepSession) =
+        dao.deleteSleepSession(session.deviceId, session.startTs)
     suspend fun upsertMetricSeries(rows: List<MetricSeriesRow>) = dao.upsertMetricSeries(rows)
     suspend fun upsertJournal(rows: List<JournalEntry>) = dao.upsertJournal(rows)
     suspend fun upsertWorkouts(rows: List<WorkoutRow>) = dao.upsertWorkouts(rows)
@@ -140,6 +189,14 @@ class WhoopRepository(private val dao: WhoopDao) {
 
     suspend fun hrSamples(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
         dao.hrSamples(deviceId, from, to, limit)
+
+    /** Raw measured HR only (no v26 PPG-derived union) for the raw-sensor diagnostic export. */
+    suspend fun rawHrSamples(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
+        dao.rawHrSamples(deviceId, from, to, limit)
+
+    /** v26 PPG-derived HR samples (own stream) for the raw-sensor diagnostic export. (#156) */
+    suspend fun ppgHrSamples(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
+        dao.ppgHrSamples(deviceId, from, to, limit)
 
     /** Downsampled HR (mean bpm per [bucketSeconds]) for the strap, for the Today 24h trend chart. */
     suspend fun hrBuckets(deviceId: String, from: Long, to: Long, bucketSeconds: Long = 300L) =
@@ -356,6 +413,131 @@ class WhoopRepository(private val dao: WhoopDao) {
     suspend fun dailyMetrics(deviceId: String, from: String, to: String): List<DailyMetric> =
         dao.dailyMetricsRange(deviceId, from, to)
 
+    // MARK: - Cross-source resolver (PR#196 — freshest-wins charts/metrics)
+    //
+    // Product surfaces (Compare/Insights/Stress/Explore/Today) historically read rows under the EXACT
+    // requested source, hiding freshly-computed and Apple-compatible data sat under another device id.
+    // [resolvedSeries] resolves a metric over an explicit precedence — imported WHOOP wins, NOOP-computed
+    // fills the days it doesn't cover, and Apple Health only fills declared-compatible vitals on days
+    // neither strap source has. Port of macOS Repository.resolvedSeries / sourceCandidates.
+
+    /** One day's resolved value plus the source that supplied it (so a caption can name it). */
+    data class ResolvedMetricPoint(
+        val day: String,
+        val value: Double,
+        val source: String,
+        val sourceKey: String,
+    )
+
+    /** A candidate (source, key) pair the resolver tries, in precedence order. */
+    data class MetricSourceCandidate(val source: String, val key: String)
+
+    /** The full result of resolving one metric: the sources tried + the merged per-day points. */
+    data class MetricSeriesResolution(
+        val requestedSource: String,
+        val candidates: List<MetricSourceCandidate>,
+        val points: List<ResolvedMetricPoint>,
+    ) {
+        /** Plain (day, value) rows — the shape the chart/correlation code already consumes. */
+        val values: List<Pair<String, Double>> get() = points.map { it.day to it.value }
+
+        /** Distinct sources that actually contributed a point, in first-seen order (for a caption). */
+        val usedSources: List<String>
+            get() {
+                val seen = LinkedHashSet<String>()
+                for (p in points) seen.add(p.source)
+                return seen.toList()
+            }
+    }
+
+    /**
+     * Product-facing daily series for [key] across every COMPATIBLE source, freshest-wins. Use this
+     * on surfaces where the user expects the best available signal; use [metricSeries] where one source
+     * must be honoured verbatim. Precedence per [sourceCandidates]: imported WHOOP > NOOP-computed >
+     * declared-compatible Apple Health. [from]/[to] are YYYY-MM-DD bounds.
+     */
+    suspend fun resolvedSeries(
+        key: String,
+        preferredSource: String,
+        from: String,
+        to: String,
+        strapDeviceId: String = "my-whoop",
+    ): MetricSeriesResolution {
+        val candidates = sourceCandidates(key, preferredSource, strapDeviceId)
+        // First candidate wins per day; later candidates only fill days no earlier one covered.
+        val byDay = LinkedHashMap<String, ResolvedMetricPoint>()
+        for (candidate in candidates) {
+            val rows = resolvedRows(candidate, from, to)
+            for ((day, value) in rows) {
+                if (!byDay.containsKey(day)) {
+                    byDay[day] = ResolvedMetricPoint(day, value, candidate.source, candidate.key)
+                }
+            }
+        }
+        val points = byDay.values.sortedBy { it.day }
+        return MetricSeriesResolution(preferredSource, candidates, points)
+    }
+
+    /**
+     * Read one candidate's rows for the window: its metricSeries, plus the matching DailyMetric column
+     * for any day the metricSeries doesn't carry (a Bluetooth-only WHOOP 5 user has values in the daily
+     * columns but not the long-format series). Ascending by day.
+     */
+    private suspend fun resolvedRows(
+        candidate: MetricSourceCandidate,
+        from: String,
+        to: String,
+    ): List<Pair<String, Double>> {
+        val byDay = LinkedHashMap<String, Double>()
+        for (row in dao.metricSeries(candidate.source, candidate.key, from, to)) byDay[row.day] = row.value
+        for (row in dao.dailyMetricsRange(candidate.source, from, to)) {
+            if (!byDay.containsKey(row.day)) {
+                dailyColumn(candidate.key, row)?.let { byDay[row.day] = it }
+            }
+        }
+        return byDay.entries.sortedBy { it.key }.map { it.key to it.value }
+    }
+
+    /**
+     * A compact snapshot of how much history each source holds, for the Data Sources "Freshness
+     * Pipeline" card (PR#196). Counts only — no per-day rows. Port of macOS RepositoryFreshness +
+     * Repository.computeFreshness. Covers a wide window (the macOS 4000-day default).
+     */
+    suspend fun freshness(strapDeviceId: String = "my-whoop"): DataFreshness {
+        val to = freshnessDayKey(1)
+        val from = freshnessDayKey(-4000)
+        val imported = dao.dailyMetricsRange(strapDeviceId, from, to)
+        val computed = dao.dailyMetricsRange(computedDeviceId(strapDeviceId), from, to)
+        val apple = dao.dailyMetricsRange(APPLE_HEALTH_SOURCE, from, to)
+        val now = System.currentTimeMillis() / 1000L
+        val lo = now - 4000L * 86_400L
+        val hi = now + 86_400L
+        val importedSleeps = dao.sleepSessions(strapDeviceId, lo, hi, DEFAULT_LIMIT)
+        val computedSleeps = dao.sleepSessions(computedDeviceId(strapDeviceId), lo, hi, DEFAULT_LIMIT)
+        val days = (imported + computed + apple).map { it.day }
+        return DataFreshness(
+            importedDays = imported.size,
+            computedDays = computed.size,
+            appleDays = apple.size,
+            importedSleeps = importedSleeps.size,
+            computedSleeps = computedSleeps.size,
+            earliestDay = days.minOrNull(),
+            latestDay = days.maxOrNull(),
+        )
+    }
+
+    /** "yyyy-MM-dd" for today offset by [deltaDays], fixed UTC (freshness window bounds). */
+    private fun freshnessDayKey(deltaDays: Int): String {
+        val cal = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"))
+        cal.add(java.util.Calendar.DAY_OF_YEAR, deltaDays)
+        return String.format(
+            java.util.Locale.US, "%04d-%02d-%02d",
+            cal.get(java.util.Calendar.YEAR),
+            cal.get(java.util.Calendar.MONTH) + 1,
+            cal.get(java.util.Calendar.DAY_OF_MONTH),
+        )
+    }
+
     // MARK: - Flows
 
     /** Reactive daily metrics (oldest first) for a device. */
@@ -371,8 +553,95 @@ class WhoopRepository(private val dao: WhoopDao) {
         /** Default row cap on range reads. Matches the Swift call sites' bounded scans. */
         const val DEFAULT_LIMIT = 100_000
 
+        /** Canonical source ids the resolver cross-references. The strap's real id is passed in. */
+        const val WHOOP_SOURCE = "my-whoop"
+        const val APPLE_HEALTH_SOURCE = "apple-health"
+
         /** Build a repository backed by the process-wide singleton database. */
         fun from(context: Context): WhoopRepository = WhoopRepository(WhoopDatabase.get(context))
+
+        /**
+         * Candidate (source, key) pairs to try for [key], in precedence order, given the user's
+         * [preferredSource]. The strap's real id is [strapDeviceId], so the computed sibling is
+         * "$strapDeviceId-noop". Port of macOS Repository.sourceCandidates:
+         *  • strap-preferred → [imported strap, computed strap, compatible Apple] (Apple only for
+         *    vitals with a declared 1:1 mapping);
+         *  • Apple-preferred → [Apple] (+ computed strap ONLY for steps/active_kcal, which the strap
+         *    estimates and Apple may not carry);
+         *  • any other source → itself only (nutrition/mood are single-source by design).
+         */
+        internal fun sourceCandidates(
+            key: String,
+            preferredSource: String,
+            strapDeviceId: String,
+        ): List<MetricSourceCandidate> {
+            val computedSource = "$strapDeviceId-noop"
+            fun uniqued(cs: List<MetricSourceCandidate>): List<MetricSourceCandidate> {
+                val seen = LinkedHashSet<MetricSourceCandidate>()
+                for (c in cs) seen.add(c)
+                return seen.toList()
+            }
+            if (preferredSource == WHOOP_SOURCE || preferredSource == strapDeviceId) {
+                val candidates = mutableListOf(
+                    MetricSourceCandidate(strapDeviceId, key),
+                    MetricSourceCandidate(computedSource, key),
+                )
+                appleCompatibleKey(key)?.let {
+                    candidates.add(MetricSourceCandidate(APPLE_HEALTH_SOURCE, it))
+                }
+                return uniqued(candidates)
+            }
+            if (preferredSource == APPLE_HEALTH_SOURCE) {
+                val candidates = mutableListOf(MetricSourceCandidate(APPLE_HEALTH_SOURCE, key))
+                if (noopComputedCanFillAppleMetric(key)) {
+                    candidates.add(MetricSourceCandidate(computedSource, key))
+                }
+                return uniqued(candidates)
+            }
+            return listOf(MetricSourceCandidate(preferredSource, key))
+        }
+
+        /** The Apple-Health series key carrying the SAME quantity as a WHOOP key; null = no fallback. */
+        internal fun appleCompatibleKey(key: String): String? = when (key) {
+            "rhr" -> "resting_hr"
+            "hrv", "spo2", "resp_rate", "avg_hr", "max_hr", "in_bed_min", "active_kcal" -> key
+            "sleep_total_min" -> "asleep_min"
+            "sleep_deep_min" -> "deep_min"
+            "sleep_rem_min" -> "rem_min"
+            "sleep_light_min" -> "core_min"
+            else -> null
+        }
+
+        /** Whether the NOOP-computed strap source may fill an Apple-preferred metric. Only the two
+         *  daily totals the strap genuinely estimates (steps, calories) — never a derived score. */
+        private fun noopComputedCanFillAppleMetric(key: String): Boolean = when (key) {
+            "steps", "active_kcal" -> true
+            else -> false
+        }
+
+        /**
+         * The DailyMetric column backing a resolver key, for days the metricSeries doesn't cover
+         * (strap-only WHOOP 5 users). Also handles the Apple-compatible sleep aliases (asleep_min /
+         * deep_min / rem_min / core_min) the resolver may request. Keys with no daily column return
+         * null. Mirrors macOS Repository.dailyColumn.
+         */
+        internal fun dailyColumn(key: String, d: DailyMetric): Double? = when (key) {
+            "recovery" -> d.recovery
+            "hrv" -> d.avgHrv
+            "rhr", "resting_hr" -> d.restingHr?.toDouble()
+            "strain" -> d.strain
+            "resp_rate" -> d.respRateBpm
+            "spo2" -> d.spo2Pct
+            "skin_temp" -> d.skinTempDevC
+            "sleep_total_min", "asleep_min" -> d.totalSleepMin
+            "sleep_efficiency" -> d.efficiency
+            "sleep_deep_min", "deep_min" -> d.deepMin
+            "sleep_rem_min", "rem_min" -> d.remMin
+            "sleep_light_min", "core_min" -> d.lightMin
+            "steps" -> d.steps?.toDouble()
+            "active_kcal", "energy_kcal" -> d.activeKcalEst
+            else -> null
+        }
 
         /**
          * Imported daily rows win per day; computed rows fill the days the import doesn't
@@ -420,16 +689,23 @@ class WhoopRepository(private val dao: WhoopDao) {
         }
 
         /**
-         * Same precedence for sleep sessions, keyed by the UTC day the night ends on.
-         * Port of macOS Repository.mergeSleep (the macOS keyer used the local tz; this
-         * port keys on UTC for consistency with AnalyticsEngine's UTC day attribution).
+         * Same precedence for sleep sessions, keyed by the LOCAL day the night ends on (#304).
+         * Brought into line with macOS Repository.mergeSleep, which keys on the local wake-day. A
+         * UTC key put a night that ends after local-but-before-UTC midnight (a UTC+ user waking
+         * early) under yesterday's UTC date, so the dashboard's local "today" read missed it and
+         * surfaced the previous night. The local key matches how IntelligenceEngine buckets nights
+         * and how the resolver looks up "today". REUSES the existing
+         * `AnalyticsEngine.dayString(ts, offsetSec)` overload — do NOT add a new offset overload,
+         * it clashes on the JVM signature and breaks the build.
          */
         internal fun mergeSleep(
             imported: List<SleepSession>,
             computed: List<SleepSession>,
         ): List<SleepSession> {
-            fun endDay(s: SleepSession): String =
-                com.noop.analytics.AnalyticsEngine.dayString(s.endTs)
+            fun endDay(s: SleepSession): String {
+                val offsetSec = (java.util.TimeZone.getDefault().getOffset(s.endTs * 1000) / 1000).toLong()
+                return com.noop.analytics.AnalyticsEngine.dayString(s.endTs, offsetSec)
+            }
             val byDay = LinkedHashMap<String, SleepSession>()
             for (s in computed) byDay[endDay(s)] = s
             for (s in imported) byDay[endDay(s)] = s

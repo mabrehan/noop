@@ -1,20 +1,30 @@
 package com.noop.ui
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.ArrowDropUp
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -25,11 +35,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.noop.data.DailyMetric
+import com.noop.data.MoodStore
+import com.noop.ingest.NutritionCsvImporter
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -84,43 +100,65 @@ private data class MetricSpec(
     val decimals: Int = 0,
     val dailyPick: ((DailyMetric) -> Double?)? = null,
     val seriesKey: String? = null,
+    /** Source (deviceId) the [seriesKey] lives under when it is NOT the strap's own — e.g. the
+     *  nutrition-csv import or the noop-mood check-in write under dedicated source ids (v2.2.0
+     *  parity with the macOS MetricCatalog, whose descriptors carry key+source). */
+    val seriesSource: String? = null,
+    /** A short, plain-English one-liner (the Explore header subtitle / catalog blurb). Only the
+     *  three headline scores — Charge / Effort / Rest — carry one today; everything else is null.
+     *  Mirrors macOS `MetricDescriptor.description`. */
+    val description: String? = null,
+    /** Effort display scale (#268) — only meaningful for the "strain" column, where it converts the
+     *  stored 0–100 value + unit onto WHOOP's 0–21 axis. Default 0–100 leaves every other column alone. */
+    val effortScale: EffortScale = EffortScale.HUNDRED,
 ) {
+    /** True for the Effort column when the user picked WHOOP's 0–21 scale (the only value-converting case). */
+    private val whoopEffort: Boolean get() = key == "strain" && effortScale == EffortScale.WHOOP
+
+    /** The unit label, swapped to "/21" for the Effort column on the WHOOP scale. */
+    val displayUnit: String get() = if (whoopEffort) "/21" else unit
+
     fun format(v: Double): String {
         if (!v.isFinite()) return "—"
-        val n = if (decimals == 0) "${v.roundToInt()}" else String.format(Locale.US, "%.${decimals}f", v)
-        return if (unit.isEmpty()) n else "$n $unit"
+        // Effort (#268): the stored value is 0–100; convert to 0–21 for display when that scale is picked.
+        val shown = if (whoopEffort) UnitFormatter.effortValue(v, EffortScale.WHOOP) else v
+        val n = if (decimals == 0) "${shown.roundToInt()}" else String.format(Locale.US, "%.${decimals}f", shown)
+        return if (displayUnit.isEmpty()) n else "$n $displayUnit"
     }
 }
 
-/** The built-in DailyMetric-backed metrics, in the macOS ordering (Recovery first). */
+/** The built-in DailyMetric-backed metrics, in the macOS ordering (Charge first). */
 private val builtInMetrics: List<MetricSpec> = listOf(
     MetricSpec(
-        key = "recovery", title = "Recovery", unit = "%", category = "Recovery",
+        key = "recovery", title = "Charge", unit = "%", category = "Charge",
         accent = Palette.accent, higherIsBetter = true, decimals = 0,
         dailyPick = { it.recovery },
+        description = "How recovered you are — led by HRV versus your personal baseline.",
     ),
     MetricSpec(
-        key = "strain", title = "Day Strain", unit = "", category = "Strain",
+        key = "strain", title = "Effort", unit = "/100", category = "Effort",
         accent = Palette.strain066, higherIsBetter = null, decimals = 1,
         dailyPick = { it.strain },
+        description = "Cardiovascular load for the day, on a 0–100 scale (was 0–21).",
     ),
     MetricSpec(
-        key = "hrv", title = "HRV", unit = "ms", category = "Recovery",
+        key = "hrv", title = "HRV", unit = "ms", category = "Charge",
         accent = Palette.metricPurple, higherIsBetter = true, decimals = 0,
         dailyPick = { it.avgHrv },
     ),
     MetricSpec(
-        key = "rhr", title = "Resting HR", unit = "bpm", category = "Recovery",
+        key = "rhr", title = "Resting HR", unit = "bpm", category = "Charge",
         accent = Palette.metricRose, higherIsBetter = false, decimals = 0,
         dailyPick = { it.restingHr?.toDouble() },
     ),
     MetricSpec(
-        key = "sleep", title = "Sleep", unit = "h", category = "Sleep",
+        key = "sleep", title = "Sleep", unit = "h", category = "Rest",
         accent = Palette.metricPurple, higherIsBetter = true, decimals = 1,
         dailyPick = { it.totalSleepMin?.let { m -> m / 60.0 } },
+        description = "How restorative your sleep was — duration, efficiency, deep+REM, timing.",
     ),
     MetricSpec(
-        key = "efficiency", title = "Sleep Efficiency", unit = "%", category = "Sleep",
+        key = "efficiency", title = "Sleep Efficiency", unit = "%", category = "Rest",
         accent = Palette.accent, higherIsBetter = true, decimals = 0,
         dailyPick = { it.efficiency },
     ),
@@ -134,6 +172,22 @@ private val builtInMetrics: List<MetricSpec> = listOf(
         accent = Palette.accent, higherIsBetter = null, decimals = 1,
         dailyPick = { it.respRateBpm },
     ),
+)
+
+/** Proper titles/units/categories for series-backed keys written by the importers and the Mind
+ *  check-in — matching the macOS MetricCatalog entries exactly (v2.2.0 parity). seriesKey/
+ *  seriesSource are filled in at discovery time. */
+private val knownSeriesMetrics: Map<String, MetricSpec> = mapOf(
+    "calories_in" to MetricSpec("calories_in", "Calories In", "kcal", "Nutrition",
+        Palette.metricAmber, null, 0),
+    "protein_g" to MetricSpec("protein_g", "Protein", "g", "Nutrition",
+        Palette.metricCyan, null, 0),
+    "carbs_g" to MetricSpec("carbs_g", "Carbs", "g", "Nutrition",
+        Palette.metricCyan, null, 0),
+    "fat_g" to MetricSpec("fat_g", "Fat", "g", "Nutrition",
+        Palette.metricCyan, null, 0),
+    "mood" to MetricSpec("mood", "Mood", "/5", "Mind",
+        Palette.metricPurple, true, 0),
 )
 
 // MARK: - A loaded series point (day string + value), oldest first.
@@ -167,19 +221,30 @@ fun TrendsExploreScreen(vm: AppViewModel) {
     val deviceId = "my-whoop"
     val recentDays by vm.recentDays.collectAsStateWithLifecycle()
 
-    // Extra long-format keys from the metricSeries table (anything beyond the built-ins).
-    var extraKeys by remember { mutableStateOf<List<String>>(emptyList()) }
+    // Extra long-format keys from the metricSeries table (anything beyond the built-ins) — from the
+    // strap source AND the dedicated import/check-in sources, which write under their OWN deviceIds
+    // (nutrition-csv, noop-mood) and were invisible to a strap-only key scan (v2.2.0 parity).
+    var extraKeys by remember { mutableStateOf<List<Pair<String, String?>>>(emptyList()) }
     LaunchedEffect(deviceId) {
-        extraKeys = runCatching { vm.repo.metricKeys(deviceId) }.getOrDefault(emptyList())
+        val strap = runCatching { vm.repo.metricKeys(deviceId) }.getOrDefault(emptyList())
+            .map { it to null as String? }
+        val sourced = listOf(NutritionCsvImporter.SOURCE_ID, MoodStore.MOOD_DEVICE_ID).flatMap { src ->
+            runCatching { vm.repo.metricKeys(src) }.getOrDefault(emptyList()).map { it to (src as String?) }
+        }
+        extraKeys = strap + sourced
     }
 
     // The full picker: built-ins first, then any extra metricSeries keys not already covered.
+    // Known import/check-in keys get their proper titles/units/categories (matching the macOS
+    // MetricCatalog); anything else falls back to a prettified key under "Other".
     val metrics = remember(extraKeys) {
         val builtInKeys = builtInMetrics.map { it.key }.toSet()
         val extras = extraKeys
-            .filter { it !in builtInKeys }
-            .map { k ->
-                MetricSpec(
+            .filter { (k, _) -> k !in builtInKeys }
+            .distinctBy { (k, src) -> "$src:$k" }
+            .map { (k, src) ->
+                val known = knownSeriesMetrics[k]
+                known?.copy(seriesKey = k, seriesSource = src) ?: MetricSpec(
                     key = k,
                     title = k.replace('_', ' ').replaceFirstChar { c -> c.uppercase() },
                     unit = "",
@@ -188,14 +253,20 @@ fun TrendsExploreScreen(vm: AppViewModel) {
                     higherIsBetter = null,
                     decimals = 1,
                     seriesKey = k,
+                    seriesSource = src,
                 )
             }
         builtInMetrics + extras
     }
 
+    // Effort display scale (#268) — carried on the selected spec so the Effort column's value + unit
+    // follow the toggle through every read-out (hero, footer stats, Y-axis). Display-only.
+    val effortScale = UnitPrefs.effortScale(LocalContext.current)
+
     var selectedKey by remember { mutableStateOf(builtInMetrics.first().key) }
     var range by remember { mutableStateOf(ExploreRange.Month) }
-    val selected = metrics.firstOrNull { it.key == selectedKey } ?: metrics.first()
+    val selected = (metrics.firstOrNull { it.key == selectedKey } ?: metrics.first())
+        .copy(effortScale = effortScale)
 
     // Build the full ascending series for the selected metric. Built-ins come straight off
     // the reactive recentDays; metricSeries-backed metrics are loaded on demand.
@@ -209,8 +280,10 @@ fun TrendsExploreScreen(vm: AppViewModel) {
             }
             seriesKeyLoaded = selected.key
         } else if (selected.seriesKey != null) {
+            // Series-backed metrics live under their own source id when imported/checked-in
+            // (nutrition-csv, noop-mood) — read from that source, else the strap's (v2.2.0 parity).
             val rows = runCatching {
-                vm.repo.metricSeries(deviceId, selected.seriesKey, "0000-00-00", "9999-99-99")
+                vm.repo.metricSeries(selected.seriesSource ?: deviceId, selected.seriesKey, "0000-00-00", "9999-99-99")
             }.getOrDefault(emptyList())
             loadedSeries = rows.map { SeriesPoint(it.day, it.value) }
             seriesKeyLoaded = selected.key
@@ -241,12 +314,10 @@ fun TrendsExploreScreen(vm: AppViewModel) {
             )
         }
 
-        // METRIC PICKER — a horizontal row of selectable chips (replaces the macOS
-        // grouped catalog list; one tap selects the metric to chart).
-        SectionHeader("Metric", overline = "Pick a signal", trailing = "${metrics.size}")
-        MetricChips(
+        // METRIC PICKER — a dropdown replacing the old horizontal chip row.
+        MetricDropdown(
             metrics = metrics,
-            selectedKey = selected.key,
+            selected = selected,
             onSelect = { selectedKey = it },
         )
 
@@ -256,6 +327,16 @@ fun TrendsExploreScreen(vm: AppViewModel) {
             Column(modifier = Modifier.weight(1f)) {
                 Overline(selected.category)
                 Text(selected.title, style = NoopType.title2, color = Palette.textPrimary)
+                // The plain-English one-liner for the three headline scores (Charge/Effort/Rest);
+                // null for every other metric, so only the scores show a subtitle here.
+                selected.description?.let { blurb ->
+                    Text(
+                        blurb,
+                        style = NoopType.footnote,
+                        color = Palette.textTertiary,
+                        modifier = Modifier.padding(top = Metrics.space2),
+                    )
+                }
             }
             SegmentedPillControl(
                 items = ExploreRange.entries.toList(),
@@ -290,54 +371,105 @@ fun TrendsExploreScreen(vm: AppViewModel) {
     }
 }
 
-// MARK: - Metric picker chips
+// MARK: - Metric picker dropdown
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun MetricChips(
+private fun MetricDropdown(
     metrics: List<MetricSpec>,
-    selectedKey: String,
+    selected: MetricSpec,
     onSelect: (String) -> Unit,
 ) {
-    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        items(metrics) { metric ->
-            MetricChip(
-                metric = metric,
-                selected = metric.key == selectedKey,
-                onClick = { onSelect(metric.key) },
+    var expanded by remember { mutableStateOf(false) }
+    val grouped = remember(metrics) { metrics.groupBy { it.category } }
+    val shape = RoundedCornerShape(Metrics.cornerSm)
+
+    ExposedDropdownMenuBox(
+        expanded = expanded,
+        onExpandedChange = { expanded = it },
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .menuAnchor()
+                .clip(shape)
+                .background(Palette.surfaceInset)
+                .border(Metrics.divider, Palette.accent.copy(alpha = StrandAlpha.selectedBorder), shape)
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Box(modifier = Modifier.size(10.dp).clip(CircleShape).background(selected.accent))
+            Column(modifier = Modifier.weight(1f)) {
+                Overline(selected.category, color = Palette.textTertiary)
+                Text(selected.title, style = NoopType.headline, color = Palette.textPrimary)
+            }
+            Icon(
+                if (expanded) Icons.Filled.ArrowDropUp else Icons.Filled.ArrowDropDown,
+                contentDescription = "Pick metric",
+                tint = if (expanded) Palette.accent else Palette.textSecondary,
             )
         }
-    }
-}
 
-@Composable
-private fun MetricChip(metric: MetricSpec, selected: Boolean, onClick: () -> Unit) {
-    val shape = RoundedCornerShape(50)
-    val border = if (selected) metric.accent.copy(alpha = 0.55f) else Palette.hairline
-    val bg = if (selected) metric.accent.copy(alpha = 0.14f) else Palette.surfaceInset
-    Row(
-        modifier = Modifier
-            .clip(shape)
-            .background(bg)
-            .border(1.dp, border, shape)
-            .clickableRow(onClick)
-            .padding(horizontal = 12.dp, vertical = 8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        Box(
+        ExposedDropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
             modifier = Modifier
-                .height(8.dp)
-                .width(8.dp)
-                .clip(RoundedCornerShape(50))
-                .background(metric.accent),
-        )
-        Text(
-            metric.title,
-            style = NoopType.captionNumber,
-            color = if (selected) Palette.textPrimary else Palette.textSecondary,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
+                .background(Palette.surfaceRaised)
+                .border(Metrics.divider, Palette.hairline, shape),
+        ) {
+            grouped.entries.forEachIndexed { groupIdx, (category, items) ->
+                if (groupIdx > 0) {
+                    HorizontalDivider(
+                        color = Palette.hairline,
+                        modifier = Modifier.padding(vertical = 4.dp),
+                    )
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Palette.surfaceRaised)
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Box(modifier = Modifier.size(6.dp).clip(CircleShape).background(Palette.accent))
+                    Overline(category, color = Palette.accent)
+                }
+                items.forEach { metric ->
+                    val isSelected = metric.key == selected.key
+                    DropdownMenuItem(
+                        text = {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            ) {
+                                Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(metric.accent))
+                                Text(
+                                    metric.title,
+                                    style = NoopType.body,
+                                    color = if (isSelected) Palette.accent else Palette.textPrimary,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                if (isSelected) {
+                                    Icon(
+                                        Icons.Filled.Check,
+                                        contentDescription = null,
+                                        tint = Palette.accent,
+                                        modifier = Modifier.size(16.dp),
+                                    )
+                                }
+                            }
+                        },
+                        onClick = { onSelect(metric.key); expanded = false },
+                        modifier = if (isSelected) {
+                            Modifier.background(Palette.accent.copy(alpha = StrandAlpha.selectedFill))
+                        } else Modifier,
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -354,12 +486,15 @@ private fun HeroChartCard(
 ) {
     val heroValue = latest?.let { metric.format(it.value) } ?: "—"
     val asOf = latest?.let { "as of ${it.day}" } ?: "no readings yet"
+    // The range bar above already prints the authoritative reading-count caption; the hero only
+    // names its window so the count isn't doubled in one card height.
     val subtitle = if (fellBack) {
-        "Sparse — widened to ${effectiveRange.windowName} · ${windowed.size} readings"
+        "Trailing ${effectiveRange.windowName}"
     } else {
-        "${windowed.size} readings · ${range.windowName}"
+        "Trailing ${range.windowName}"
     }
-    NoopCard {
+    // Wash the hero card in the metric's domain world (Charge green / Effort amber / Rest indigo).
+    NoopCard(tint = domainTint(metric.category)) {
         Column(verticalArrangement = Arrangement.spacedBy(Metrics.gap)) {
             Row(verticalAlignment = Alignment.Top) {
                 Column(modifier = Modifier.weight(1f)) {
@@ -373,12 +508,58 @@ private fun HeroChartCard(
             }
 
             if (windowed.size >= 2) {
-                LineChart(
-                    values = windowed.map { it.value },
-                    modifier = Modifier.height(Metrics.chartHeight),
-                    color = metric.accent,
-                    fill = true,
-                )
+                // Chart flanked by a max/avg/min Y-axis column and a first/mid/last date X-axis row,
+                // so the line reads against real numbers and dates rather than a bare curve. The
+                // Y-labels reuse the metric's own formatter but drop the unit suffix to keep the
+                // narrow left gutter compact.
+                val values = windowed.map { it.value }
+                val maxV = values.max()
+                val avgV = values.average()
+                val minV = values.min()
+                val fmtY: (Double) -> String = { v -> metric.format(v).substringBefore(' ').take(7) }
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Row(
+                        modifier = Modifier.height(IntrinsicSize.Min),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Column(
+                            modifier = Modifier.height(Metrics.chartHeight),
+                            verticalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Text(fmtY(maxV), style = NoopType.footnote, color = Palette.textTertiary, maxLines = 1)
+                            Text(fmtY(avgV), style = NoopType.footnote, color = Palette.textTertiary, maxLines = 1)
+                            Text(fmtY(minV), style = NoopType.footnote, color = Palette.textTertiary, maxLines = 1)
+                        }
+                        // The shared LineChart with a glowing "now" end-cap on its latest sample —
+                        // the Bevel idiom from Today's OverviewHRChart.
+                        Box(modifier = Modifier.weight(1f).height(Metrics.chartHeight)) {
+                            LineChart(
+                                values = values,
+                                modifier = Modifier.fillMaxSize(),
+                                color = metric.accent,
+                                fill = true,
+                                selectionEnabled = true,
+                            )
+                            ExploreGlowEndCap(values = values, tipColor = metric.accent)
+                        }
+                    }
+                    val days = windowed.map { it.day }
+                    Row(modifier = Modifier.fillMaxWidth()) {
+                        listOf(days.first(), days.getOrNull(days.lastIndex / 2), days.last()).forEach { d ->
+                            Text(
+                                d?.let {
+                                    runCatching { LocalDate.parse(it).format(DateTimeFormatter.ofPattern("d MMM", Locale.US)) }
+                                        .getOrDefault(it)
+                                }.orEmpty(),
+                                style = NoopType.footnote,
+                                color = Palette.textTertiary,
+                                modifier = Modifier.weight(1f),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                }
             } else {
                 Box(
                     modifier = Modifier
@@ -413,6 +594,39 @@ private fun ChartFootItem(label: String, value: String) {
     Column {
         Overline(label, color = Palette.textTertiary)
         Text(value, style = NoopType.captionNumber, color = Palette.textSecondary)
+    }
+}
+
+/** The metric category's domain colour world for the card wash; brand green for neutral categories. */
+private fun domainTint(category: String): Color = when (category) {
+    "Charge" -> Palette.chargeColor
+    "Effort" -> Palette.effortColor
+    "Rest" -> Palette.restColor
+    else -> Palette.accent
+}
+
+/**
+ * A glowing "now" end-cap on a LineChart's latest sample (soft halo + bright core + white centre),
+ * matching Today's OverviewHRChart. Reproduces LineChart's own point geometry so the dot sits on the
+ * curve's final point. Drawn as a sibling overlay — the shared LineChart stays untouched.
+ */
+@Composable
+private fun ExploreGlowEndCap(values: List<Double>, tipColor: Color) {
+    val clean = remember(values) { values.filter { it.isFinite() } }
+    if (clean.size < 2) return
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        val strokePx = 2.5f
+        val topPad = strokePx + 4f
+        val bottomPad = strokePx + 4f
+        val minV = clean.min()
+        val maxV = clean.max()
+        val span = (maxV - minV).takeIf { it > 0.0 } ?: 1.0
+        val usableH = (size.height - topPad - bottomPad).coerceAtLeast(1f)
+        val norm = ((clean.last() - minV) / span).toFloat().coerceIn(0f, 1f)
+        val center = Offset(size.width, topPad + (1f - norm) * usableH)
+        drawCircle(color = tipColor.copy(alpha = 0.30f), radius = 9f, center = center)
+        drawCircle(color = tipColor.copy(alpha = 0.65f), radius = 5.5f, center = center)
+        drawCircle(color = Color.White, radius = 2.4f, center = center)
     }
 }
 
@@ -530,8 +744,3 @@ private fun rangeCaption(
     return if (fellBack) "$n $unit · sparse — widened to ${effectiveRange.windowName}"
     else "$n $unit · ${range.windowName}"
 }
-
-// MARK: - Small interaction helper (clickable row, default ripple)
-
-private fun Modifier.clickableRow(onClick: () -> Unit): Modifier =
-    this.clickable(onClick = onClick)

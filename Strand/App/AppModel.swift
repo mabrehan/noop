@@ -130,6 +130,14 @@ final class AppModel: ObservableObject {
             guard let self, bonded, self.behavior.smartAlarmEnabled else { return }
             self.applySmartAlarm()
         }.store(in: &hrCancellables)
+        // Re-apply "Continuous HRV capture" on every (re)bond: if on, the strap should hold the dense
+        // realtime stream armed even with no Live screen open, so it banks beat-to-beat R-R 24/7 for
+        // better overnight HRV/recovery/sleep. The BLE reconciler arms it on the off→on edge; pushing it
+        // here (and at the init tail) covers a fresh launch and every reconnect. (See PuffinExperiment.)
+        live.$bonded.removeDuplicates().sink { [weak self] _ in
+            guard let self else { return }
+            self.ble.setKeepRealtimeForData(PuffinExperiment.keepRealtimeForDataEnabled)
+        }.store(in: &hrCancellables)
         // A completed backfill has just written strap history. Refresh the dashboard cache,
         // but leave heavyweight analysis to its own guarded/background-friendly path.
         live.$lastSyncedAt
@@ -146,6 +154,11 @@ final class AppModel: ObservableObject {
 
         AppModel.shared = self   // publish for App Intents (Shortcuts) — see the static above (#42)
 
+        // Seed the BLE client with the persisted "Continuous HRV capture" intent so `wantsRealtime`
+        // reflects it from launch — the reconciler then arms the dense stream as soon as the strap bonds
+        // (and the bond sink above re-applies it on every reconnect).
+        ble.setKeepRealtimeForData(PuffinExperiment.keepRealtimeForDataEnabled)
+
         // Turn the strap's offloaded raw data into dashboard scores on launch and every 15
         // minutes, so recovery / strain / sleep populate from the strap itself with no import.
         // IntelligenceEngine computes, persists under "my-whoop-noop", and refreshes the dashboard.
@@ -153,6 +166,10 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             await self.repo.refresh()                          // surface any imported data at once
             try? await Task.sleep(nanoseconds: 6_000_000_000)  // give the first offload a moment
+            // One-shot on-upgrade Effort rescore (#313): recompute strain from source across the FULL
+            // history once, so any deep-history rows an older build left on the 0–21 axis regenerate on
+            // the 0–100 axis. Guarded by a persisted flag, so this is a no-op on every subsequent launch.
+            await self.intelligence.runEffortRescoreIfNeeded()
             while !Task.isCancelled {
                 await self.intelligence.analyzeRecent()
                 try? await Task.sleep(nanoseconds: 900_000_000_000)  // 15 min, matches the offload cadence
@@ -163,6 +180,11 @@ final class AppModel: ObservableObject {
     private func refreshAfterCompletedBackfill() async {
         live.append(log: "Backfill: refreshing dashboard cache from completed sync")
         await repo.refresh(days: 120)
+        // Score the freshly-offloaded raw data RIGHT NOW rather than waiting for the next 15-minute
+        // analyzeRecent tick — otherwise a just-synced night's Charge / Effort / Rest can take up to
+        // 15 minutes to appear on a strap-only (no-import) dashboard. analyzeRecent no-ops if a tick is
+        // already running and refreshes the dashboard itself once the new scores persist. (PR #218)
+        await intelligence.analyzeRecent()
     }
 
     /// Fold a fresh reading into the smoothing window and republish a stable bpm.
@@ -182,7 +204,11 @@ final class AppModel: ObservableObject {
         hrWindow.removeAll { now.timeIntervalSince($0.t) > 10 }   // ~10s window
         if hrWindow.count > 40 { hrWindow.removeFirst(hrWindow.count - 40) }
         let vals = hrWindow.map(\.v).sorted()
-        bpm = vals.isEmpty ? nil : Int(vals[vals.count / 2].rounded())
+        // live perf: only republish when the SMOOTHED value actually changes. ingestHR fires on every
+        // heartRate AND rr update (~1–3 Hz), but the median is stable across most of them — an
+        // unconditional assign re-renders every bpm observer (Live, menu bar, widgets) for nothing.
+        let smoothed = vals.isEmpty ? nil : Int(vals[vals.count / 2].rounded())
+        if bpm != smoothed { bpm = smoothed }
         captureWorkoutSample()
         evaluateStress()
     }
@@ -349,7 +375,13 @@ final class AppModel: ObservableObject {
     func runMacAction(_ kind: MacActionKind, shortcut: String) {
         switch kind {
         case .none: break
-        case .lockScreen: if !MacActions.lockScreen() { MacActions.runShortcut("Lock Screen") }
+        case .lockScreen:
+            if !MacActions.lockScreen() {
+                #if os(macOS)
+                MacActions.runShortcut("Lock Screen")   // login.framework unavailable — fall back to a Shortcut
+                #endif
+                // iOS can't lock the device and .lockScreen isn't selectable there, so no stray Shortcut launch.
+            }
         case .buzzBack: buzz(loops: 1)
         case .markMoment: markMoment()
         case .runShortcut: MacActions.runShortcut(shortcut)
@@ -357,8 +389,12 @@ final class AppModel: ObservableObject {
     }
 
     /// Record a "moment" (double-tap marker) with a confirming buzz.
-    func markMoment() {
-        moments.append(Date())
+    func markMoment() { markMoment(at: Date()) }
+
+    /// Record a "moment" at a specific time (used by the Siri/Shortcuts path, which captures the
+    /// invocation time even though the app only drains the queue later when it becomes active).
+    func markMoment(at date: Date) {
+        moments.append(date)
         if moments.count > 500 { moments.removeFirst(moments.count - 500) }
         UserDefaults.standard.set(moments.map(\.timeIntervalSince1970), forKey: "moments")
         buzz(loops: 1)
@@ -369,7 +405,12 @@ final class AppModel: ObservableObject {
         if worn {
             if !behavior.wristOnShortcut.isEmpty { MacActions.runShortcut(behavior.wristOnShortcut) }
         } else {
+            #if os(macOS)
+            // Auto-lock on wrist-off is a macOS-only affordance (the toggle is hidden on iOS, where a
+            // third-party app can't lock the device). Guarding it here also stops a stray "Lock Screen"
+            // Shortcut launch for any iOS user who toggled this on before it was gated off iPhone.
             if behavior.autoLockOnWristOff, !MacActions.lockScreen() { MacActions.runShortcut("Lock Screen") }
+            #endif
             if !behavior.wristOffShortcut.isEmpty { MacActions.runShortcut(behavior.wristOffShortcut) }
         }
     }
@@ -431,6 +472,46 @@ final class AppModel: ObservableObject {
     }
 
     /// Import a Whoop CSV export (.zip or folder) → on-device store, then refresh the dashboard.
+    /// A picked import file made safe to read. On iOS the security-scoped — and possibly
+    /// iCloud-placeholder — URL is coordinated and COPIED into the app's temp directory, so the
+    /// importer reads a stable LOCAL file. That's what makes import work for iCloud Drive files (they
+    /// arrive as un-downloaded placeholders that ZIPFoundation can't open in place) and removes the
+    /// scoped-access timing fragility that blocked iPhone imports (#179). On macOS the picked URL is
+    /// read in place. `cleanup()` removes the temp copy. Sendable so it can cross the actor boundary.
+    struct ImportFile: Sendable {
+        let url: URL
+        private let temp: URL?
+        init(url: URL, temp: URL?) { self.url = url; self.temp = temp }
+        func cleanup() { if let temp { try? FileManager.default.removeItem(at: temp) } }
+    }
+
+    /// Runs off the main actor (nonisolated) so copying a large export never blocks the UI; the
+    /// caller holds the security scope (process-wide) for the duration.
+    nonisolated static func materializeForImport(_ picked: URL) async throws -> ImportFile {
+        #if os(iOS)
+        let ext = picked.pathExtension.isEmpty ? "dat" : picked.pathExtension
+        let dst = FileManager.default.temporaryDirectory
+            .appendingPathComponent("noop-import-\(UUID().uuidString)")
+            .appendingPathExtension(ext)
+        var coordError: NSError?
+        var ioError: Error?
+        // .forUploading materialises an iCloud placeholder and gives a stable snapshot to copy from.
+        NSFileCoordinator().coordinate(readingItemAt: picked, options: [.forUploading], error: &coordError) { readURL in
+            do {
+                if FileManager.default.fileExists(atPath: dst.path) {
+                    try FileManager.default.removeItem(at: dst)
+                }
+                try FileManager.default.copyItem(at: readURL, to: dst)
+            } catch { ioError = error }
+        }
+        if let coordError { throw coordError }
+        if let ioError { throw ioError }
+        return ImportFile(url: dst, temp: dst)
+        #else
+        return ImportFile(url: picked, temp: nil)
+        #endif
+    }
+
     func importWhoop(url: URL) {
         beginImport(.whoop)
         Task {
@@ -441,7 +522,9 @@ final class AppModel: ObservableObject {
                     finishImport(.whoop, summary: "Couldn't open the local store.", failed: true)
                     return
                 }
-                let summary = try await WhoopImporter.importExport(url: url, into: store, deviceId: deviceId)
+                let local = try await Self.materializeForImport(url)
+                defer { local.cleanup() }
+                let summary = try await WhoopImporter.importExport(url: local.url, into: store, deviceId: deviceId)
                 await repo.refresh()
                 let span: String
                 if let a = summary.earliest, let b = summary.latest {
@@ -467,7 +550,9 @@ final class AppModel: ObservableObject {
                     finishImport(.appleHealth, summary: "Couldn't open the local store.", failed: true)
                     return
                 }
-                let summary = try await AppleHealthImport.importExport(url: url, into: store, deviceId: appleDeviceId)
+                let local = try await Self.materializeForImport(url)
+                defer { local.cleanup() }
+                let summary = try await AppleHealthImport.importExport(url: local.url, into: store, deviceId: appleDeviceId)
                 await repo.refresh()
                 finishImport(.appleHealth, summary: "Imported \(summary.recordCount) records")
             } catch {

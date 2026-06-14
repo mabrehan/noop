@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.ActiveCaloriesBurnedRecord
+import androidx.health.connect.client.records.DistanceRecord
 import androidx.health.connect.client.records.ExerciseSessionRecord
 import androidx.health.connect.client.records.HeartRateRecord
 import androidx.health.connect.client.records.HeartRateVariabilityRmssdRecord
@@ -77,6 +78,11 @@ object HealthConnectImporter {
     /** Page size for paginated readRecords() calls. */
     private const val PAGE_SIZE = 5000
 
+    /** Slack (seconds) when matching a DistanceRecord to a workout session — a relay app can write the
+     *  distance record offset by up to a few minutes from the session it belongs to (#215). Overlap
+     *  clipping keeps a neighbouring activity inside this window from over-counting. */
+    private const val DISTANCE_MATCH_BUFFER_S = 300L
+
     /** The record types this importer reads, in one place so PERMISSIONS stays in sync. */
     private val READ_RECORDS: List<KClass<out Record>> = listOf(
         StepsRecord::class,
@@ -91,6 +97,7 @@ object HealthConnectImporter {
         Vo2MaxRecord::class,
         WeightRecord::class,
         ExerciseSessionRecord::class,
+        DistanceRecord::class,
     )
 
     /**
@@ -290,6 +297,46 @@ object HealthConnectImporter {
                     )
                 }
             }
+
+            // Fill per-workout distance (#215): an ExerciseSessionRecord carries no distance, so
+            // distanceM was stored null and the "(Total) Distance" tile read 0. Sum the DistanceRecord
+            // metres inside each session window — a targeted per-session read, bounded by workout count,
+            // mirroring the HR fill above. readAll swallows a per-session failure / revoked permission
+            // (partial-permissions design, #150), so one bad session can't fail the import. iOS/macOS
+            // already source workout distance from Apple Health; this is the Android-only equivalent.
+            for (i in workouts.indices) {
+                val w = workouts[i]
+                if (w.endTs <= w.startTs) continue
+                var meters = 0.0
+                // #215: a relay app (e.g. Suunto → Health Sync) often writes the cumulative DistanceRecord
+                // with start/end offset by seconds-to-minutes from the ExerciseSession it belongs to, so a
+                // strict between(session.start, session.end) read returned nothing and distance stayed 0
+                // even though the distance was in Health Connect. Read a buffered window so an offset record
+                // is found, then count only the portion of each record that OVERLAPS the actual session —
+                // so a neighbouring activity's record inside the buffer can't over-count.
+                val ws = w.startTs
+                val we = w.endTs
+                readAll(
+                    client, DistanceRecord::class,
+                    TimeRangeFilter.between(
+                        Instant.ofEpochSecond(ws - DISTANCE_MATCH_BUFFER_S),
+                        Instant.ofEpochSecond(we + DISTANCE_MATCH_BUFFER_S),
+                    ),
+                ) { d ->
+                    val rs = d.startTime.epochSecond
+                    val re = d.endTime.epochSecond
+                    val overlap = (minOf(re, we) - maxOf(rs, ws)).coerceAtLeast(0)
+                    meters += when {
+                        re > rs && overlap > 0 -> d.distance.inMeters * (overlap.toDouble() / (re - rs))
+                        re <= rs && rs in (ws - DISTANCE_MATCH_BUFFER_S)..(we + DISTANCE_MATCH_BUFFER_S) ->
+                            d.distance.inMeters // degenerate zero-length record near the session
+                        else -> 0.0
+                    }
+                }
+                if (meters > 0.0) {
+                    workouts[i] = w.copy(distanceM = round1(meters))
+                }
+            }
         } catch (e: Exception) {
             return ImportSummary.failure(SOURCE, "Health Connect read failed: ${e.message}")
         }
@@ -403,6 +450,62 @@ object HealthConnectImporter {
             message = if (total == 0) "Nothing new to import from Health Connect."
             else "Imported $total rows from Health Connect.",
         )
+    }
+
+    /**
+     * Live top-up of TODAY's Health Connect step total (#150 follow-up). [import] is a manual
+     * one-shot, so today's stored steps freeze at import time while the real count keeps climbing —
+     * past days were fine, today wasn't. This does ONE StepsRecord read over [startOfDay, now],
+     * bucketed by record START day exactly like [import], and rewrites only today's "health-connect"
+     * [AppleDaily] row. The existing row is read first and updated via `copy(steps = …)` because
+     * [WhoopRepository.upsertAppleDaily] is a Room `@Upsert` — on a (deviceId, day) conflict it
+     * REPLACES the whole row, so a fresh steps-only row would null every other column.
+     *
+     * Returns the live sum, or the stored count when today read zero, or null when Health Connect
+     * is unavailable / steps aren't granted / there's nothing at all. Never throws.
+     */
+    suspend fun refreshTodaySteps(context: Context, repo: WhoopRepository): Int? {
+        if (sdkStatus(context) != HealthConnectClient.SDK_AVAILABLE) return null
+        val client = client(context)
+        val granted = try {
+            client.permissionController.getGrantedPermissions()
+        } catch (e: Exception) {
+            return null
+        }
+        if (HealthPermission.getReadPermission(StepsRecord::class) !in granted) return null
+
+        val zone = ZoneId.systemDefault()
+        val today = LocalDate.now(zone)
+        val dayKey = today.toString()
+        var sum = 0L
+        // readAll swallows a failed read (sum stays 0), so a flaky provider degrades to the stored
+        // row below rather than clobbering it with zero.
+        readAll(
+            client, StepsRecord::class,
+            TimeRangeFilter.between(today.atStartOfDay(zone).toInstant(), Instant.now()),
+        ) { r ->
+            // The filter matches by overlap — drop records that STARTED yesterday so the bucketing
+            // agrees with [import]'s dayOf(r.startTime).
+            if (LocalDate.ofInstant(r.startTime, zone) == today) sum += r.count
+        }
+
+        val existing = try {
+            repo.appleDaily(HC_DEVICE, dayKey, dayKey).firstOrNull()
+        } catch (e: Exception) {
+            null
+        }
+        // Zero is indistinguishable from "no data yet today" — never overwrite a stored count with it.
+        if (sum <= 0L) return existing?.steps
+
+        val updated = existing?.copy(steps = sum.toInt())
+            ?: AppleDaily(deviceId = HC_DEVICE, day = dayKey, steps = sum.toInt())
+        try {
+            if (existing == null) repo.upsertDevice(HC_DEVICE, name = "Health Connect")
+            repo.upsertAppleDaily(listOf(updated))
+        } catch (e: Exception) {
+            return existing?.steps
+        }
+        return sum.toInt()
     }
 
     // MARK: - paginated read helper

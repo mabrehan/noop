@@ -1,5 +1,6 @@
 package com.noop.ui
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -8,6 +9,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -25,7 +27,16 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -36,7 +47,9 @@ import com.noop.analytics.Baselines
 import com.noop.analytics.VitalBands
 import com.noop.ble.LiveState
 import com.noop.data.DailyMetric
+import java.time.Instant
 import java.time.LocalDate
+import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import kotlin.math.roundToInt
@@ -164,18 +177,34 @@ private fun hrZone(fraction: Double): Int = when {
     else -> 5
 }
 
-/** A short HR series for the hero chart. Prefers the accumulated live-HR history (which moves over
- *  time); falls back to per-beat HR from R-R, then to a flat pair while the buffer fills. The old
- *  version derived ONLY from R-R, which is sparse on WHOOP 4, so it sat on a flat 2-point line even
- *  while HR was clearly changing (issue #18). */
-private fun hrSeries(history: List<Int>, live: LiveState, hr: Int?): List<Double> {
-    if (history.size > 1) return history.map { it.toDouble() }
+/** One streamed live-HR reading with the wall-clock time it arrived (epoch millis). Carrying the
+ *  time — not a bare bpm — is what lets the hero render a real time x-axis (#198). */
+data class LiveHrSample(val timeMs: Long, val bpm: Double)
+
+/** A short, time-stamped HR series for the hero chart. Prefers the accumulated live-HR history
+ *  (which moves over time); falls back to per-beat HR from R-R, then to a flat pair while the
+ *  buffer fills. The old version derived ONLY from R-R, which is sparse on WHOOP 4, so it sat on a
+ *  flat 2-point line even while HR was clearly changing (issue #18). The R-R / flat fallbacks have
+ *  no real per-sample timestamps, so we synthesise a 1 Hz trailing window ending "now" — the x-axis
+ *  still reads as clock time and scrolls, matching the live buffer (#198). */
+private fun hrSeries(history: List<LiveHrSample>, live: LiveState, hr: Int?): List<LiveHrSample> {
+    if (history.size > 1) return history
     val beats = live.rr.takeLast(60).mapNotNull { rr ->
         if (rr > 0) 60_000.0 / rr else null
     }
-    if (beats.size > 1) return beats
-    if (hr != null) return listOf(hr.toDouble(), hr.toDouble())
+    if (beats.size > 1) return synthesiseSeries(beats)
+    if (hr != null) return synthesiseSeries(listOf(hr.toDouble(), hr.toDouble()))
     return emptyList()
+}
+
+/** Wrap a bare value series in trailing 1 Hz timestamps ending "now", so the fallbacks chart on the
+ *  same time x-axis as the live buffer. */
+private fun synthesiseSeries(values: List<Double>): List<LiveHrSample> {
+    val now = System.currentTimeMillis()
+    val n = values.size
+    return values.mapIndexed { i, v ->
+        LiveHrSample(timeMs = now + (i - (n - 1)) * 1000L, bpm = v)
+    }
 }
 
 // MARK: - Heart rate hero (live)
@@ -188,12 +217,13 @@ private fun HeartRateSection(live: LiveState, hrMax: Int) {
     val fraction = hrFraction(displayHr, hrMax)
     val zone = hrZone(fraction)
     // Accumulate the streamed HR over time so the hero chart actually moves (issue #18 — it used to
-    // derive from sparse R-R and flat-line). Lives in UI state; resets when you leave the screen.
-    val hrHistory = remember { mutableStateListOf<Int>() }
+    // derive from sparse R-R and flat-line). Each sample now carries its arrival time so the hero can
+    // render a real time x-axis (#198). Lives in UI state; resets when you leave the screen.
+    val hrHistory = remember { mutableStateListOf<LiveHrSample>() }
     LaunchedEffect(displayHr) {
         displayHr?.let { if (it in 30..220) {
-            hrHistory.add(it)
-            if (hrHistory.size > 90) hrHistory.removeAt(0)
+            hrHistory.add(LiveHrSample(timeMs = System.currentTimeMillis(), bpm = it.toDouble()))
+            if (hrHistory.size > 180) hrHistory.removeAt(0)
         } }
     }
     val series = hrSeries(hrHistory, live, displayHr)
@@ -206,7 +236,11 @@ private fun HeartRateSection(live: LiveState, hrMax: Int) {
             trailing = if (derived) "from R-R" else null,
         )
 
-        NoopCard(padding = Metrics.space18) {
+        // The live HR hero floats over a Charge-world scenic backdrop (the Health screen's colour
+        // world) with the card tinted rose — heart-rate's metric accent. Mirrors HealthView.swift.
+        Box(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(Metrics.cardRadius))) {
+            ScenicHeroBackground(modifier = Modifier.matchParentSize(), domain = DomainTheme.Charge)
+            NoopCard(padding = Metrics.space18, tint = Palette.metricRose) {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 // Card header: title + subtitle on the left, live bpm read-out right.
                 Row(
@@ -237,14 +271,20 @@ private fun HeartRateSection(live: LiveState, hrMax: Int) {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(Metrics.chartHeight),
+                        .height(Metrics.chartHeight)
+                        .semantics {
+                            contentDescription = if (hasLiveHr) {
+                                "Live heart rate over time, $displayHr beats per minute, zone $zone"
+                            } else {
+                                "Live heart rate over time, no data"
+                            }
+                        },
                 ) {
                     if (series.size > 1) {
-                        LineChart(
-                            values = series,
-                            modifier = Modifier.fillMaxWidth().height(Metrics.chartHeight),
+                        LiveHrTimeChart(
+                            samples = series,
                             color = zoneColor,
-                            fill = true,
+                            modifier = Modifier.fillMaxWidth().height(Metrics.chartHeight),
                         )
                     } else {
                         Column(
@@ -278,6 +318,7 @@ private fun HeartRateSection(live: LiveState, hrMax: Int) {
                     state = if (hasLiveHr) "STREAMING" else "IDLE",
                 )
             }
+            }
         }
     }
 }
@@ -303,6 +344,132 @@ private fun FooterStat(label: String, value: String, modifier: Modifier = Modifi
         Overline(label)
         Text(value, style = NoopType.captionNumber, color = Palette.textPrimary)
     }
+}
+
+// MARK: - Live HR time chart
+//
+// The live HR hero plotted over a real TIME x-axis (HH:mm:ss), so the trace visibly scrolls as new
+// samples arrive (#198). Replaces the axis-less LineChart on this hero — a phone user has no hover,
+// so the visible clock axis is the fix. A local Canvas chart (not the shared LineChart, which has no
+// axis): x is time-proportional, y auto-fits with headroom, the zone colour drives line + soft fill.
+
+private val liveHrAxisFormatter: DateTimeFormatter =
+    DateTimeFormatter.ofPattern("HH:mm:ss", Locale.US).withZone(ZoneId.systemDefault())
+
+@Composable
+private fun LiveHrTimeChart(
+    samples: List<LiveHrSample>,
+    color: Color,
+    modifier: Modifier,
+) {
+    Box(modifier = modifier.fillMaxWidth().clipToBounds()) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            if (samples.size < 2 || size.width <= 0f || size.height <= 0f) {
+                drawHrBaseline()
+                return@Canvas
+            }
+
+            val strokePx = 2.5f
+            val topPad = strokePx + 4f
+            // Reserve a strip at the bottom for the time labels.
+            val axisHeight = 26f
+            val plotBottom = (size.height - axisHeight).coerceAtLeast(1f)
+            val usableH = (plotBottom - topPad).coerceAtLeast(1f)
+
+            val tMin = samples.first().timeMs
+            val tMax = samples.last().timeMs
+            val tSpan = (tMax - tMin).coerceAtLeast(1L)
+
+            val values = samples.map { it.bpm }
+            val vMin = values.min()
+            val vMax = values.max()
+            val vSpan = (vMax - vMin)
+            // A little y-headroom so the trace never kisses the plot edges.
+            val pad = if (vSpan > 0.0) vSpan * 0.12 else 5.0
+            val lo = vMin - pad
+            val hi = vMax + pad
+            val span = (hi - lo).coerceAtLeast(0.0001)
+
+            fun xFor(t: Long): Float = ((t - tMin).toFloat() / tSpan.toFloat()) * size.width
+            fun yFor(v: Double): Float {
+                val norm = ((v - lo) / span).toFloat()
+                return topPad + (1f - norm) * usableH
+            }
+
+            val pts = samples.map { Offset(xFor(it.timeMs), yFor(it.bpm)) }
+
+            // Soft gradient fill under the curve (down to the plot baseline, above the axis strip).
+            val fillPath = Path().apply {
+                moveTo(pts.first().x, plotBottom)
+                lineTo(pts.first().x, pts.first().y)
+                for (i in 1 until pts.size) lineTo(pts[i].x, pts[i].y)
+                lineTo(pts.last().x, plotBottom)
+                close()
+            }
+            drawPath(
+                path = fillPath,
+                brush = Brush.verticalGradient(
+                    colors = listOf(
+                        color.copy(alpha = StrandAlpha.chartFillStrong),
+                        color.copy(alpha = StrandAlpha.chartFillSoft),
+                        Color.Transparent,
+                    ),
+                    startY = 0f,
+                    endY = plotBottom,
+                ),
+            )
+
+            // The line itself.
+            val linePath = Path().apply {
+                moveTo(pts.first().x, pts.first().y)
+                for (i in 1 until pts.size) lineTo(pts[i].x, pts[i].y)
+            }
+            drawPath(
+                path = linePath,
+                color = color,
+                style = Stroke(width = strokePx, cap = StrokeCap.Round, join = StrokeJoin.Round),
+            )
+
+            // Time x-axis: a faint baseline + evenly-spaced clock labels across the time span.
+            drawLine(
+                color = Palette.hairline.copy(alpha = 0.4f),
+                start = Offset(0f, plotBottom),
+                end = Offset(size.width, plotBottom),
+                strokeWidth = 1f,
+                cap = StrokeCap.Round,
+            )
+            val tickCount = 4
+            drawContext.canvas.nativeCanvas.apply {
+                val paint = android.graphics.Paint().apply {
+                    isAntiAlias = true
+                    textSize = 24f
+                    this.color = Palette.textTertiary.toArgb()
+                }
+                val baselineY = size.height - 6f
+                for (i in 0 until tickCount) {
+                    val frac = i.toFloat() / (tickCount - 1)
+                    val t = tMin + (tSpan * frac).toLong()
+                    val label = liveHrAxisFormatter.format(Instant.ofEpochMilli(t))
+                    val labelWidth = paint.measureText(label)
+                    // Keep the first/last labels inside the plot bounds.
+                    val rawX = frac * size.width
+                    val x = rawX.coerceIn(0f, (size.width - labelWidth).coerceAtLeast(0f))
+                    drawText(label, x, baselineY, paint)
+                }
+            }
+        }
+    }
+}
+
+private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawHrBaseline() {
+    val y = size.height / 2f
+    drawLine(
+        color = Palette.hairline.copy(alpha = StrandAlpha.subtleLine),
+        start = Offset(0f, y),
+        end = Offset(size.width, y),
+        strokeWidth = 1f,
+        cap = StrokeCap.Round,
+    )
 }
 
 // MARK: - Vitals grid (uniform StatTiles)
@@ -378,6 +545,9 @@ private data class Vital(
     val banding: VitalBands.Result,
     /** The metric's category colour (used only when in range). */
     val metricColor: Color,
+    /** Trailing values (oldest → newest) for the tile's metric-tinted sparkline trail, matching
+     *  Today's Key-Metrics tiles. Presentation-only; defaulted so existing call sites compile. */
+    val sparkline: List<Double> = emptyList(),
 ) {
     /** Value with its unit appended, or null when no data. */
     val formattedValue: String? = value?.let { "${format(it)} $unit" }
@@ -441,6 +611,10 @@ private fun vitalsFor(
         val max = allValues.maxOrNull() ?: return null
         return "within ${format(min)} -- ${format(max)} $unit"
     }
+    // Trailing values (oldest → newest) feeding each tile's sparkline trail. Built from the same
+    // history already gathered for banding, including the displayed day's value. Presentation-only.
+    fun trail(current: Double?, window: Int = 14, selector: (DailyMetric) -> Double?): List<Double> =
+        (history.mapNotNull(selector) + listOfNotNull(current)).takeLast(window)
 
     // Skin temp is bimodal: CSV imports store ABSOLUTE °C, the on-device pipeline a ±°C
     // DEVIATION — partition the history to the displayed value's kind and pick the matching
@@ -496,6 +670,7 @@ private fun vitalsFor(
             rangeCaption = respRangeCaption,
             banding = VitalBands.band(d?.respRateBpm, series { it.respRateBpm }, 12.0..20.0, Baselines.respCfg),
             metricColor = Palette.metricCyan,
+            sparkline = trail(d?.respRateBpm) { it.respRateBpm },
         ),
         Vital(
             key = "spo2", label = "Blood O₂", unit = "%",
@@ -508,6 +683,7 @@ private fun vitalsFor(
             // of personal baseline (no "spo2" MetricCfg exists).
             banding = VitalBands.band(d?.spo2Pct, emptyList(), 95.0..100.0, null),
             metricColor = Palette.metricCyan,
+            sparkline = trail(d?.spo2Pct) { it.spo2Pct },
         ),
         Vital(
             key = "rhr", label = "Resting HR", unit = "bpm",
@@ -521,6 +697,7 @@ private fun vitalsFor(
                 Baselines.restingHRCfg,
             ),
             metricColor = Palette.metricRose,
+            sparkline = trail(d?.restingHr?.toDouble()) { it.restingHr?.toDouble() },
         ),
         Vital(
             key = "hrv", label = "HRV", unit = "ms",
@@ -531,6 +708,7 @@ private fun vitalsFor(
             rangeCaption = hrvRangeCaption,
             banding = VitalBands.band(d?.avgHrv, series { it.avgHrv }, 40.0..120.0, Baselines.hrvCfg),
             metricColor = Palette.metricPurple,
+            sparkline = trail(d?.avgHrv) { it.avgHrv },
         ),
         Vital(
             key = "skin", label = "Skin Temp", unit = skinUnitLabel,
@@ -540,6 +718,10 @@ private fun vitalsFor(
             asOfLabel = asOfLabel(todayKey),
             rangeCaption = skinRangeCaption,
             banding = skinResult, metricColor = Palette.metricAmber,
+            // Keep the trail on the displayed value's kind — absolute °C and ±deviation must not mix.
+            sparkline = trail(skin) { row ->
+                row.skinTempDevC?.takeIf { VitalBands.isAbsoluteSkinTemp(it) == skinIsAbsolute }
+            },
         ),
     )
 }
@@ -552,7 +734,9 @@ private fun VitalTile(
     caption: String = vital.stateCaption,
     accent: Color = vital.accent,
 ) {
-    NoopCard(modifier = modifier.height(Metrics.tileHeight), padding = Metrics.space14) {
+    // The tile borrows its accent as a faint card wash, so each vital reads as part of its colour
+    // world while staying legible on the deep blue-black — matching Today's StatTile.
+    NoopCard(modifier = modifier.height(Metrics.tileHeight), padding = Metrics.space14, tint = accent) {
         Column {
             Overline(vital.label)
             Spacer(Modifier.weight(1f))
@@ -563,6 +747,18 @@ private fun VitalTile(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+            // A metric-tinted sparkline trail with a glowing "now" end-cap, mirroring Today's tiles.
+            // Hidden below two points so a sparse vital shows the caption with no flat trail.
+            if (vital.sparkline.size > 1) {
+                TileSparkline(
+                    values = vital.sparkline,
+                    color = vital.metricColor,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(20.dp)
+                        .padding(top = Metrics.space4),
+                )
+            }
             Text(
                 text = caption,
                 style = NoopType.footnote,
@@ -572,6 +768,74 @@ private fun VitalTile(
                 modifier = Modifier.padding(top = Metrics.space2),
             )
         }
+    }
+}
+
+/**
+ * A compact metric-tinted sparkline for a tile trail: a soft gradient fill under a coloured line,
+ * capped with a glowing end-cap (a halo + white core) at the latest point so it reads as "now".
+ * Built locally with Canvas + Palette colours (there is no shared tile-spark composable), mirroring
+ * the Bevel chart end-cap used on the macOS sparkline and the Today HR chart. Decorative — the tile
+ * already carries a combined contentDescription, so the spark is not separately announced.
+ */
+@Composable
+private fun TileSparkline(values: List<Double>, color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier.clipToBounds()) {
+        if (values.size < 2 || size.width <= 0f || size.height <= 0f) return@Canvas
+        val strokePx = 2f
+        val pad = strokePx + 2f
+        val usableH = (size.height - pad * 2).coerceAtLeast(1f)
+        val lo = values.min()
+        val hi = values.max()
+        val span = (hi - lo).takeIf { it > 0.0 } ?: 1.0
+        val n = values.size
+        fun xFor(i: Int): Float = if (n > 1) size.width * i / (n - 1) else 0f
+        fun yFor(v: Double): Float {
+            val norm = ((v - lo) / span).toFloat().coerceIn(0f, 1f)
+            return pad + (1f - norm) * usableH
+        }
+        val pts = values.mapIndexed { i, v -> Offset(xFor(i), yFor(v)) }
+
+        // Soft gradient fill under the curve.
+        val fillPath = Path().apply {
+            moveTo(pts.first().x, size.height)
+            lineTo(pts.first().x, pts.first().y)
+            for (i in 1 until pts.size) lineTo(pts[i].x, pts[i].y)
+            lineTo(pts.last().x, size.height)
+            close()
+        }
+        drawPath(
+            path = fillPath,
+            brush = Brush.verticalGradient(
+                colors = listOf(
+                    color.copy(alpha = StrandAlpha.chartFillSoft),
+                    Color.Transparent,
+                ),
+                startY = 0f,
+                endY = size.height,
+            ),
+        )
+
+        // The line, tinted lighter → full at the leading edge so it reads as building toward "now".
+        val linePath = Path().apply {
+            moveTo(pts.first().x, pts.first().y)
+            for (i in 1 until pts.size) lineTo(pts[i].x, pts[i].y)
+        }
+        drawPath(
+            path = linePath,
+            brush = Brush.horizontalGradient(
+                colors = listOf(color.copy(alpha = 0.5f), color),
+                startX = 0f,
+                endX = size.width,
+            ),
+            style = Stroke(width = strokePx, cap = StrokeCap.Round, join = StrokeJoin.Round),
+        )
+
+        // Glowing "now" end-cap at the latest point: a soft halo + white core.
+        val end = pts.last()
+        drawCircle(color = color.copy(alpha = 0.30f), radius = 6f, center = end)
+        drawCircle(color = color.copy(alpha = 0.65f), radius = 3.5f, center = end)
+        drawCircle(color = Color.White, radius = 1.6f, center = end)
     }
 }
 

@@ -64,10 +64,41 @@ private func metricAccent(_ m: MetricDescriptor) -> Color {
 /// The gradient for a metric's trend line — strain/recovery ride their data scales;
 /// everything else uses a flat tint of its category accent.
 private func metricGradient(_ m: MetricDescriptor) -> Gradient {
-    if m.category == "Strain" { return StrandPalette.strainGradient }
+    if m.category == "Effort" { return StrandPalette.strainGradient }
     if m.key == "recovery" { return StrandPalette.recoveryGradient }
     let c = metricAccent(m)
     return Gradient(colors: [c.opacity(0.55), c])
+}
+
+/// The Bevel colour world a metric's detail hero belongs to — the catalog's category
+/// already names it (Charge / Rest / Effort), and Heart/Health/Nutrition/Mind metrics
+/// fall back to the world that best fits their accent. Drives the ScenicHeroBackground
+/// tint + the hero gauge/number glow.
+private func metricDomain(_ m: MetricDescriptor) -> DomainTheme {
+    switch m.category {
+    case "Charge":            return .charge
+    case "Effort":            return .effort
+    case "Rest", "Mind":      return .rest
+    default:
+        // Heart / Health / Nutrition: lean on the metric's own world. RHR-style risk
+        // metrics read as Stress (teal); everything else rides the Charge green chrome.
+        switch m.key {
+        case "rhr", "max_hr", "stress", "body_fat": return .stress
+        default:                                    return .charge
+        }
+    }
+}
+
+/// A 0–100 score that reads naturally as a layered ring gauge in the hero (vs a bare
+/// headline number). Recovery / Rest / Blood-oxygen sit on a clean 0–100 axis.
+private func metricGaugeFraction(_ m: MetricDescriptor, value: Double) -> Double? {
+    switch m.key {
+    case "recovery", "sleep_performance", "spo2", "hours_vs_needed_pct",
+         "sleep_consistency", "restorative_pct", "sleep_efficiency":
+        return min(max(value / 100.0, 0), 1)
+    default:
+        return nil
+    }
 }
 
 // MARK: - Range
@@ -106,55 +137,106 @@ enum ExploreRange: Int, CaseIterable, Identifiable, Hashable {
 /// MetricDetailView. A faint trailing "•" marks metrics whose series is empty.
 struct MetricExplorerView: View {
     @EnvironmentObject var repo: Repository
-    /// metric.id → whether its series is empty (loaded once, lazily).
+    /// metric.id → whether its series is empty. Filled INCREMENTALLY by `probeEmptiness()`; a metric
+    /// absent from the map simply has no empty-dot yet (rows never wait on it — see `MetricRow`).
     @State private var emptyByID: [String: Bool] = [:]
+    @State private var probedRefreshSeq: Int?
+    /// True while the empty-dot probe is still running its first pass. Drives a small inline progress
+    /// hint in the header, never gating the rows: the catalog is static, so every row's label/icon/unit
+    /// must paint immediately even before any series read returns (#199).
+    @State private var probing = true
 
     var body: some View {
-        NavigationStack {
-            ScreenScaffold(title: "Explore", subtitle: "Every signal, one tap deep.") {
-                ForEach(MetricCatalog.categories, id: \.self) { category in
-                    let metrics = MetricCatalog.inCategory(category)
-                    if !metrics.isEmpty {
-                        VStack(alignment: .leading, spacing: NoopMetrics.gap) {
-                            SectionHeader("\(category)", overline: "Category",
-                                          trailing: "\(metrics.count)")
-                            NoopCard(padding: 0) {
-                                VStack(spacing: 0) {
-                                    ForEach(Array(metrics.enumerated()), id: \.element.id) { idx, metric in
-                                        NavigationLink(value: metric) {
-                                            MetricRow(metric: metric,
-                                                      isEmpty: emptyByID[metric.id] ?? false)
-                                        }
-                                        .buttonStyle(.plain)
-                                        if idx < metrics.count - 1 {
-                                            Divider().overlay(StrandPalette.hairline)
-                                                .padding(.leading, 56)
-                                        }
+        #if os(macOS)
+        // macOS: Explore is a standalone detail pane, so it owns its NavigationStack.
+        NavigationStack { exploreScaffold }
+            .task(id: repo.refreshSeq) { await probeEmptiness(refreshSeq: repo.refreshSeq) }
+        #else
+        // iOS: Explore is pushed INSIDE the More tab's NavigationStack. A nested NavigationStack made
+        // tapping a metric bounce straight back to the More list (#199) — so use the ambient stack and
+        // let the navigationDestination below resolve against it.
+        exploreScaffold
+            .task(id: repo.refreshSeq) { await probeEmptiness(refreshSeq: repo.refreshSeq) }
+        #endif
+    }
+
+    private var exploreScaffold: some View {
+        ScreenScaffold(title: "Explore", subtitle: "Every signal, one tap deep.") {
+            // A quiet, non-blocking hint while the empty-dot probe runs its first pass. The rows below
+            // render in full immediately regardless — this only reassures during the scan, and never
+            // leaves the screen reading as a bare/empty list before the probe lands (#199).
+            if probing {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Scanning your data…")
+                        .font(StrandFont.footnote)
+                        .foregroundStyle(StrandPalette.textTertiary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            ForEach(MetricCatalog.categories, id: \.self) { category in
+                let metrics = MetricCatalog.inCategory(category)
+                if !metrics.isEmpty {
+                    VStack(alignment: .leading, spacing: NoopMetrics.gap) {
+                        SectionHeader("\(category)", overline: "Category",
+                                      trailing: "\(metrics.count)")
+                        NoopCard(padding: 0) {
+                            VStack(spacing: 0) {
+                                ForEach(Array(metrics.enumerated()), id: \.element.id) { idx, metric in
+                                    NavigationLink(value: metric) {
+                                        MetricRow(metric: metric,
+                                                  isEmpty: emptyByID[metric.id] ?? false)
+                                    }
+                                    // Full-row press-down feedback (square corners — the row spans the
+                                    // card edge-to-edge, dividers between).
+                                    .buttonStyle(StrandPressableButtonStyle(cornerRadius: 0))
+                                    #if os(iOS)
+                                    // Light selection tick on tap; the simultaneousGesture leaves the
+                                    // NavigationLink push intact.
+                                    .simultaneousGesture(TapGesture().onEnded {
+                                        StrandHaptic.selection.play()
+                                    })
+                                    #endif
+                                    if idx < metrics.count - 1 {
+                                        Divider().overlay(StrandPalette.hairline)
+                                            .padding(.leading, 56)
                                     }
                                 }
                             }
                         }
-                        .padding(.bottom, NoopMetrics.sectionGap - 20)
                     }
+                    .padding(.bottom, NoopMetrics.sectionGap - 20)
                 }
             }
-            .navigationDestination(for: MetricDescriptor.self) { metric in
-                MetricDetailView(metric: metric)
-            }
         }
-        .task { await probeEmptiness() }
+        .navigationDestination(for: MetricDescriptor.self) { metric in
+            MetricDetailView(metric: metric)
+        }
     }
 
-    /// One lightweight pass to learn which metrics have no series, so rows can flag
-    /// them with the faint trailing dot. Failures default to "has data" (no dot).
-    private func probeEmptiness() async {
-        guard emptyByID.isEmpty else { return }
-        var map: [String: Bool] = [:]
+    /// One lightweight pass to learn which metrics have no series, so rows can flag them with the
+    /// faint trailing dot. Failures default to "has data" (no dot).
+    ///
+    /// Crucially this assigns into `emptyByID` PER METRIC, not in one final batch (#199): the previous
+    /// version ran ~35 sequential `exploreSeries` reads — each hopping back to the @MainActor Repository
+    /// — before publishing a single result, so on iOS the main thread stayed busy and the freshly-pushed
+    /// list painted blank until the whole sweep finished. Publishing each result (with a `Task.yield()`
+    /// between reads so the run loop can lay the rows out) lets the catalog rows render immediately and
+    /// the dots fill in as the probe lands. Rows already render their label/icon/unit without waiting on
+    /// this — the map only ever ADDS a trailing dot.
+    private func probeEmptiness(refreshSeq: Int) async {
+        guard probedRefreshSeq != refreshSeq || emptyByID.isEmpty else { probing = false; return }
+        probedRefreshSeq = refreshSeq
+        emptyByID = [:]
+        probing = true
         for metric in MetricCatalog.all {
-            let s = await repo.series(key: metric.key, source: metric.source)
-            map[metric.id] = s.isEmpty
+            guard !Task.isCancelled else { return }
+            let s = await repo.exploreSeries(key: metric.key, source: metric.source)
+            guard !Task.isCancelled else { return }
+            emptyByID[metric.id] = s.isEmpty
+            await Task.yield()
         }
-        emptyByID = map
+        probing = false
     }
 }
 
@@ -164,13 +246,16 @@ private struct MetricRow: View {
     let metric: MetricDescriptor
     let isEmpty: Bool
 
-    // Trailing unit chip follows the Imperial/Metric preference (kg→lb, °C→°F).
+    // Trailing unit chip follows the Imperial/Metric preference (kg→lb, °C→°F) and the Effort scale
+    // (/100→/21, #268).
     @AppStorage(UnitPrefs.systemKey) private var unitSystemRaw = UnitSystem.metric.rawValue
     @AppStorage(UnitPrefs.temperatureKey) private var temperatureRaw = ""
+    @AppStorage(UnitPrefs.effortScaleKey) private var effortScaleRaw = EffortScale.hundred.rawValue
     private var unitLabel: String {
         let system = UnitSystem(rawValue: unitSystemRaw) ?? .metric
         let temp = UnitPrefs.resolveTemperature(system: system, override: temperatureRaw)
-        return metric.displayUnit(system: system, temperature: temp)
+        let effort = UnitPrefs.resolveEffortScale(effortScaleRaw)
+        return metric.displayUnit(system: system, temperature: temp, effortScale: effort)
     }
 
     var body: some View {
@@ -233,13 +318,22 @@ struct MetricDetailView: View {
     // here; everything else is unit-agnostic and renders unchanged.
     @AppStorage(UnitPrefs.systemKey) private var unitSystemRaw = UnitSystem.metric.rawValue
     @AppStorage(UnitPrefs.temperatureKey) private var temperatureRaw = ""
+    // Effort display scale (#268) — routes the Effort metric's numbers + unit; display-only, the plotted
+    // series stays 0–100. Every other metric is scale-agnostic (see MetricDescriptor.format).
+    @AppStorage(UnitPrefs.effortScaleKey) private var effortScaleRaw = EffortScale.hundred.rawValue
     private var unitSystem: UnitSystem { UnitSystem(rawValue: unitSystemRaw) ?? .metric }
     private var temperatureUnit: TemperatureUnit {
         UnitPrefs.resolveTemperature(system: unitSystem, override: temperatureRaw)
     }
-    private func fmt(_ v: Double) -> String { metric.format(v, system: unitSystem, temperature: temperatureUnit) }
+    private var effortScale: EffortScale { UnitPrefs.resolveEffortScale(effortScaleRaw) }
+    private func fmt(_ v: Double) -> String {
+        metric.format(v, system: unitSystem, temperature: temperatureUnit, effortScale: effortScale)
+    }
 
     @State private var range: ExploreRange = .month
+    /// Draw-in fraction for the hero ring gauge (0–100 scores). Set to the real fraction
+    /// in `.onAppear` with a soft ease, exactly as TodayView animates its rings.
+    @State private var heroAnimatedFraction: Double = 0
     /// Full ascending series for this metric — ALL history.
     @State private var series: [(day: String, value: Double)] = []
     /// Every OTHER catalog series, loaded once for the correlation scan.
@@ -253,6 +347,7 @@ struct MetricDetailView: View {
     @State private var correlationCache: [CorrRow] = []
     /// The (metricID, range) the cache was built for; nil means "not yet computed".
     @State private var correlationKey: String? = nil
+    private var loadTaskID: String { "\(metric.id)|\(repo.refreshSeq)" }
 
     // MARK: Derived
 
@@ -320,13 +415,19 @@ struct MetricDetailView: View {
         let fellBack = effRange != range
         return ScrollView {
             VStack(alignment: .leading, spacing: NoopMetrics.sectionGap) {
-                rangeBar(effectiveRange: effRange, windowed: win, windowFellBack: fellBack)
                 if loaded && series.isEmpty {
-                    // ONLY genuine empty state: no data in the entire history.
+                    // No data in the entire history — keep the range bar for context, then the
+                    // honest empty state (no scenic hero floating over nothing).
+                    rangeBar(effectiveRange: effRange, windowed: win, windowFellBack: fellBack)
                     ComingSoon(what: "Import your history first. A WHOOP export in Data Sources fills every metric you can explore here in about a minute.")
                 } else if !loaded {
+                    rangeBar(effectiveRange: effRange, windowed: win, windowFellBack: fellBack)
                     ComingSoon(what: "Reading your \(metric.title.lowercased())…")
                 } else {
+                    // Scenic hero: the metric's current value as a layered ring gauge (0–100
+                    // scores) or a big SF-Rounded headline, floated over the domain's starfield,
+                    // with the range pill. Then the frosted chart / stat tiles / correlations.
+                    heroHeader(effectiveRange: effRange, windowed: win, windowFellBack: fellBack)
                     heroChart(effectiveRange: effRange, windowed: win, windowFellBack: fellBack)
                     statRow(effectiveRange: effRange, windowed: win)
                     correlationCard
@@ -337,23 +438,113 @@ struct MetricDetailView: View {
         }
         .background(StrandPalette.surfaceBase)
         .navigationTitle(metric.title)
-        .task(id: metric.id) { await load() }
+        .task(id: loadTaskID) { await load() }
         // Range changes the window, hence the correlation inputs — recompute the
         // cached scan rather than letting `correlationCard` run it inside body.
         .onChange(of: range) { _ in recomputeCorrelations() }
     }
 
     private func load() async {
-        series = await repo.series(key: metric.key, source: metric.source)
+        series = await repo.exploreSeries(key: metric.key, source: metric.source)
         var loadedOthers: [(metric: MetricDescriptor, series: [(day: String, value: Double)])] = []
         for other in MetricCatalog.all where other.id != metric.id {
-            let s = await repo.series(key: other.key, source: other.source)
+            let s = await repo.exploreSeries(key: other.key, source: other.source)
             if !s.isEmpty { loadedOthers.append((other, s)) }
         }
         others = loadedOthers
         loaded = true
         // First correlation build, now that `series`/`others` exist.
         recomputeCorrelations()
+    }
+
+    // MARK: Scenic hero
+
+    /// The detail's opening hero: the metric's latest value as either a layered ring
+    /// BevelGauge (for 0–100 scores) or a big SF-Rounded headline number, floated over a
+    /// domain-tinted ScenicHeroBackground, with the category overline, the "as of" line,
+    /// and the range pill. Mirrors TodayView's score-hero idiom.
+    @ViewBuilder
+    private func heroHeader(effectiveRange: ExploreRange,
+                            windowed: [(day: String, value: Double)],
+                            windowFellBack: Bool) -> some View {
+        let domain = metricDomain(metric)
+        let value = latest?.value
+        let heroValue = latest.map { fmt($0.value) } ?? "—"
+        let asOf: String = {
+            guard let day = latest?.day, let d = parseDay(day) else { return "—" }
+            return "as of \(longDate(d))"
+        }()
+        let fraction = value.flatMap { metricGaugeFraction(metric, value: $0) }
+
+        ZStack(alignment: .top) {
+            ScenicHeroBackground(domain: domain)
+                .clipShape(RoundedRectangle(cornerRadius: NoopMetrics.cardRadius, style: .continuous))
+
+            VStack(alignment: .leading, spacing: NoopMetrics.gap) {
+                // Title + range control over the starfield.
+                HStack(alignment: .firstTextBaseline) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(metric.category.uppercased()).strandOverline()
+                        Text(metric.title)
+                            .font(StrandFont.title2)
+                            .foregroundStyle(StrandPalette.textPrimary)
+                    }
+                    Spacer()
+                    SegmentedPillControl(ExploreRange.allCases, selection: $range) { $0.label }
+                }
+
+                // The headline read-out: a ring gauge for 0–100 scores, else a big number.
+                HStack {
+                    Spacer(minLength: 0)
+                    if let fraction {
+                        BevelGauge(
+                            fraction: fraction,
+                            stops: domain.gradient.stops,
+                            tipColor: domain.bright,
+                            numberText: latest.map { String(Int($0.value.rounded())) } ?? "—",
+                            captionText: metric.unit.isEmpty ? nil : "\(metric.unit)",
+                            stateText: nil,
+                            supporting: asOf,
+                            diameter: 188,
+                            lineWidth: 15,
+                            showsLabel: latest != nil,
+                            animatedFraction: heroAnimatedFraction
+                        )
+                    } else {
+                        VStack(spacing: 6) {
+                            Text(heroValue)
+                                .font(StrandFont.number(54))
+                                .foregroundStyle(StrandPalette.textPrimary)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.5)
+                            Text(asOf)
+                                .font(StrandFont.footnote)
+                                .foregroundStyle(StrandPalette.textTertiary)
+                        }
+                        .padding(.vertical, 18)
+                    }
+                    Spacer(minLength: 0)
+                }
+
+                // The "N readings · range" caption (auto-widen flagged when it happens).
+                Text(rangeCaption(effectiveRange: effectiveRange,
+                                  windowed: windowed,
+                                  windowFellBack: windowFellBack))
+                    .font(StrandFont.footnote)
+                    .foregroundStyle(windowFellBack ? StrandPalette.statusWarning : StrandPalette.textTertiary)
+                    .accessibilityLabel(rangeCaption(effectiveRange: effectiveRange,
+                                                     windowed: windowed,
+                                                     windowFellBack: windowFellBack))
+            }
+            .padding(NoopMetrics.cardPadding)
+        }
+        // The hero shows the LATEST available point (range-independent), so the gauge
+        // settles once on appear — like TodayView's rings.
+        .onAppear {
+            withAnimation(.easeOut(duration: 0.9)) {
+                heroAnimatedFraction = fraction ?? 0
+            }
+        }
     }
 
     // MARK: Range bar
@@ -411,7 +602,8 @@ struct MetricDetailView: View {
         return ChartCard(
             title: "\(metric.title)",
             subtitle: subtitle,
-            trailing: "\(heroValue) · \(asOf)"
+            trailing: "\(heroValue) · \(asOf)",
+            tint: metricDomain(metric).color
         ) {
             TrendChart(
                 points: trendPoints(windowed),
@@ -521,7 +713,7 @@ struct MetricDetailView: View {
 
     private var correlationCard: some View {
         let rows = correlationCache
-        return NoopCard {
+        return NoopCard(tint: metricDomain(metric).color) {
             VStack(alignment: .leading, spacing: NoopMetrics.gap) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("What correlates").strandOverline()
@@ -591,7 +783,7 @@ struct MetricDetailView: View {
     private func signed(_ delta: Double) -> String {
         // A difference between two readings: route through the delta formatter so a temperature Δ
         // scales without the +32 offset.
-        (delta >= 0 ? "+" : "−") + metric.formatDelta(abs(delta), system: unitSystem, temperature: temperatureUnit)
+        (delta >= 0 ? "+" : "−") + metric.formatDelta(abs(delta), system: unitSystem, temperature: temperatureUnit, effortScale: effortScale)
     }
 
     private func correlationColor(_ r: Double) -> Color {

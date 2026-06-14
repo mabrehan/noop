@@ -1,4 +1,5 @@
 import SwiftUI
+import Charts
 import StrandDesign
 import StrandAnalytics
 import WhoopStore
@@ -30,8 +31,9 @@ struct HealthView: View {
 
     var body: some View {
         ScreenScaffold(title: "Health Monitor",
-                       subtitle: "Live vitals, streamed from the strap.") {
-            if repo.today == nil && !hasLiveHR {
+                       subtitle: "Live vitals, streamed from the strap.",
+                       onRefresh: { await repo.refresh() }) {
+            if repo.days.isEmpty && !hasLiveHR {
                 emptyState
             } else {
                 VStack(alignment: .leading, spacing: NoopMetrics.sectionGap) {
@@ -65,8 +67,10 @@ private struct HeartRateSection: View {
     /// Rolling buffer of recently-streamed live HR (newest last), so the hero graph builds a real
     /// continuous time-series instead of collapsing to a 2-point flat line when the strap streams HR
     /// but little/no R-R (the #105 case — Live HR works, but the Health graph showed only 2 samples).
+    /// Each sample now carries the wall-clock time it arrived so the hero renders a real time x-axis
+    /// (#198 — the chart had no time axis, so an iPhone user with no hover had no time context).
     /// Capped to ~3 min @ ~1 Hz; resets when the view is recreated, which is fine for a live trace.
-    @State private var hrHistory: [Double] = []
+    @State private var hrHistory: [LiveHRSample] = []
 
     /// HR to display: reported value when >0, else derived from the latest R-R
     /// interval (the strap streams R-R even when its HR field reads 0).
@@ -94,19 +98,30 @@ private struct HeartRateSection: View {
         }
     }
 
-    /// A short HR series for the hero sparkline, derived from streamed R-R intervals
-    /// (newest last). Falls back to a flat line at the current HR when R-R is sparse.
-    private func hrSeries(_ hr: Int?) -> [Double] {
-        // Prefer the accumulated live HR time-series — that's what a "live" graph should show, and it
-        // keeps growing even when the strap streams HR but sparse R-R (#105). Fall back to R-R-derived
-        // beats, then a flat line at the current HR.
+    /// A short, time-stamped HR series for the hero chart (newest last).
+    /// Prefers the accumulated live-HR time-series — that's what a "live" graph should show, and it
+    /// keeps growing even when the strap streams HR but sparse R-R (#105). Falls back to R-R-derived
+    /// beats, then a flat line at the current HR. The R-R / flat fallbacks have no real per-sample
+    /// timestamps, so we synthesise a 1 Hz trailing window ending "now" — the x-axis still reads as
+    /// clock time and scrolls, matching the live buffer's behaviour (#198).
+    private func hrSeries(_ hr: Int?) -> [LiveHRSample] {
         if hrHistory.count > 1 { return hrHistory }
         let beats = live.rr.suffix(60).compactMap { rr -> Double? in
             rr > 0 ? 60_000.0 / Double(rr) : nil
         }
-        if beats.count > 1 { return Array(beats) }
-        if let hr = hr { return [Double(hr), Double(hr)] }
+        if beats.count > 1 { return Self.synthesiseSeries(beats) }
+        if let hr = hr { return Self.synthesiseSeries([Double(hr), Double(hr)]) }
         return []
+    }
+
+    /// Wrap a bare value series in trailing 1 Hz timestamps ending at `Date()`, so the
+    /// fallbacks (R-R-derived beats, flat line) chart on the same time x-axis as the live buffer.
+    private static func synthesiseSeries(_ values: [Double]) -> [LiveHRSample] {
+        let now = Date()
+        let n = values.count
+        return values.enumerated().map { i, v in
+            LiveHRSample(date: now.addingTimeInterval(Double(i - (n - 1))), bpm: v)
+        }
     }
 
     var body: some View {
@@ -121,11 +136,14 @@ private struct HeartRateSection: View {
         return VStack(alignment: .leading, spacing: NoopMetrics.gap) {
             SectionHeader("Heart Rate", overline: "Live", trailing: hrIsDerived ? "from R-R" : nil)
 
+            // The live HR hero floats over a Charge-world scenic backdrop (the Health screen's
+            // colour world), with the card itself tinted rose — heart-rate's metric accent.
             ChartCard(
                 title: "Heart Rate",
                 subtitle: hrIsDerived ? "Estimated from R-R interval"
                     : (hasLiveHR ? "Streaming live" : "Awaiting strap"),
-                trailing: hasLiveHR ? "\(displayHR!) bpm" : "—"
+                trailing: hasLiveHR ? "\(displayHR!) bpm" : "—",
+                tint: StrandPalette.metricRose
             ) {
                 heroChart(displayHR: displayHR, hasLiveHR: hasLiveHR,
                           fraction: fraction, zone: zone, series: series)
@@ -137,32 +155,36 @@ private struct HeartRateSection: View {
                     ("State", hasLiveHR ? "STREAMING" : "IDLE"),
                 ])
             }
+            .background {
+                ScenicHeroBackground(domain: .charge)
+                    .clipShape(RoundedRectangle(cornerRadius: NoopMetrics.cardRadius, style: .continuous))
+            }
         }
         .onChange(of: displayHR) { newHR in
-            // Append each new live HR reading so the hero graph grows a continuous time-series (#105).
+            // Append each new live HR reading (with its arrival time) so the hero graph grows a
+            // continuous, time-stamped series — feeding the time x-axis (#198) and the #105 trace.
             guard let v = newHR else { return }
-            hrHistory.append(Double(v))
+            hrHistory.append(LiveHRSample(date: Date(), bpm: Double(v)))
             if hrHistory.count > 180 { hrHistory.removeFirst(hrHistory.count - 180) }
         }
     }
 
-    /// The hero chart body: a tall HR sparkline tinted to the current zone, with a
+    /// The hero chart body: a tall, time-aware HR line tinted to the current zone, with a
     /// status pill floated top-trailing. Fixed to NoopMetrics.chartHeight via ChartCard.
     private func heroChart(displayHR: Int?, hasLiveHR: Bool,
-                           fraction: Double, zone: Int, series: [Double]) -> some View {
+                           fraction: Double, zone: Int, series: [LiveHRSample]) -> some View {
         ZStack(alignment: .topTrailing) {
             if series.count > 1 {
-                Sparkline(
-                    values: series,
+                LiveTimeChart(
+                    samples: series,
                     gradient: Gradient(colors: [
                         StrandPalette.hrZoneColor(max(1, zone - 1)),
                         StrandPalette.hrZoneColor(zone),
-                    ]),
-                    lineWidth: 2.5,
-                    showsArea: true,
-                    valueFormat: { "\(Int($0.rounded())) bpm" }
+                    ])
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityLabel("Live heart rate over time")
+                .accessibilityValue(hasLiveHR ? "\(displayHR ?? 0) beats per minute, zone \(zone)" : "no data")
             } else {
                 VStack(spacing: 8) {
                     Text(displayHR.map(String.init) ?? "—")
@@ -188,6 +210,90 @@ private struct HeartRateSection: View {
     }
 }
 
+// MARK: - Live HR sample + time chart
+
+/// One streamed live-HR reading with the wall-clock time it arrived. Carrying the time
+/// (rather than a bare bpm) is what lets the hero render a real time x-axis (#198).
+struct LiveHRSample: Identifiable, Equatable {
+    let id = UUID()
+    let date: Date
+    let bpm: Double
+}
+
+/// The live HR hero chart: a zone-gradient line + soft area over a real **time** x-axis
+/// (hour:minute:second), so the trace visibly scrolls as new samples arrive. Replaces the
+/// axis-less Sparkline on this hero (#198) — an iPhone user has no hover, so the visible
+/// clock axis is the fix. Built on Swift Charts; the rolling ~90–180 s window comes from the
+/// caller's capped buffer (HeartRateSection.hrHistory).
+private struct LiveTimeChart: View {
+    var samples: [LiveHRSample]
+    /// The gradient the line/area is stroked with (the current HR-zone band).
+    var gradient: Gradient
+
+    /// Auto-fitted y bounds with a little headroom so the trace never kisses the edges.
+    private var yDomain: ClosedRange<Double> {
+        let values = samples.map(\.bpm)
+        guard let lo = values.min(), let hi = values.max() else { return 0...1 }
+        if lo == hi { return (lo - 5)...(hi + 5) }
+        let pad = (hi - lo) * 0.12
+        return (lo - pad)...(hi + pad)
+    }
+
+    /// A vertical gradient keyed bottom→top so the stroke colour tracks the zone band.
+    private var lineGradient: LinearGradient {
+        LinearGradient(gradient: gradient, startPoint: .bottom, endPoint: .top)
+    }
+
+    /// The lightest stop of the zone gradient, used to tint the area wash.
+    private var areaTint: Color {
+        StrandPalette.sample(stops: gradient.stops, at: 0.85)
+    }
+
+    var body: some View {
+        Chart(samples) { s in
+            AreaMark(
+                x: .value("Time", s.date),
+                y: .value("BPM", s.bpm)
+            )
+            .interpolationMethod(.catmullRom)
+            .foregroundStyle(
+                LinearGradient(
+                    colors: [areaTint.opacity(0.24), Color.clear],
+                    startPoint: .top, endPoint: .bottom
+                )
+            )
+
+            LineMark(
+                x: .value("Time", s.date),
+                y: .value("BPM", s.bpm)
+            )
+            .interpolationMethod(.catmullRom)
+            .lineStyle(StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
+            .foregroundStyle(lineGradient)
+        }
+        .chartYScale(domain: yDomain)
+        // catmullRom overshoots on sharp HR turns and the area fill draws unclipped — clip the
+        // plot so nothing bleeds below the card (mirrors TrendChart's fix for #104).
+        .chartPlotStyle { plotArea in plotArea.clipped() }
+        .chartXAxis {
+            AxisMarks(values: .automatic(desiredCount: 4)) { _ in
+                AxisGridLine().foregroundStyle(StrandPalette.hairline.opacity(0.4))
+                AxisValueLabel(format: .dateTime.hour().minute().second())
+                    .foregroundStyle(StrandPalette.textTertiary)
+                    .font(StrandFont.footnote)
+            }
+        }
+        .chartYAxis {
+            AxisMarks(position: .leading, values: .automatic(desiredCount: 4)) { _ in
+                AxisGridLine().foregroundStyle(StrandPalette.hairline.opacity(0.4))
+                AxisValueLabel().foregroundStyle(StrandPalette.textTertiary)
+                    .font(StrandFont.footnote)
+            }
+        }
+        .clipped()
+    }
+}
+
 // MARK: - Vitals grid (uniform StatTiles)
 
 /// Static vitals grid, split into its own view so it depends only on `repo` and is
@@ -205,19 +311,28 @@ private struct VitalsSection: View {
     }
 
     var body: some View {
+        let readings = BodyVitalSigns.readings(
+            sourceRows: repo.vitalMetricRows,
+            temperatureUnit: temperatureUnit
+        )
         VStack(alignment: .leading, spacing: NoopMetrics.gap) {
-            SectionHeader("Vital Signs", overline: "Today", trailing: vitalsAsOf)
+            SectionHeader("Vital Signs", overline: "Latest", trailing: BodyVitalSigns.latestDayLabel(readings))
             LazyVGrid(
                 columns: [GridItem(.adaptive(minimum: 168), spacing: NoopMetrics.gap)],
                 alignment: .leading,
                 spacing: NoopMetrics.gap
             ) {
-                ForEach(vitals) { v in
+                ForEach(readings) { v in
+                    // Each vital is a frosted, metric-tinted StatTile — matching Today's Key-Metrics
+                    // grid. `accent` carries the metric's colour world (rose RHR, purple HRV, cyan
+                    // SpO₂, amber skin temp), washing the card and tinting its spark trail to match.
                     StatTile(
                         label: "\(v.label)",
                         value: v.formattedValue ?? "—",
                         caption: v.stateCaption,
-                        accent: v.accent
+                        accent: v.accent,
+                        sparkline: v.sparkline,
+                        sparkColor: v.metricColor
                     )
                     .accessibilityElement(children: .ignore)
                     .accessibilityLabel(v.accessibilityText)
@@ -228,130 +343,6 @@ private struct VitalsSection: View {
                 .foregroundStyle(StrandPalette.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)
         }
-    }
-
-    /// "as of" caption sourced from the most recent imported day.
-    private var vitalsAsOf: String? {
-        guard let day = repo.today?.day else { return nil }
-        return "as of \(day)"
-    }
-
-    /// The vitals row, built from the most recent imported day and banded against the user's
-    /// OWN trailing baseline once 14 trusted nights exist (population ranges before that —
-    /// `VitalBands` does the deciding; this just wires the history series in).
-    private var vitals: [Vital] {
-        let d = repo.today
-        let todayKey = d?.day
-        // History strictly before the displayed day, oldest→newest (repo.days is already
-        // oldest→newest), calendar-padded so wear gaps count as missing nights (a stale
-        // baseline then falls back to the population range).
-        let history = repo.days.filter { row in todayKey.map { row.day < $0 } ?? true }
-        func series(_ kp: (DailyMetric) -> Double?) -> [Double?] {
-            VitalBands.calendarSeries(history.map { ($0.day, kp($0)) })
-        }
-        // Skin temp is bimodal: CSV imports store ABSOLUTE °C, the on-device pipeline a ±°C
-        // DEVIATION — partition the history to the displayed value's kind and pick the matching
-        // config + population fallback (±0.6 °C mirrors the illness watch's flag threshold).
-        let skin = d?.skinTempDevC
-        let skinResult: VitalBands.Result
-        // Track which kind the displayed value is so the temperature converter applies the right rule:
-        // an ABSOLUTE reading uses the full C→F formula (×9/5 + 32); a ±DEVIATION must omit the offset.
-        let skinIsAbsolute = skin.map(VitalBands.isAbsoluteSkinTemp) ?? true
-        if let skin {
-            skinResult = VitalBands.band(
-                value: skin,
-                history: VitalBands.skinTempHistory(matching: skin, in: series { $0.skinTempDevC }),
-                populationRange: skinIsAbsolute ? 33...36 : (-0.6)...0.6,
-                cfg: skinIsAbsolute ? Baselines.metricCfg["skin_temp"]! : VitalBands.skinTempDeviationCfg)
-        } else {
-            skinResult = VitalBands.Result(band: .noData, basis: .population, nights: 0)
-        }
-        // Resolve the skin-temp label + converter once, honouring the °C/°F preference.
-        let tempUnit = temperatureUnit
-        let skinUnitLabel = UnitFormatter.temperatureUnit(tempUnit)
-        let skinFormat: (Double) -> String = { c in
-            // Strip the trailing " °C/°F" the formatter adds — `Vital.formattedValue` appends `unit`.
-            let full = skinIsAbsolute
-                ? UnitFormatter.temperatureFromCelsius(c, unit: tempUnit, decimals: 1)
-                : UnitFormatter.temperatureDeltaFromCelsius(c, unit: tempUnit, decimals: 1)
-            return full.replacingOccurrences(of: " " + skinUnitLabel, with: "")
-        }
-        return [
-            Vital(key: "resp", label: "Resp Rate", unit: "rpm",
-                  value: d?.respRateBpm, format: { String(format: "%.1f", $0) },
-                  banding: VitalBands.band(value: d?.respRateBpm, history: series { $0.respRateBpm },
-                                           populationRange: 12...20, cfg: Baselines.respCfg),
-                  metricColor: StrandPalette.metricCyan),
-            Vital(key: "spo2", label: "Blood O₂", unit: "%",
-                  value: d?.spo2Pct, format: { String(format: "%.0f", $0) },
-                  // Population-only on purpose: an absolute <95% floor is meaningful regardless
-                  // of personal baseline (no "spo2" MetricCfg exists).
-                  banding: VitalBands.band(value: d?.spo2Pct, history: [],
-                                           populationRange: 95...100, cfg: nil),
-                  metricColor: StrandPalette.metricCyan),
-            Vital(key: "rhr", label: "Resting HR", unit: "bpm",
-                  value: d?.restingHr.map(Double.init), format: { String(Int($0.rounded())) },
-                  banding: VitalBands.band(value: d?.restingHr.map(Double.init),
-                                           history: series { $0.restingHr.map(Double.init) },
-                                           populationRange: 40...60, cfg: Baselines.restingHRCfg),
-                  metricColor: StrandPalette.metricRose),
-            Vital(key: "hrv", label: "HRV", unit: "ms",
-                  value: d?.avgHrv, format: { String(Int($0.rounded())) },
-                  banding: VitalBands.band(value: d?.avgHrv, history: series { $0.avgHrv },
-                                           populationRange: 40...120, cfg: Baselines.hrvCfg),
-                  metricColor: StrandPalette.metricPurple),
-            Vital(key: "skin", label: "Skin Temp", unit: skinUnitLabel,
-                  value: skin, format: skinFormat,
-                  banding: skinResult, metricColor: StrandPalette.metricAmber),
-        ]
-    }
-}
-
-// MARK: - Vital model
-
-private struct Vital: Identifiable {
-    let key: String
-    let label: String
-    let unit: String
-    let value: Double?
-    let format: (Double) -> String
-    /// Personal-baseline banding (population fallback until 14 trusted nights).
-    let banding: VitalBands.Result
-    /// The metric's category colour (used only when in range).
-    let metricColor: Color
-
-    var id: String { key }
-
-    /// Value with its unit appended, or nil when no data.
-    var formattedValue: String? { value.map { "\(format($0)) \(unit)" } }
-
-    /// Colour communicates state: in-range = the metric's category colour,
-    /// out-of-range = warning amber, no data = tertiary.
-    var accent: Color {
-        switch banding.band {
-        case .noData:     return StrandPalette.textTertiary
-        case .inRange:    return metricColor
-        case .outOfRange: return StrandPalette.statusWarning
-        }
-    }
-
-    /// The in-range caption that stands in for a StatePill inside the fixed-height tile
-    /// (keeps the row pixel-uniform). The wording says which yardstick judged it: your own
-    /// baseline vs the typical adult range. String(localized:) — StatTile's caption is a
-    /// plain String rendered via Text(String), which never consults the catalog on its own.
-    var stateCaption: String {
-        switch (banding.band, banding.basis) {
-        case (.noData, _):               return String(localized: "No data")
-        case (.inRange, .personal):      return String(localized: "In your range")
-        case (.outOfRange, .personal):   return String(localized: "Off your baseline")
-        case (.inRange, .population):    return String(localized: "In typical range")
-        case (.outOfRange, .population): return String(localized: "Outside typical range")
-        }
-    }
-
-    var accessibilityText: String {
-        guard let v = formattedValue else { return "\(label): no data" }
-        return "\(label): \(v), \(stateCaption)"
     }
 }
 

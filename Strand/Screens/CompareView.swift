@@ -12,7 +12,8 @@ import WhoopStore
 // chart (each metric min–max scaled to 0–1 within the window so different units
 // share an axis). Below, every pair of selected metrics gets a live Pearson-r
 // correlation readout with a plain-English conclusion. Pure read-side: each
-// metric loads from repo.series; everything else is derived in-view.
+// metric loads from repo.resolvedSeries (freshest-wins across imported / NOOP-computed /
+// compatible Apple Health, PR#196); everything else is derived in-view.
 
 // yyyy-MM-dd → Date, fixed UTC / en_US_POSIX (per task spec).
 private let compareDayParser: DateFormatter = {
@@ -109,6 +110,12 @@ private struct CompareSeries: Identifiable {
 struct CompareView: View {
     @EnvironmentObject var repo: Repository
 
+    // Effort display scale (#268) — routes the Effort metric's min/max + hover read-outs onto WHOOP's
+    // 0–21 axis; display-only, the normalized overlay shape is untouched. Every other metric is
+    // scale-agnostic (see MetricDescriptor.format).
+    @AppStorage(UnitPrefs.effortScaleKey) private var effortScaleRaw = EffortScale.hundred.rawValue
+    private var effortScale: EffortScale { UnitPrefs.resolveEffortScale(effortScaleRaw) }
+
     // Distinct, high-legibility series colors (avoid the recovery/strain ramps so
     // overlay lines read as categorical, not as a value gradient).
     private static let seriesPalette: [Color] = [
@@ -137,6 +144,7 @@ struct CompareView: View {
 
     private let maxSelection = 4
     private let minSelection = 2
+    private var loadTaskID: String { "\(selectionKey)|\(repo.refreshSeq)" }
 
     var body: some View {
         ScreenScaffold(title: "Compare", subtitle: "Overlay signals, draw conclusions.") {
@@ -159,7 +167,7 @@ struct CompareView: View {
             }
         }
         .task { await loadIfNeeded() }
-        .task(id: selectionKey) {
+        .task(id: loadTaskID) {
             await loadSelected()
             refreshPairCache(activeSeries)
         }
@@ -218,6 +226,17 @@ struct CompareView: View {
         }
     }
 
+    /// How the overlay subtitle tells the user to read real (un-normalized) values.
+    /// The chart axis is normalized, so the only readout of real numbers is the
+    /// crosshair tooltip — driven by pointer hover on macOS, by tap/drag on iOS.
+    private var inspectHint: String {
+        #if os(iOS)
+        return "tap or drag for real values"
+        #else
+        return "hover for real values"
+        #endif
+    }
+
     /// "N readings · <range>" caption near the control, flagging any auto-widen.
     private var rangeCaption: String {
         let series = activeSeries
@@ -240,10 +259,12 @@ struct CompareView: View {
         selected = Array(picks.prefix(maxSelection))
     }
 
-    /// Load (and cache) the full history for any selected metric not yet fetched.
+    /// Load the full history for the selected metrics. Selection is capped at four,
+    /// so a repository refresh can safely replace cached rows instead of leaving
+    /// Compare on a stale pre-sync snapshot.
     private func loadSelected() async {
-        for metric in selected where fullSeries[metric.id] == nil {
-            let s = await repo.series(key: metric.key, source: metric.source)
+        for metric in selected {
+            let s = await repo.resolvedSeries(key: metric.key, source: metric.source).values
             fullSeries[metric.id] = s
         }
         loadedOnce = true
@@ -354,11 +375,16 @@ struct CompareView: View {
             ChartCard(
                 title: "Normalized overlay",
                 subtitle: anyWidened
-                    ? "Min–max normalized · sparse series widened past \(range.phrase) · hover for real values"
-                    : "Each line min–max normalized within \(range.phrase) · hover for real values",
-                trailing: "\(nonEmpty.count) series"
+                    ? "Min–max normalized · sparse series widened past \(range.phrase) · \(inspectHint)"
+                    : "Each line min–max normalized within \(range.phrase) · \(inspectHint)",
+                trailing: "\(nonEmpty.count) series",
+                // Anchor the overlay card to the brand-green chrome world; each line keeps its own
+                // categorical series colour so the lines stay distinguishable against the wash.
+                tint: StrandPalette.accent
             ) {
-                OverlayChart(series: nonEmpty, height: NoopMetrics.chartHeight)
+                // The overlay is min–max NORMALIZED 0–1, so the Effort scale never touches the line shape;
+                // only the per-series hover read-outs convert (passed through to the tooltip). (#268)
+                OverlayChart(series: nonEmpty, effortScale: effortScale, height: NoopMetrics.chartHeight)
             } footer: {
                 legend(nonEmpty)
             }
@@ -376,13 +402,14 @@ struct CompareView: View {
                         .font(StrandFont.subhead)
                         .foregroundStyle(StrandPalette.textPrimary)
                     Spacer()
-                    Text("\(s.metric.format(s.realMin)) – \(s.metric.format(s.realMax))")
+                    // Real min/max labels honour the Effort scale (#268); other metrics are unchanged.
+                    Text("\(s.metric.format(s.realMin, effortScale: effortScale)) – \(s.metric.format(s.realMax, effortScale: effortScale))")
                         .font(StrandFont.captionNumber)
                         .foregroundStyle(StrandPalette.textSecondary)
                 }
                 .padding(.vertical, 7)
                 .accessibilityElement(children: .combine)
-                .accessibilityLabel("\(s.metric.title), range \(s.metric.format(s.realMin)) to \(s.metric.format(s.realMax))")
+                .accessibilityLabel("\(s.metric.title), range \(s.metric.format(s.realMin, effortScale: effortScale)) to \(s.metric.format(s.realMax, effortScale: effortScale))")
                 if idx < series.count - 1 {
                     Divider().overlay(StrandPalette.hairline)
                 }
@@ -475,7 +502,9 @@ struct CompareView: View {
     /// One pairwise correlation as its own NoopCard.
     private func pairCard(_ p: PairResult) -> some View {
         let tint = correlationColor(p.r)
-        return NoopCard {
+        // Frosted card washed by the relationship's own colour (green positive / rose negative), with a
+        // TrendChip surfacing the signed direction at a glance — the Today delta idiom, applied to r.
+        return NoopCard(tint: tint) {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 10) {
                     // Two color swatches for the pair.
@@ -487,6 +516,7 @@ struct CompareView: View {
                         .font(StrandFont.headline)
                         .foregroundStyle(StrandPalette.textPrimary)
                     Spacer()
+                    TrendChip(text: signedR(p.r), color: tint)
                     Text("r = \(signedR(p.r))")
                         .font(StrandFont.number(18))
                         .foregroundStyle(tint)
@@ -598,6 +628,9 @@ private struct FlowChips: View {
 /// the nearest day.
 private struct OverlayChart: View {
     let series: [CompareSeries]
+    /// Effort display scale (#268) — passed through to the hover tooltip's real-value read-outs. The
+    /// plotted points stay min–max normalized 0–1, so the line shape is unaffected.
+    var effortScale: EffortScale = .hundred
     var height: CGFloat = 260
 
     @State private var hoverX: CGFloat? = nil
@@ -623,11 +656,24 @@ private struct OverlayChart: View {
         }
     }
 
+    /// The latest normalized plot point of each series — the "now" end-caps that get a bright glowing dot.
+    private var endCaps: [Plot] {
+        series.compactMap { s in
+            guard let row = s.rows.last, let d = parseCompareDay(row.day) else { return nil }
+            return Plot(title: s.metric.title, date: d, norm: s.normalized(row.value))
+        }
+    }
+
     /// The union of all days present, ascending — the x-domain for hover snapping.
     private var allDays: [String] {
         var set = Set<String>()
         for s in series { for r in s.rows { set.insert(r.day) } }
         return set.sorted()
+    }
+
+    /// The series colour for a metric title — drives the matching "now" end-cap glow.
+    private func colorFor(_ title: String) -> Color? {
+        series.first(where: { $0.metric.title == title })?.color
     }
 
     var body: some View {
@@ -646,6 +692,26 @@ private struct OverlayChart: View {
             )
             .symbolSize(10)
             .foregroundStyle(by: .value("Metric", p.title))
+        }
+        // Bevel "now" end-caps — a soft halo + bright core on each series' latest point, drawn on top.
+        .chartOverlay { proxy in
+            GeometryReader { geo in
+                let plot = geo[proxy.plotAreaFrame]
+                ForEach(endCaps) { cap in
+                    if let px = proxy.position(forX: cap.date),
+                       let py = proxy.position(forY: cap.norm),
+                       let color = colorFor(cap.title) {
+                        ZStack {
+                            Circle().fill(color.opacity(0.30)).frame(width: 16, height: 16)
+                            Circle().fill(color.opacity(0.65)).frame(width: 10, height: 10)
+                            Circle().fill(Color.white).frame(width: 4, height: 4)
+                        }
+                        .position(x: px + plot.minX, y: py + plot.minY)
+                        .allowsHitTesting(false)
+                    }
+                }
+            }
+            .accessibilityHidden(true)
         }
         .chartForegroundStyleScale(range: series.map(\.color))
         .chartYScale(domain: 0...1)
@@ -700,6 +766,7 @@ private struct OverlayChart: View {
                         MultiTooltip(
                             day: day,
                             series: series,
+                            effortScale: effortScale,
                             anchorX: cx,
                             container: geo.size
                         )
@@ -713,6 +780,22 @@ private struct OverlayChart: View {
                     case .ended: hoverX = nil
                     }
                 }
+                #if os(iOS)
+                // Touch input never fires onContinuousHover (pointer-only), so on iPhone /
+                // iPad-without-pointer the crosshair + value tooltip would be unreachable.
+                // Drive the same hoverX via tap (single touch-down) and drag-to-scrub across
+                // days. minimumDistance:0 keeps the first touch responsive; a clearly vertical
+                // pan is still claimed by the parent ScrollView.
+                .gesture(
+                    SpatialTapGesture(coordinateSpace: .local)
+                        .onEnded { hoverX = $0.location.x }
+                        .exclusively(before:
+                            DragGesture(minimumDistance: 0, coordinateSpace: .local)
+                                .onChanged { hoverX = $0.location.x }
+                                .onEnded { _ in hoverX = nil }
+                        )
+                )
+                #endif
             }
         }
         .frame(height: height)
@@ -738,6 +821,8 @@ private struct OverlayChart: View {
 private struct MultiTooltip: View {
     let day: String
     let series: [CompareSeries]
+    /// Effort display scale (#268) — the per-series real value converts onto WHOOP's 0–21 axis when set.
+    var effortScale: EffortScale = .hundred
     let anchorX: CGFloat
     let container: CGSize
 
@@ -761,7 +846,7 @@ private struct MultiTooltip: View {
                         .font(StrandFont.caption)
                         .foregroundStyle(StrandPalette.textSecondary)
                     Spacer(minLength: 12)
-                    Text(s.value(on: day).map { s.metric.format($0) } ?? "—")
+                    Text(s.value(on: day).map { s.metric.format($0, effortScale: effortScale) } ?? "—")
                         .font(StrandFont.captionNumber)
                         .foregroundStyle(StrandPalette.textPrimary)
                 }

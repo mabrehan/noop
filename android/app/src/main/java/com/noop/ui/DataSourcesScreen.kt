@@ -23,7 +23,9 @@ import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.FileUpload
+import androidx.compose.material.icons.filled.FitnessCenter
 import androidx.compose.material.icons.filled.MonitorHeart
+import androidx.compose.material.icons.filled.Restaurant
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
@@ -38,6 +40,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
@@ -51,6 +54,8 @@ import com.noop.data.ImportSummary
 import com.noop.ingest.AppleHealthImporter
 import com.noop.ingest.HealthConnectImporter
 import com.noop.ingest.HealthConnectWriter
+import com.noop.ingest.LiftingImporter
+import com.noop.ingest.NutritionCsvImporter
 import com.noop.ingest.WhoopCsvImporter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -76,6 +81,10 @@ import kotlinx.coroutines.withContext
  *                     [com.noop.ingest.AppleHealthImporter].
  *   - Health Connect— native Android import (steps/HR/HRV/sleep/SpO₂/weight/workouts) via
  *                     [com.noop.ingest.HealthConnectImporter], gated on runtime permission.
+ *   - Nutrition CSV — daily calories / macros / body weight from a nutrition CSV
+ *                     (MyFitnessPal, Cronometer, or any date+columns spreadsheet) via
+ *                     [com.noop.ingest.NutritionCsvImporter], stored as metricSeries rows
+ *                     under source "nutrition-csv".
  *   - WHOOP Strap   — the live BLE bond/stream status, straight from the LiveState flow.
  *   - Backup        — Export / Import the whole on-device database through [DataBackup],
  *                     wired to ActivityResult document launchers.
@@ -100,6 +109,12 @@ fun DataSourcesScreen(vm: AppViewModel) {
     // export so each card reflects its own data rather than both showing under Apple Health (issue #34).
     var hcDays by remember { mutableStateOf<Int?>(null) }
     var hcWorkouts by remember { mutableStateOf<Int?>(null) }
+    // Nutrition CSV writes long-format metricSeries rows under its own source ("nutrition-csv"),
+    // so its card counts days-with-calories and weigh-ins straight off that table.
+    var nutritionDays by remember { mutableStateOf<Int?>(null) }
+    var nutritionWeighIns by remember { mutableStateOf<Int?>(null) }
+    // Imported lifting (Hevy / Liftosaur) writes workouts under its own source ("lifting").
+    var liftingWorkouts by remember { mutableStateOf<Int?>(null) }
 
     LaunchedEffect(Unit) {
         val now = System.currentTimeMillis() / 1000
@@ -110,6 +125,9 @@ fun DataSourcesScreen(vm: AppViewModel) {
         appleWorkouts = vm.repo.workouts("apple-health", 0L, now).size
         hcDays = vm.repo.appleDaily("health-connect", "0000-01-01", "9999-12-31").size
         hcWorkouts = vm.repo.workouts("health-connect", 0L, now).size
+        nutritionDays = vm.repo.metricSeries(NutritionCsvImporter.SOURCE_ID, "calories_in", "0000-01-01", "9999-12-31").size
+        nutritionWeighIns = vm.repo.metricSeries(NutritionCsvImporter.SOURCE_ID, "weight", "0000-01-01", "9999-12-31").size
+        liftingWorkouts = vm.repo.workouts(LiftingImporter.SOURCE_ID, 0L, now).size
     }
 
     // Whole-store backup: export to a user-created document; import from a picked one.
@@ -163,6 +181,9 @@ fun DataSourcesScreen(vm: AppViewModel) {
         appleWorkouts = vm.repo.workouts("apple-health", 0L, nowS).size
         hcDays = vm.repo.appleDaily("health-connect", "0000-01-01", "9999-12-31").size
         hcWorkouts = vm.repo.workouts("health-connect", 0L, nowS).size
+        nutritionDays = vm.repo.metricSeries(NutritionCsvImporter.SOURCE_ID, "calories_in", "0000-01-01", "9999-12-31").size
+        nutritionWeighIns = vm.repo.metricSeries(NutritionCsvImporter.SOURCE_ID, "weight", "0000-01-01", "9999-12-31").size
+        liftingWorkouts = vm.repo.workouts(LiftingImporter.SOURCE_ID, 0L, nowS).size
     }
 
     // Run an importer off the main thread, refresh the counts, then toast the result.
@@ -186,6 +207,19 @@ fun DataSourcesScreen(vm: AppViewModel) {
     val appleImportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument(),
     ) { uri -> if (uri != null) runImport { AppleHealthImporter.importExport(context, uri, vm.repo) } }
+
+    val nutritionImportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> if (uri != null) runImport { NutritionCsvImporter.importCsv(context, uri, vm.repo) } }
+
+    // Lifting: imported workouts also need the Workouts list to reload (runImport only re-counts).
+    val liftingImportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri != null) runImport {
+            LiftingImporter.importExport(context, uri, vm.repo).also { vm.loadWorkouts() }
+        }
+    }
 
     // Health Connect permission request → import once granted.
     val hcPermissionLauncher = rememberLauncherForActivityResult(
@@ -279,6 +313,7 @@ fun DataSourcesScreen(vm: AppViewModel) {
         SourceCard(
             title = "Apple Health",
             icon = Icons.Filled.FavoriteBorder,
+            tint = Palette.metricCyan,
             subtitle = "Import HR, HRV, sleep, SpO₂ and steps from an Apple Health export. On " +
                 "an iPhone: Health app → tap your photo → Export All Health Data, then " +
                 "import the .zip here. Working now on Android.",
@@ -297,6 +332,7 @@ fun DataSourcesScreen(vm: AppViewModel) {
                 label = "Import Apple Health export…",
                 icon = Icons.Filled.FileUpload,
                 enabled = !busy,
+                tint = Palette.metricCyan,
                 modifier = Modifier.fillMaxWidth(),
             ) { appleImportLauncher.launch(arrayOf("*/*")) }
         }
@@ -425,6 +461,61 @@ fun DataSourcesScreen(vm: AppViewModel) {
             }
         }
 
+        // --- Nutrition CSV (calories / macros / body weight) ---
+        SourceCard(
+            title = "Nutrition (CSV)",
+            icon = Icons.Filled.Restaurant,
+            tint = Palette.metricAmber,
+            subtitle = "Import daily calories, protein, carbs, fat and body weight from a " +
+                "nutrition CSV — a MyFitnessPal or Cronometer export, or any spreadsheet " +
+                "with a date column plus those values. Meal-level rows are summed per day.",
+        ) {
+            val hasNutrition = (nutritionDays ?: 0) > 0 || (nutritionWeighIns ?: 0) > 0
+            StatePill(
+                title = if (hasNutrition) "Imported" else "Nothing imported",
+                tone = if (hasNutrition) StrandTone.Accent else StrandTone.Neutral,
+                showsDot = true,
+            )
+            CountLine(
+                primary = nutritionDays?.let { "$it days logged" } ?: "—",
+                secondary = nutritionWeighIns?.let { "$it weigh-ins" } ?: "Counting…",
+            )
+            BackupButton(
+                label = "Import nutrition CSV…",
+                icon = Icons.Filled.FileUpload,
+                enabled = !busy,
+                modifier = Modifier.fillMaxWidth(),
+            ) { nutritionImportLauncher.launch(arrayOf("*/*")) }
+        }
+
+        // --- Lifting log (Hevy CSV / Liftosaur JSON) ---
+        SourceCard(
+            title = "Lifting log (Hevy / Liftosaur)",
+            icon = Icons.Filled.FitnessCenter,
+            tint = DomainTheme.Effort.color,
+            subtitle = "Import your strength-training history from a Hevy CSV export or a Liftosaur " +
+                "JSON export. Each workout becomes a Strength session with a training-volume " +
+                "estimate (weight × reps) — a volume figure, not a measured strain, so it never " +
+                "changes your Effort.",
+        ) {
+            val hasLifting = (liftingWorkouts ?: 0) > 0
+            StatePill(
+                title = if (hasLifting) "Imported" else "Nothing imported",
+                tone = if (hasLifting) StrandTone.Accent else StrandTone.Neutral,
+                showsDot = true,
+            )
+            CountLine(
+                primary = liftingWorkouts?.let { "$it workouts" } ?: "—",
+                secondary = "volume load shown per session",
+            )
+            BackupButton(
+                label = "Import lifting log…",
+                icon = Icons.Filled.FileUpload,
+                enabled = !busy,
+                modifier = Modifier.fillMaxWidth(),
+            ) { liftingImportLauncher.launch(arrayOf("*/*")) }
+        }
+
         // --- Live WHOOP strap over BLE ---
         SourceCard(
             title = "WHOOP Strap (Live BLE)",
@@ -485,20 +576,31 @@ private fun SourceCard(
     title: String,
     icon: ImageVector,
     subtitle: String,
+    tint: Color = Palette.accent,
     content: @Composable () -> Unit,
 ) {
-    NoopCard(padding = 18.dp) {
+    // A frosted, domain-tinted card: a tinted source glyph chip + title, the explainer line, then
+    // the source's status pill + connect/import action(s). Replaces the old flat surface.
+    NoopCard(padding = 18.dp, tint = tint) {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Icon(
-                    icon,
-                    contentDescription = null,
-                    tint = Palette.accent,
-                    modifier = Modifier.size(20.dp),
-                )
+                Box(
+                    modifier = Modifier
+                        .size(30.dp)
+                        .clip(RoundedCornerShape(9.dp))
+                        .background(tint.copy(alpha = 0.14f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        icon,
+                        contentDescription = null,
+                        tint = tint,
+                        modifier = Modifier.size(16.dp),
+                    )
+                }
                 Text(title, style = NoopType.headline, color = Palette.textPrimary)
             }
             Text(subtitle, style = NoopType.subhead, color = Palette.textSecondary)
@@ -531,24 +633,25 @@ private fun BackupButton(
     icon: ImageVector,
     enabled: Boolean,
     modifier: Modifier = Modifier,
+    tint: Color = Palette.accent,
     onClick: () -> Unit,
 ) {
     val shape = RoundedCornerShape(14.dp)
-    val tint = if (enabled) Palette.accent else Palette.accent.copy(alpha = Palette.disabledOpacity)
+    val ink = if (enabled) tint else tint.copy(alpha = Palette.disabledOpacity)
     Row(
         modifier = modifier
             .height(48.dp)
             .clip(shape)
-            .background(Palette.accentMuted)
-            .border(1.dp, tint.copy(alpha = 0.4f), shape)
+            .background(tint.copy(alpha = 0.14f))
+            .border(1.dp, ink.copy(alpha = 0.4f), shape)
             .let { if (enabled) it.clickable(onClick = onClick) else it }
             .padding(horizontal = 14.dp)
             .semantics { contentDescription = label },
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(18.dp))
+        Icon(icon, contentDescription = null, tint = ink, modifier = Modifier.size(18.dp))
         Spacer(Modifier.width(8.dp))
-        Text(label, style = NoopType.headline, color = tint)
+        Text(label, style = NoopType.headline, color = ink)
     }
 }

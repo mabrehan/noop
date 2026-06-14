@@ -20,6 +20,13 @@ import Foundation
 struct AppleHealthView: View {
     @EnvironmentObject var repo: Repository
 
+    // iOS-only: the live two-way HealthKit bridge, injected at StrandiOSApp. macOS has no HealthKit
+    // (HealthKitBridge is `#if os(iOS)` in its own file and isn't in the macOS environment), so this
+    // property and every `health.*` use below MUST stay inside `#if os(iOS)`.
+    #if os(iOS)
+    @EnvironmentObject private var health: HealthKitBridge
+    #endif
+
     // Imperial/Metric display preference (D#103). Weight and lean mass (stored kg) re-label to lb here;
     // every other Apple Health metric is unit-agnostic. Display-only.
     @AppStorage(UnitPrefs.systemKey) private var unitSystemRaw = UnitSystem.metric.rawValue
@@ -97,6 +104,15 @@ struct AppleHealthView: View {
         return f
     }()
 
+    /// Thousands-grouped integer formatter (steps / calories). Static so it isn't reallocated
+    /// per tile on every render. (perf plan Q3)
+    private static let groupedIntFmt: NumberFormatter = {
+        let f = NumberFormatter()
+        f.numberStyle = .decimal
+        f.maximumFractionDigits = 0
+        return f
+    }()
+
     private func date(_ day: String) -> Date? { Self.dayParser.date(from: day) }
 
     // MARK: - Range control (W / M / 3M / 6M / 1Y / ALL) — the ONE pill control.
@@ -155,13 +171,27 @@ struct AppleHealthView: View {
     }
 
     var body: some View {
-        ScreenScaffold(title: "Apple Health", subtitle: spanSubtitle.map { "\($0)" }) {
+        ScreenScaffold(title: "Apple Health", subtitle: spanSubtitle.map { "\($0)" },
+                       onRefresh: { await repo.refresh() }) {
             if loaded && !hasAnyData {
+                #if os(iOS)
+                // No data yet, but iOS can grant live access right here — keep the Enable card above
+                // the (now live-aware) empty-state copy so the richer path isn't hidden behind a
+                // manual .zip export.
+                VStack(alignment: .leading, spacing: NoopMetrics.sectionGap) {
+                    liveSyncCard
+                    ComingSoon(what: "Nothing here yet. Tap Enable Apple Health above to read your data live, or import a Health export .zip in Data Sources.")
+                }
+                #else
                 ComingSoon(what: "Nothing imported yet. On an iPhone: Health app, tap your photo, Export All Health Data, then import the .zip here in Data Sources.")
+                #endif
             } else if !loaded {
                 loadingState
             } else {
                 VStack(alignment: .leading, spacing: NoopMetrics.sectionGap) {
+                    #if os(iOS)
+                    liveSyncCard
+                    #endif
                     rangeControl
                     tileGrid
                     heartSection
@@ -171,7 +201,7 @@ struct AppleHealthView: View {
                 }
             }
         }
-        .task { await load() }
+        .task(id: repo.refreshSeq) { await load() }
         .onChange(of: range) { _ in rebuildWindowCache() }
     }
 
@@ -216,7 +246,7 @@ struct AppleHealthView: View {
         }
 
         let loadedRows = await rows
-        let appleWorkouts = await workouts.filter { $0.source == "apple_health" || $0.source == "apple-health" }
+        let appleWorkouts = await workouts.filter { WorkoutSource.isAppleHealth($0.source) }
 
         await MainActor.run {
             appleRows = loadedRows.sorted { $0.day < $1.day }
@@ -258,7 +288,7 @@ struct AppleHealthView: View {
         let rows = loaded ? windowedRows : appleRows
         guard let first = rows.first?.day, let last = rows.last?.day,
               let lo = date(first), let hi = date(last) else {
-            return "Steps, heart, sleep, body composition and VO₂ max — read locally on this Mac."
+            return "Steps, heart, sleep, body composition and VO₂ max — read locally on \(Platform.deviceNounPhrase)."
         }
         let loS = Self.spanFormatter.string(from: lo)
         let hiS = Self.spanFormatter.string(from: hi)
@@ -286,14 +316,107 @@ struct AppleHealthView: View {
     }
 
     private var loadingState: some View {
-        NoopCard {
+        NoopCard(tint: StrandPalette.metricCyan) {
             HStack(spacing: 10) {
-                ProgressView().controlSize(.small)
+                ConnectionDot(tone: .accent, pulsing: true)
                 Text("Reading your Apple Health history…")
                     .font(StrandFont.subhead).foregroundStyle(StrandPalette.textSecondary)
             }
         }
     }
+
+    // MARK: - Live Apple Health (iOS only)
+    //
+    // The opt-in entry point for the two-way HealthKitBridge. macOS has no HealthKit, so this whole
+    // card — and every `health.*` reference — is `#if os(iOS)`-gated. Tapping "Enable Apple Health"
+    // shows the system permission sheet (rationale strings ship in the iOS target's Info.plist), then
+    // runs the first read + write-back and refreshes this screen. Once authorized, a "Sync now"
+    // control and last-synced/status line take its place.
+    #if os(iOS)
+    @ViewBuilder
+    private var liveSyncCard: some View {
+        StrandCard(padding: 20, tint: StrandPalette.metricCyan) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    Image(systemName: "heart.text.square.fill")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(StrandPalette.metricCyan)
+                        .frame(width: 30, height: 30)
+                        .background(StrandPalette.metricCyan.opacity(0.14), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                        .accessibilityHidden(true)
+                    Text("Apple Health (Live)")
+                        .font(StrandFont.headline)
+                        .foregroundStyle(StrandPalette.textPrimary)
+                    Spacer()
+                    if health.auth == .authorized {
+                        StatePill(health.syncing ? "Syncing" : "Connected",
+                                  tone: .positive, pulsing: health.syncing)
+                    }
+                }
+
+                switch health.auth {
+                case .unavailable:
+                    Text("Apple Health isn't available on \(Platform.deviceNounPhrase).")
+                        .font(StrandFont.subhead)
+                        .foregroundStyle(StrandPalette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                case .unknown, .denied:
+                    Text("Read your heart rate, HRV, blood oxygen, respiratory rate, sleep, steps and energy straight from Apple Health, and write NOOP's strap-derived metrics back. Everything stays on \(Platform.deviceNounPhrase).")
+                        .font(StrandFont.caption)
+                        .foregroundStyle(StrandPalette.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button {
+                        Task {
+                            await health.requestAuthorization()
+                            await health.sync()
+                            await load()
+                        }
+                    } label: {
+                        Label("Enable Apple Health", systemImage: "heart.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(StrandPalette.metricCyan)
+                    if health.auth == .denied {
+                        Text("If you don't see the prompt, enable NOOP under Settings › Health › Data Access & Devices.")
+                            .font(StrandFont.footnote)
+                            .foregroundStyle(StrandPalette.textTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                case .authorized:
+                    if let last = health.lastSync {
+                        Text("Last synced \(relativeAgo(last.timeIntervalSince1970)).")
+                            .font(StrandFont.subhead)
+                            .foregroundStyle(StrandPalette.textSecondary)
+                    } else {
+                        Text("Connected. Reading on launch and when you return to NOOP.")
+                            .font(StrandFont.subhead)
+                            .foregroundStyle(StrandPalette.textSecondary)
+                    }
+                    Button {
+                        Task {
+                            await health.sync()
+                            await load()
+                        }
+                    } label: {
+                        Label("Sync now", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(StrandPalette.metricCyan)
+                    .disabled(health.syncing)
+                }
+
+                if let err = health.lastError {
+                    Text(err)
+                        .font(StrandFont.footnote)
+                        .foregroundStyle(StrandPalette.statusCritical)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+    #endif
 
     // MARK: - Metric tiles (uniform 104pt StatTiles in an adaptive grid)
 
@@ -375,7 +498,7 @@ struct AppleHealthView: View {
             label: "Workouts",
             value: "\(workoutCount)",
             caption: workoutCount > 0 ? "Apple-logged" : nil,
-            accent: workoutCount > 0 ? StrandPalette.strainColor(12) : StrandPalette.textTertiary
+            accent: workoutCount > 0 ? StrandPalette.strainColor(57) : StrandPalette.textTertiary
         )
     }
 
@@ -609,10 +732,7 @@ struct AppleHealthView: View {
     private func intString(_ v: Double) -> String {
         let n = Int(v.rounded())
         if abs(n) >= 1000 {
-            let f = NumberFormatter()
-            f.numberStyle = .decimal
-            f.maximumFractionDigits = 0
-            return f.string(from: NSNumber(value: n)) ?? "\(n)"
+            return Self.groupedIntFmt.string(from: NSNumber(value: n)) ?? "\(n)"
         }
         return "\(n)"
     }
